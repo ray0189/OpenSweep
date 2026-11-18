@@ -90,6 +90,36 @@ Out-Json @{ ok = [bool]$p }`;
   return text ? JSON.parse(text) : { ok: true };
 }
 
+// Run a script as the built-in SYSTEM account (one-shot scheduled task). Used only as a
+// fallback when Windows denies administrators, e.g. policy keys newer Windows 11 builds lock.
+async function asSystem(script, args, { timeout = 120000 } = {}) {
+  const dir = path.join(process.env.ProgramData || 'C:\\ProgramData', 'OpenSweep');
+  fs.mkdirSync(dir, { recursive: true });
+  const id = crypto.randomBytes(6).toString('hex');
+  const resultFile = path.join(dir, `sys-${id}.json`);
+  const file = path.join(dir, `sys-${id}.ps1`);
+  fs.writeFileSync(file, '\ufeff' + withArgs(`function Out-Result($x){ Out-Json $x | Out-File -LiteralPath '${resultFile}' -Encoding utf8 }\ntry {\n${script}\n} catch { Out-Result @{ error = $_.Exception.Message } }`, args), 'utf8');
+  const name = `OpenSweep-${id}`;
+  try {
+    await elevated(`
+$act = New-ScheduledTaskAction -Execute '${PS}' -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $a.file + '"')
+$pr = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName $a.name -Action $act -Principal $pr -Force -ErrorAction Stop | Out-Null
+Start-ScheduledTask -TaskName $a.name
+$t0 = Get-Date
+while (-not (Test-Path -LiteralPath $a.result) -and ((Get-Date) - $t0).TotalSeconds -lt ${Math.round(timeout / 1000)}) { Start-Sleep -Milliseconds 300 }
+Unregister-ScheduledTask -TaskName $a.name -Confirm:$false -ErrorAction SilentlyContinue
+Out-Result @{ ok = $true }`, { file, name, result: resultFile }, { timeout: timeout + 30000 });
+    const text = fs.readFileSync(resultFile, 'utf8').replace(/^\ufeff/, '').trim();
+    const r = text ? JSON.parse(text) : null;
+    if (r && r.error && Object.keys(r).length === 1) throw new Error(r.error);
+    return r;
+  } finally {
+    fs.rm(file, { force: true }, () => {});
+    fs.rm(resultFile, { force: true }, () => {});
+  }
+}
+
 // ---------------------------------------------------------------- system
 async function systemInfo() {
   return ps(`
@@ -392,8 +422,18 @@ async function setTweaks(changes) {
   const machine = ops.filter(o => o.key.startsWith('HKEY_LOCAL_MACHINE'));
   const errors = [];
   if (machine.length) {
-    try { errors.push(...asList(await elevated(`${TWEAK_SET}\nOut-Result @($errs)`, machine))); }
-    catch (e) { [...new Set(machine.map(o => o.id))].forEach(id => errors.push({ id, error: e.message })); }
+    let errs = [];
+    try { errs = asList(await elevated(`${TWEAK_SET}\nOut-Result @($errs)`, machine)); }
+    catch (e) { errs = [...new Set(machine.map(o => o.id))].map(id => ({ id, error: e.message })); }
+    // Keys Windows locks even for admins: retry those as SYSTEM.
+    const denied = new Set(errs.filter(e => /unauthori[sz]ed|denied/i.test(e.error)).map(e => e.id));
+    if (denied.size) {
+      try {
+        const again = asList(await asSystem(`${TWEAK_SET}\nOut-Result @($errs)`, machine.filter(o => denied.has(o.id))));
+        errs = errs.filter(e => !denied.has(e.id)).concat(again);
+      } catch (e) { errs.forEach(x => { if (denied.has(x.id)) x.error += ` (SYSTEM retry: ${e.message})`; }); }
+    }
+    errors.push(...errs);
   }
   if (user.length) errors.push(...asList(await ps(`${TWEAK_SET}\nOut-Json @($errs)`, user)));
   if (restartExplorer) await ps('Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 1500; if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }; Out-Json @{ ok=$true }');
@@ -596,5 +636,5 @@ module.exports = {
   installedApps, uninstallApp, startupItems, setStartup, security, defenderAction, threats, network, networkAction,
   tweakStates, setTweaks, bloatStatus, removeApps, servicesStatus, setServices, tasksStatus, setTasks,
   powerPlans, setPowerPlan, runRepair, launchTool, updatesStatus, updatesAction,
-  isAdmin, verifyTweaks, _ps: ps, stabilityCheck, scanDevices, setAutoStart,
+  isAdmin, verifyTweaks, _ps: ps, asSystem, stabilityCheck, scanDevices, setAutoStart,
 };
