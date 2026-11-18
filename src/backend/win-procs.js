@@ -26,7 +26,7 @@ while ($true) {
       $company = $info[$path][0]; $desc = $info[$path][1]
       if (-not $sig.ContainsKey($path) -and $sigWatch.ElapsedMilliseconds -lt 300 -and $tick -gt 1) {
         $lp = $path.ToLower()
-        if ($lp.StartsWith($win)) { $sig[$path] = 'Valid' } else { try { [void][Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($path); $sig[$path] = 'Valid' } catch { $sig[$path] = 'NotSigned' } } }
+        if ($lp.StartsWith($win) -or $lp.Contains('\\windowsapps\\')) { $sig[$path] = 'Valid' } else { try { [void][Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($path); $sig[$path] = 'Valid' } catch { $sig[$path] = 'NotSigned' } } }
     }
     $pri = $null; try { $pri = [string]$p.PriorityClass } catch {}
     [pscustomobject]@{ pid=$p.Id; name=$p.ProcessName; cpu=[math]::Round([math]::Max(0,$cpu),1); mem=[math]::Round($p.WorkingSet64/1MB,1); io=[math]::Round([math]::Max(0,$iob)); threads=$p.Threads.Count; path=$path; company=$company; desc=$desc; title=$p.MainWindowTitle; sig=$(if ($path) { $sig[$path] } else { $null }); pri=$pri }
