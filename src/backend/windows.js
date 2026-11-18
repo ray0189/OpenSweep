@@ -593,5 +593,5 @@ module.exports = {
   installedApps, uninstallApp, startupItems, setStartup, security, defenderAction, threats, network, networkAction,
   tweakStates, setTweaks, bloatStatus, removeApps, servicesStatus, setServices, tasksStatus, setTasks,
   powerPlans, setPowerPlan, runRepair, launchTool, updatesStatus, updatesAction,
-  isAdmin, verifyTweaks, stabilityCheck, scanDevices, setAutoStart,
+  isAdmin, verifyTweaks, _ps: ps, stabilityCheck, scanDevices, setAutoStart,
 };

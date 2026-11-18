@@ -34,7 +34,14 @@ async function step(name, fn) {
   const on = await step(`setTweaks ON (${toApply.length})`, () => W.setTweaks(toApply));
   if (on) for (const f of on.failed) fail(`tweak ${f.id}`, f.error);
   const off = await step(`setTweaks OFF (${toApply.length})`, () => W.setTweaks(toApply.map(c => ({ id: c.id, on: false }))));
-  if (off) for (const f of off.failed) fail(`revert ${f.id}`, f.error);
+  if (off && off.failed.length) {
+    // Diagnose: show what is actually in the registry, then retry once.
+    const vals = off.failed.flatMap(f => C.TWEAKS.find(t => t.id === f.id).values.map(v => ({ id: f.id, key: v.key, name: v.name || '', want: v.off })));
+    console.log(JSON.stringify(await W._ps(`Out-Json @(foreach ($q in $a) { $v = $null; try { $v = (Get-ItemProperty -LiteralPath ('Registry::' + $q.key) -Name $q.name -ErrorAction Stop).($q.name) } catch { $v = 'ERR ' + $_.Exception.Message }; [pscustomobject]@{ id=$q.id; name=$q.name; want=$q.want; got=$v } })`, vals), null, 1));
+    const again = await W.setTweaks(off.failed.map(f => ({ id: f.id, on: false })));
+    console.log('retry failed:', again.failed.map(f => f.id).join(', ') || 'none');
+    for (const f of again.failed) fail(`revert ${f.id}`, f.error);
+  }
 
   // Services: set each present one to its recommended type, verify, then restore.
   const svc = (await W.servicesStatus()).filter(s => s.status !== 'Missing');
