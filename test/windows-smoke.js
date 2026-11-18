@@ -69,6 +69,21 @@ async function step(name, fn) {
   if (as && !as.enabled) fail('setAutoStart', 'task not registered');
   await step('setAutoStart off', () => W.setAutoStart({ enabled: false, exe }));
 
+  // Locked-down script folder (same icacls as main.js hardenDataDir): scripts must still run from it.
+  await step('hardened script dir', async () => {
+    const { execFileSync } = require('child_process'); const path = require('path'); const fs = require('fs');
+    const dir = path.join(process.env.ProgramData, 'OpenSweepHardenTest'), run = path.join(dir, 'run');
+    fs.mkdirSync(run, { recursive: true });
+    execFileSync('icacls.exe', [dir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX', '/T', '/C', '/Q']);
+    execFileSync('icacls.exe', [dir, '/setowner', '*S-1-5-32-544', '/T', '/C', '/Q']);
+    require('../src/backend/pscore').setScriptDir(run);
+    const r = await W._ps('Out-Json @{ ok = $true }');
+    const e = await W.asSystem('Out-Result @{ ok = $true }');
+    require('../src/backend/pscore').setScriptDir(null);
+    if (!r || !r.ok || !e || !e.ok) throw new Error('scripts did not run from the hardened folder');
+    return { acl: execFileSync('icacls.exe', [dir]).toString().split(/\r?\n/).slice(0, 4).join(' | ') };
+  });
+
   // ---------------- v0.3 features
   await step('isAdmin', () => W.isAdmin());
   const sys = await step('asSystem whoami', () => W.asSystem('Out-Result @{ who = [Security.Principal.WindowsIdentity]::GetCurrent().Name }'));

@@ -22,8 +22,12 @@ function Get-DirSize([string]$p, [int]$budgetMs = 4000) {
 }
 `;
 
+// Scripts that run elevated must live in a folder only administrators can write to (see
+// security-audit S2). main.js hardens %ProgramData%\OpenSweep\run at startup and calls setScriptDir.
+let scriptDir = null;
+function setScriptDir(d) { scriptDir = d; }
 function tmpFile(ext) {
-  return path.join(os.tmpdir(), `opensweep-${crypto.randomBytes(8).toString('hex')}${ext}`);
+  return path.join(scriptDir || os.tmpdir(), `opensweep-${crypto.randomBytes(8).toString('hex')}${ext}`);
 }
 function withArgs(script, args) {
   if (args === undefined) return PRELUDE + script;
@@ -144,4 +148,4 @@ function stream(script, args, onData, onExit) {
   return () => { try { p.kill(); } catch { /* gone */ } };
 }
 
-module.exports = { PS, ps, elevated, isAdmin, asSystem, stream, tmpFile, withArgs, writeScript };
+module.exports = { setScriptDir, PS, ps, elevated, isAdmin, asSystem, stream, tmpFile, withArgs, writeScript };

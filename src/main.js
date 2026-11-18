@@ -147,6 +147,21 @@ function scheduleStability() {
   setInterval(tick, 15 * 60e3);
 }
 
+// ------------------------------------------------------------------ protected data folder
+// %ProgramData%\OpenSweep holds scripts run as admin/SYSTEM, backups and install logs. By default
+// ordinary users can add files there, so lock it to SYSTEM + Administrators (read-only for Users).
+function hardenDataDir() {
+  try {
+    const { execFileSync } = require('child_process');
+    const dir = path.join(process.env.ProgramData || 'C:\\ProgramData', 'OpenSweep');
+    const run = path.join(dir, 'run');
+    fs.mkdirSync(run, { recursive: true });
+    execFileSync('icacls.exe', [dir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX', '/T', '/C', '/Q'], { windowsHide: true, timeout: 30000 });
+    execFileSync('icacls.exe', [dir, '/setowner', '*S-1-5-32-544', '/T', '/C', '/Q'], { windowsHide: true, timeout: 30000 });
+    require('./backend/pscore').setScriptDir(run);
+  } catch { /* not admin or icacls failed: keep using %TEMP% */ }
+}
+
 // ------------------------------------------------------------------ settings guard (keeps your tweaks applied)
 let guardRunning = false;
 async function runGuard({ manual = false } = {}) {
@@ -390,7 +405,9 @@ const api = {
   organizeDownloads: ({ apply, where }) => organizeDownloads({ apply: !!apply, where }),
   organizeUndo: ({ moves }) => {
     let n = 0;
-    for (const m of moves || []) { try { if (fs.existsSync(m.to) && !fs.existsSync(m.from)) { fs.renameSync(m.to, m.from); n++; } } catch { /* skip */ } }
+    const roots = ['desktop', 'downloads', 'documents', 'pictures', 'videos', 'music'].map(k => path.resolve(app.getPath(k)).toLowerCase() + path.sep);
+    const inside = (p) => typeof p === 'string' && roots.some(r => path.resolve(p).toLowerCase().startsWith(r));
+    for (const m of moves || []) { if (!inside(m.from) || !inside(m.to)) continue; try { if (fs.existsSync(m.to) && !fs.existsSync(m.from)) { fs.renameSync(m.to, m.from); n++; } } catch { /* skip */ } }
     return { ok: true, restored: n };
   },
   organizePick: async () => { const r = await dialog.showOpenDialog(win, { title: 'Folder to organise', properties: ['openDirectory'] }); if (r.canceled) return null; organizeDir = r.filePaths[0]; return organizeDir; },
@@ -522,6 +539,16 @@ const api = {
     else { const err = await shell.openPath(s.target); if (err) throw new Error(err); }
     return { ok: true };
   },
+  // Shortcuts: files are only added through the system file picker, links must be http(s) (security-audit S4).
+  addShortcut: async ({ name, url }) => {
+    const n = String(name || '').trim().slice(0, 60);
+    let target;
+    if (url !== undefined) { target = String(url).trim(); if (!/^https?:\/\/[^\s]+$/i.test(target) || target.length > 1024) throw new Error('Enter a web address starting with https://'); }
+    else { const r = await dialog.showOpenDialog(win, { title: 'Choose an app, file or folder', properties: ['openFile', 'openDirectory'] }); if (r.canceled) return null; target = r.filePaths[0]; }
+    settings.shortcuts = [...(settings.shortcuts || []), { name: n || path.basename(target), target }].slice(0, 50);
+    saveSettings(); return api.getSettings();
+  },
+  removeShortcut: ({ index }) => { if (!Number.isInteger(index)) throw new Error('Invalid'); settings.shortcuts = (settings.shortcuts || []).filter((_, i) => i !== index); saveSettings(); return api.getSettings(); },
   openUri: async ({ uri }) => {
     if (!/^(ms-settings:[a-z-]*|windowsdefender:)$/i.test(uri)) throw new Error('Blocked URI');
     if (!DEMO) await shell.openExternal(uri);
@@ -531,7 +558,7 @@ const api = {
 
   getSettings: () => ({ ...settings, history: undefined, stabilitySeen: undefined, guardTweaks: undefined, guardCount: (settings.guardTweaks || []).length }),
   setSettings: ({ patch }) => {
-    const allowed = ['theme', 'minimizeToTray', 'showWidget', 'launchAtLogin', 'confirmActions', 'scanRoot', 'shortcuts', 'autoUpdate', 'stabilityMonitor', 'stabilityNotify', 'settingsGuard', 'autoClean', 'compactNav'];
+    const allowed = ['theme', 'minimizeToTray', 'showWidget', 'launchAtLogin', 'confirmActions', 'scanRoot', 'autoUpdate', 'stabilityMonitor', 'stabilityNotify', 'settingsGuard', 'autoClean', 'compactNav'];
     if ('autoClean' in (patch || {}) && !['off', 'weekly', 'monthly'].includes(patch.autoClean)) throw new Error('Invalid schedule');
     const cleanChanged = 'autoClean' in (patch || {}) && patch.autoClean !== settings.autoClean;
     for (const k of allowed) if (k in (patch || {})) settings[k] = patch[k];
@@ -545,7 +572,9 @@ const api = {
   undo: async ({ index }) => {
     const h = settings.history[index];
     if (!h || !h.undo || h.undone) throw new Error('Nothing to undo');
-    await api[h.undo.fn](h.undo.args);
+    // settings.json is user-writable: only known undo actions, with their arguments re-validated.
+    if (!UNDO_FNS.has(h.undo.fn)) throw new Error('This history entry cannot be undone');
+    await api[h.undo.fn](h.undo.args || {});
     h.undone = true; saveSettings();
     return { ok: true };
   },
@@ -580,6 +609,7 @@ Object.assign(api, extra, {
   guardRun: () => runGuard({ manual: true }),
 });
 
+const UNDO_FNS = new Set(['setTweaks', 'setStartup', 'setTasks', 'setFeature', 'restoreBackup', 'organizeUndo']);
 const INTERNAL_ONLY = new Set(['organizeUndo', 'restoreBackup', '_stopAll']); // only reachable through History & undo
 ipcMain.handle('api', async (_e, method, args) => {
   if (!Object.prototype.hasOwnProperty.call(api, method) || INTERNAL_ONLY.has(method)) throw new Error('Unknown method ' + method);
@@ -643,6 +673,7 @@ else {
   app.whenReady().then(() => {
     app.setAppUserModelId('org.opensweep.app');
     loadSettings();
+    if (!DEMO) hardenDataDir();
     if (process.argv.includes('--auto-clean')) {
       // Scheduled run: clean quietly, then quit.
       autoClean().catch(() => {}).finally(() => setTimeout(() => { quitting = true; app.quit(); }, 8000));

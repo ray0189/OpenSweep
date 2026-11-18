@@ -605,16 +605,16 @@ PAGES.toolbox = async (main) => {
   const cats = [...new Set(C.TOOLBOX.map(t => t.cat))];
   const custom = h('div');
   const name = h('input', { type: 'text', placeholder: 'Name', style: { minWidth: '160px' } });
-  const target = h('input', { type: 'text', placeholder: 'C:\\path\\to\\app.exe or https://…' });
+  const target = h('input', { type: 'text', placeholder: 'https://…' });
   function drawCustom() {
     const sc = S.settings.shortcuts || [];
     custom.replaceChildren(sc.length ? h('div', { class: 'grid g4' }, sc.map((s, i) => h('div', { class: 'tile', onclick: () => call('openShortcut', { index: i }) }, h('span', { class: 't' }, s.name), h('span', { class: 'd trunc', style: { maxWidth: '100%' } }, s.target),
-      h('button', { class: 'btn small', onclick: async (e) => { e.stopPropagation(); S.settings = await call('setSettings', { patch: { shortcuts: sc.filter((_, j) => j !== i) } }); drawCustom(); } }, 'Remove')))) : h('div', { class: 'sub' }, 'Add your own apps, folders or websites.'));
+      h('button', { class: 'btn small', onclick: async (e) => { e.stopPropagation(); S.settings = await call('removeShortcut', { index: i }); drawCustom(); } }, 'Remove')))) : h('div', { class: 'sub' }, 'Add your own apps, folders or websites.'));
   }
   main.append(pageHead('Toolbox', 'Every useful Windows tool in one place, plus your own shortcuts.'),
     ...cats.flatMap(c => [h('div', { class: 'section-title' }, c), h('div', { class: 'grid g4' }, C.TOOLBOX.filter(t => t.cat === c).map(t => h('button', { class: 'tile', onclick: () => call('launchTool', { id: t.id }).then(() => S.info.demo && toast(`Demo: would open ${t.name}`)) }, h('span', { class: 't' }, t.name), h('span', { class: 'd mono' }, t.cmd || t.uri))))]),
     h('div', { class: 'section-title' }, 'My shortcuts'),
-    h('div', { class: 'card' }, h('div', { class: 'row', style: { marginBottom: '12px' } }, name, target, h('button', { class: 'btn primary', onclick: async () => { if (!name.value || !target.value) return; S.settings = await call('setSettings', { patch: { shortcuts: [...(S.settings.shortcuts || []), { name: name.value, target: target.value }] } }); name.value = target.value = ''; drawCustom(); } }, 'Add')), custom));
+    h('div', { class: 'card' }, h('div', { class: 'row', style: { marginBottom: '12px' } }, name, target, h('button', { class: 'btn primary', onclick: async () => { if (!target.value) return; S.settings = await call('addShortcut', { name: name.value, url: target.value }); name.value = target.value = ''; drawCustom(); } }, 'Add link'), h('button', { class: 'btn', onclick: async () => { const r = await call('addShortcut', { name: name.value }); if (r) { S.settings = r; name.value = ''; drawCustom(); } } }, 'Add app or file…')), custom));
   drawCustom();
 };
 
