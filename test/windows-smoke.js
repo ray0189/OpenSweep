@@ -89,7 +89,7 @@ async function step(name, fn) {
   const fs = require('fs'), path = require('path');
   const fakeDir = path.join(process.env.ProgramData, 'OpenSweepFakeApp');
   fs.mkdirSync(fakeDir, { recursive: true }); fs.writeFileSync(path.join(fakeDir, 'fake.exe'), 'x'.repeat(5000));
-  await W._ps(`New-Item -Path 'HKCU:\\Software\\OpenSweepFakeApp' -Force | Out-Null; New-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'OpenSweepFakeApp' -Value ('"' + $a + '\\fake.exe"') -Force | Out-Null
+  await W._ps(`New-Item -Path 'HKCU:\\Software\\OpenSweepFakeApp' -Force | Out-Null; if (-not (Test-Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run')) { New-Item -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' | Out-Null }; New-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'OpenSweepFakeApp' -Value ('"' + $a + '\\fake.exe"') -Force | Out-Null
 Register-ScheduledTask -TaskName 'OpenSweepFakeAppUpdate' -Action (New-ScheduledTaskAction -Execute ($a + '\\fake.exe')) -Trigger (New-ScheduledTaskTrigger -Daily -At 3am) -Force | Out-Null; Out-Json @{ ok=$true }`, fakeDir);
   const left = await step('leftoverScan (fake app)', () => W.leftoverScan({ name: 'OpenSweepFakeApp', publisher: 'Nobody Inc', location: fakeDir, regKey: null }));
   if (left) {
