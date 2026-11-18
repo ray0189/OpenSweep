@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, screen, Notification, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -13,7 +13,8 @@ let win = null, widget = null, tray = null, quitting = false;
 
 // ------------------------------------------------------------------ settings
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
-const DEFAULTS = { theme: 'system', minimizeToTray: true, showWidget: false, launchAtLogin: false, confirmActions: true, scanRoot: '', shortcuts: [], history: [] };
+const DEFAULTS = { theme: 'system', minimizeToTray: true, showWidget: false, launchAtLogin: false, confirmActions: true, scanRoot: '', shortcuts: [], history: [],
+  autoUpdate: true, stabilityMonitor: true, stabilityNotify: true, stabilitySeen: null };
 let settings = { ...DEFAULTS };
 function loadSettings() { try { settings = { ...DEFAULTS, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) }; } catch { settings = { ...DEFAULTS }; } }
 function saveSettings() { try { fs.mkdirSync(path.dirname(settingsFile()), { recursive: true }); fs.writeFileSync(settingsFile(), JSON.stringify(settings, null, 2)); } catch { /* non-fatal */ } }
@@ -86,6 +87,15 @@ async function health() {
     const annoy = C.ANNOYANCE_FIXES.filter(id => !tw[id]).length;
     if (annoy) add('medium', `${annoy} common Windows annoyances are active`, 'Slow folders, forced restarts, account nags, Sticky Keys pop-ups, Edge in Alt+Tab and more.', { fix: 'preset:annoy', label: 'Fix all' });
   }
+  const stab = stability && Date.now() - new Date(stability.checkedAt).getTime() < 3 * 3600e3 ? stability : await runStability({ manual: true }).catch(() => null);
+  if (stab) {
+    const dev = (stab.devices || []).length;
+    if (dev) add('high', `${dev} device${dev > 1 ? 's have' : ' has'} a driver problem`, (stab.devices || []).slice(0, 3).map(d => `${d.name}: ${d.problem}`).join(' · '), { go: 'stability' });
+    const bsod = (stab.events || []).filter(e => e.kind === 'Blue screen').length;
+    if (bsod) add('high', `${bsod} blue screen${bsod > 1 ? 's' : ''} in the last ${stab.days} days`, 'Usually a driver or hardware problem.', { go: 'stability' });
+    const other = (stab.events || []).filter(e => e.kind !== 'Blue screen').length;
+    if (other) add('medium', `${other} stability warning${other > 1 ? 's' : ''} in the last ${stab.days} days`, [...new Set((stab.events || []).filter(e => e.kind !== 'Blue screen').map(e => e.kind))].join(', '), { go: 'stability' });
+  }
   if (m.memPct > 85) add('medium', `Memory is ${m.memPct}% used`, '', { fix: 'boost', label: 'Boost' });
 
   const weight = { high: 12, medium: 5, low: 2 };
@@ -93,6 +103,81 @@ async function health() {
   issues.sort((a, b) => weight[b.sev] - weight[a.sev]);
   return { score, issues, checkedAt: new Date().toISOString() };
 }
+// ------------------------------------------------------------------ events to the UI + desktop notifications
+function send(event, data) { for (const w of [win, widget]) if (w && !w.isDestroyed()) w.webContents.send('event', event, data); }
+function notify(title, body, onClick) {
+  try { if (!Notification.isSupported()) return; const n = new Notification({ title, body, icon: appIcon() }); if (onClick) n.on('click', onClick); n.show(); } catch { /* ignore */ }
+}
+
+// ------------------------------------------------------------------ drivers & stability monitor (background, low priority)
+let stability = null, stabilityRunning = null;
+function runStability({ manual = false } = {}) {
+  if (stabilityRunning) return stabilityRunning;
+  stabilityRunning = (async () => {
+    try {
+      const r = await backend.stabilityCheck({ days: 7 });
+      stability = r;
+      const keys = [...(r.devices || []).map(d => `dev|${d.id}|${d.code}`), ...(r.events || []).map(e => `ev|${e.key}`)];
+      const first = settings.stabilitySeen === null;
+      const seen = new Set(settings.stabilitySeen || []);
+      const fresh = keys.filter(k => !seen.has(k));
+      settings.stabilitySeen = keys.slice(0, 500); saveSettings();
+      if (!manual && !first && fresh.length && settings.stabilityNotify) {
+        const nd = fresh.filter(k => k.startsWith('dev|')).length, ne = fresh.length - nd;
+        notify('OpenSweep: stability check', [nd ? `${nd} device(s) have a driver problem` : '', ne ? `${ne} new crash/hardware event(s)` : ''].filter(Boolean).join(' · '), () => { showMain(); send('go', 'stability'); });
+      }
+      send('stability', r);
+      return r;
+    } finally { stabilityRunning = null; }
+  })();
+  return stabilityRunning;
+}
+function scheduleStability() {
+  if (DEMO) return;
+  let last = 0;
+  const tick = () => {
+    if (!settings.stabilityMonitor) return;
+    const every = (powerMonitor.isOnBatteryPower && powerMonitor.isOnBatteryPower() ? 3 : 1) * 3600e3;
+    if (Date.now() - last < every - 60e3) return;
+    last = Date.now();
+    runStability().catch(() => {});
+  };
+  setTimeout(tick, 90e3);
+  setInterval(tick, 15 * 60e3);
+}
+
+// ------------------------------------------------------------------ auto-update from GitHub Releases
+const upd = { state: 'idle', version: null, progress: 0, error: null, checkedAt: null };
+let updater = null;
+function setUpd(patch) { Object.assign(upd, patch); send('update', upd); }
+function setupUpdater() {
+  if (DEMO || !app.isPackaged) { upd.state = 'disabled'; return; }
+  try { updater = require('electron-updater').autoUpdater; } catch { upd.state = 'disabled'; return; }
+  updater.autoDownload = true;
+  updater.autoInstallOnAppQuit = true;
+  updater.allowPrerelease = true;
+  updater.on('checking-for-update', () => setUpd({ state: 'checking', error: null }));
+  updater.on('update-available', i => setUpd({ state: 'downloading', version: i.version, progress: 0 }));
+  updater.on('update-not-available', () => setUpd({ state: 'latest', checkedAt: new Date().toISOString() }));
+  updater.on('download-progress', p => setUpd({ progress: Math.round(p.percent || 0) }));
+  updater.on('error', e => setUpd({ state: 'error', error: String((e && e.message) || e).split('\n')[0] }));
+  updater.on('update-downloaded', i => {
+    setUpd({ state: 'ready', version: i.version, progress: 100 });
+    // Nobody is looking at the window: install quietly now and come back in the tray.
+    if (!win || win.isDestroyed() || !win.isVisible()) return installUpdate();
+    notify('OpenSweep update ready', `Version ${i.version} is downloaded. Restart OpenSweep to use it.`, showMain);
+  });
+  const check = () => { if (settings.autoUpdate && upd.state !== 'downloading' && upd.state !== 'ready') updater.checkForUpdates().catch(() => {}); };
+  setTimeout(check, 20e3);
+  setInterval(check, 4 * 3600e3);
+}
+function installUpdate() {
+  if (!updater || upd.state !== 'ready') return { ok: false };
+  quitting = true;
+  setImmediate(() => updater.quitAndInstall(true, true));
+  return { ok: true };
+}
+
 function fmt(b) { const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++; } return `${b.toFixed(i > 1 ? 1 : 0)} ${u[i]}`; }
 
 // ------------------------------------------------------------------ downloads organiser (pure Node)
@@ -147,7 +232,7 @@ const str = (x, max = 4096) => { if (typeof x !== 'string' || x.length > max) th
 const SERVICE_TYPES = ['Automatic', 'Manual', 'Disabled'];
 
 const api = {
-  info: () => ({ demo: DEMO, platform: process.platform, version: app.getVersion(), home: os.homedir() }),
+  info: async () => ({ demo: DEMO, platform: process.platform, version: app.getVersion(), home: os.homedir(), isAdmin: DEMO ? true : await backend.isAdmin() }),
   catalog: () => C,
   stats,
   health,
@@ -198,15 +283,23 @@ const api = {
   setStartup: async ({ id, enabled }) => {
     const s = cache.startup.get(id);
     if (!s) throw new Error('Unknown startup item — refresh the list');
-    const r = await backend.setStartup(s, !!enabled);
-    s.enabled = !!enabled;
+    await backend.setStartup(s, !!enabled);
+    const now = (await api.startupItems()).find(x => x.id === id);
+    if (now && now.enabled !== !!enabled) throw new Error(`${s.name}: the change did not stick. Try again or check Task Manager → Startup apps.`);
+    const r = { ok: true, verified: true };
     logHistory({ kind: 'startup', summary: `${enabled ? 'Enabled' : 'Disabled'} startup: ${s.name}`, undo: { fn: 'setStartup', args: { id, enabled: !enabled } } });
     return r;
   },
 
   security: () => backend.security(),
   threats: () => backend.threats(),
-  defenderAction: ({ action }) => backend.defenderAction({ action: str(action, 32) }),
+  defenderAction: async ({ action }) => {
+    const r = await backend.defenderAction({ action: str(action, 32) });
+    const check = { 'firewall-on': se => (se.firewall || []).every(f => f.enabled), 'smb1-off': se => !se.smb1, 'rdp-off': se => !se.rdpEnabled }[action];
+    if (check && !check(await backend.security())) throw new Error('Windows did not keep this change. Another security app or a policy may be controlling it.');
+    if (check) logHistory({ kind: 'security', summary: { 'firewall-on': 'Firewall turned on', 'smb1-off': 'SMB1 disabled', 'rdp-off': 'Remote Desktop disabled' }[action] });
+    return r;
+  },
 
   network: () => backend.network(),
   latency,
@@ -215,6 +308,10 @@ const api = {
       const p = C.DNS_PROVIDERS.find(d => d.id === dns);
       if (!p || !Number.isInteger(index)) throw new Error('Invalid DNS selection');
       const r = await backend.networkAction({ action, index, servers: p.servers });
+      if (!DEMO && p.servers.length) {
+        const a = (await backend.network() || []).find(x => x.index === index);
+        if (a && p.servers.filter(x => x.includes('.')).some(x => !(a.dns || []).includes(x))) throw new Error(`DNS for ${a.name} did not change (it shows ${(a.dns || []).join(', ') || 'automatic'}).`);
+      }
       logHistory({ kind: 'network', summary: `DNS set to ${p.name}` });
       return r;
     }
@@ -227,7 +324,8 @@ const api = {
     const valid = (changes || []).filter(c => C.TWEAKS.some(t => t.id === c.id)).map(c => ({ id: c.id, on: !!c.on }));
     if (!valid.length) return { ok: true };
     const r = await backend.setTweaks(valid);
-    logHistory({ kind: 'tweaks', summary: label || `${valid.length} setting(s) changed`, undo: { fn: 'setTweaks', args: { changes: valid.map(c => ({ id: c.id, on: !c.on })), label: `Undo: ${label || 'settings'}` } } });
+    const done = valid.filter(c => !(r.failed || []).some(f => f.id === c.id));
+    if (done.length) logHistory({ kind: 'tweaks', summary: `${label || 'Settings changed'} (${done.length} verified${r.failed && r.failed.length ? `, ${r.failed.length} failed` : ''})`, undo: { fn: 'setTweaks', args: { changes: done.map(c => ({ id: c.id, on: !c.on })), label: `Undo: ${label || 'settings'}` } } });
     return r;
   },
 
@@ -242,14 +340,16 @@ const api = {
   setServices: async ({ changes }) => {
     const valid = (changes || []).filter(c => C.SERVICES.some(s => s.name === c.name) && SERVICE_TYPES.includes(c.type));
     const r = await backend.setServices(valid);
-    logHistory({ kind: 'services', summary: `Changed ${valid.length} service(s)` });
+    const ok = (r || []).filter(x => x.ok).length;
+    logHistory({ kind: 'services', summary: `Changed ${ok} of ${valid.length} service(s) (verified)` });
     return r;
   },
   tasksStatus: () => backend.tasksStatus(),
   setTasks: async ({ changes }) => {
     const valid = (changes || []).map(c => ({ t: C.SCHEDULED_TASKS.find(t => t.path + t.name === c.id), enable: !!c.enable })).filter(x => x.t).map(x => ({ path: x.t.path, name: x.t.name, enable: x.enable }));
     const r = await backend.setTasks(valid);
-    logHistory({ kind: 'tasks', summary: `${valid.length} scheduled task(s) changed`, undo: { fn: 'setTasks', args: { changes: valid.map(v => ({ id: v.path + v.name, enable: !v.enable })) } } });
+    const ok = (r.results || []).filter(x => x.ok).length;
+    logHistory({ kind: 'tasks', summary: `${ok} of ${valid.length} scheduled task(s) changed (verified)`, undo: { fn: 'setTasks', args: { changes: valid.map(v => ({ id: v.path + v.name, enable: !v.enable })) } } });
     return r;
   },
 
@@ -267,6 +367,12 @@ const api = {
     } else if (action === 'uninstall') { if (!/^KB\d{6,8}$/.test(kb)) throw new Error('Invalid update ID'); args.kb = kb; }
     else if (!['resume', 'unlock', 'scan'].includes(action)) throw new Error('Unknown action');
     const r = await backend.updatesAction(args);
+    if (['pause', 'resume', 'active-hours', 'lock', 'unlock'].includes(action)) {
+      const st = await backend.updatesStatus();
+      const paused = st.pausedUntil && new Date(st.pausedUntil).getTime() > Date.now();
+      const ok = { pause: paused, resume: !paused, 'active-hours': Number(st.activeStart) === args.start && Number(st.activeEnd) === args.end, lock: st.lockedVersion === args.version, unlock: !st.lockedVersion }[action];
+      if (!ok) throw new Error('Windows did not keep this Windows Update change. If your PC is managed by work or school, their policy wins.');
+    }
     const label = { pause: `Paused updates for ${args.days} days`, resume: 'Resumed updates', 'active-hours': `Active hours set to ${args.start}:00–${args.end}:00`, lock: `Locked Windows to version ${args.version}`, unlock: 'Unlocked Windows version', uninstall: `Uninstall started for ${kb}` }[action];
     if (label) logHistory({ kind: 'updates', summary: label });
     return r;
@@ -294,9 +400,9 @@ const api = {
   },
   openRepo: () => shell.openExternal('https://github.com/'),
 
-  getSettings: () => ({ ...settings, history: undefined }),
+  getSettings: () => ({ ...settings, history: undefined, stabilitySeen: undefined }),
   setSettings: ({ patch }) => {
-    const allowed = ['theme', 'minimizeToTray', 'showWidget', 'launchAtLogin', 'confirmActions', 'scanRoot', 'shortcuts'];
+    const allowed = ['theme', 'minimizeToTray', 'showWidget', 'launchAtLogin', 'confirmActions', 'scanRoot', 'shortcuts', 'autoUpdate', 'stabilityMonitor', 'stabilityNotify'];
     for (const k of allowed) if (k in (patch || {})) settings[k] = patch[k];
     if (Array.isArray(settings.shortcuts)) settings.shortcuts = settings.shortcuts.slice(0, 50).map(s => ({ name: String(s.name).slice(0, 60), target: String(s.target).slice(0, 1024) }));
     saveSettings();
@@ -319,6 +425,11 @@ const api = {
     return { ok: true };
   },
   openMain: () => { showMain(); return { ok: true }; },
+  stability: async ({ refresh }) => (refresh || !stability ? runStability({ manual: true }) : stability),
+  scanDevices: async () => { const r = await backend.scanDevices(); logHistory({ kind: 'drivers', summary: 'Scanned for hardware changes' }); return r; },
+  updateStatus: () => ({ ...upd, current: app.getVersion() }),
+  checkUpdate: async () => { if (!updater) return { ...upd }; await updater.checkForUpdates().catch(e => setUpd({ state: 'error', error: e.message })); return { ...upd }; },
+  installUpdate: () => installUpdate(),
   closeWidget: () => { settings.showWidget = false; saveSettings(); applySettings(); return { ok: true }; },
 };
 
@@ -368,8 +479,15 @@ function createTray() {
 
 function applySettings() {
   if (settings.showWidget) createWidget(); else if (widget) widget.close();
-  if (!DEMO) app.setLoginItemSettings({ openAtLogin: !!settings.launchAtLogin, args: ['--hidden'] });
+  if (!DEMO && autoStartApplied !== !!settings.launchAtLogin) {
+    // OpenSweep runs as admin, which Windows won't start from the normal startup list,
+    // so "Start with Windows" uses a logon task with highest privileges instead.
+    autoStartApplied = !!settings.launchAtLogin;
+    app.setLoginItemSettings({ openAtLogin: false });
+    backend.setAutoStart({ enabled: autoStartApplied, exe: process.execPath }).catch(() => { autoStartApplied = null; });
+  }
 }
+let autoStartApplied = null;
 
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
@@ -380,7 +498,10 @@ else {
     createMain();
     if (process.argv.includes('--hidden')) win.once('ready-to-show', () => win.hide());
     try { createTray(); } catch { /* tray unsupported */ }
+    if (!settings.launchAtLogin) autoStartApplied = false; // nothing to clean up on a normal start
     applySettings();
+    setupUpdater();
+    scheduleStability();
   });
   app.on('before-quit', () => { quitting = true; });
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

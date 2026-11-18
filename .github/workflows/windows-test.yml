@@ -1,0 +1,23 @@
+name: Windows test
+
+# Runs the real PowerShell backend on a Windows VM: every read, every tweak applied,
+# read back and reverted. Catches broken scripts before they reach a release.
+on:
+  push:
+    branches: ['**']
+    paths: ['src/backend/**', 'test/**', '.github/workflows/windows-test.yml']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --version
+      - name: Backend smoke test (no npm install needed)
+        run: node test/windows-smoke.js

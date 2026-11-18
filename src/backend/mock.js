@@ -113,14 +113,22 @@ module.exports = {
   async networkAction() { await wait(700); return { ok: true }; },
 
   async tweakStates() { await wait(350); return { ...state.tweaks }; },
-  async setTweaks(changes) { await wait(600); for (const c of changes) state.tweaks[c.id] = !!c.on; return { ok: true }; },
+  async setTweaks(changes) {
+    await wait(600);
+    for (const c of changes) if (c.id !== 'ai.recall-off') state.tweaks[c.id] = !!c.on; // one sample failure so the verify UI can be seen
+    return this.verifyTweaks(changes);
+  },
+  async verifyTweaks(changes) {
+    const failed = changes.filter(c => !!state.tweaks[c.id] !== !!c.on).map(c => ({ id: c.id, title: (C.TWEAKS.find(t => t.id === c.id) || {}).title || c.id, error: 'Demo: pretend a policy is overriding this one.' }));
+    return { ok: !failed.length, applied: changes.length - failed.length, failed, states: { ...state.tweaks } };
+  },
 
   async bloatStatus() { await wait(400); return [...state.installed]; },
   async removeApps({ pkgs }) { await wait(1500); pkgs.forEach(p => state.installed.delete(p)); return pkgs.map(pkg => ({ pkg, ok: true })); },
   async servicesStatus() { await wait(300); return C.SERVICES.map(s => ({ name: s.name, status: state.services[s.name] === 'Disabled' ? 'Stopped' : 'Running', startType: state.services[s.name] })); },
-  async setServices(changes) { await wait(800); changes.forEach(c => { state.services[c.name] = c.type; }); return changes.map(c => ({ name: c.name, ok: true })); },
+  async setServices(changes) { await wait(800); changes.forEach(c => { state.services[c.name] = c.type; }); return changes.map(c => ({ name: c.name, ok: true, error: null })); },
   async tasksStatus() { await wait(300); return C.SCHEDULED_TASKS.map(t => ({ id: t.path + t.name, state: state.tasks[t.path + t.name] })); },
-  async setTasks(changes) { await wait(600); changes.forEach(c => { state.tasks[c.path + c.name] = c.enable ? 'Ready' : 'Disabled'; }); return { ok: true }; },
+  async setTasks(changes) { await wait(600); changes.forEach(c => { state.tasks[c.path + c.name] = c.enable ? 'Ready' : 'Disabled'; }); return { ok: true, results: changes.map(c => ({ id: c.path + c.name, ok: true, error: null })) }; },
 
   async updatesStatus() {
     await wait(400);
@@ -142,4 +150,19 @@ module.exports = {
   async setPowerPlan() { await wait(200); return { ok: true }; },
   async runRepair() { await wait(800); return { ok: true }; },
   async launchTool() { await wait(150); return { ok: true }; },
+  async isAdmin() { return true; },
+  async stabilityCheck({ days = 7 } = {}) {
+    await wait(900);
+    const t = (h) => new Date(Date.now() - h * 3600e3).toISOString().slice(0, 19);
+    return { checkedAt: t(0), days,
+      devices: [{ id: 'USB\\VID_0BDA&PID_8771\\5&1A2B', name: 'Generic Bluetooth Adapter', cls: 'Bluetooth', code: 43, problem: 'Device reported a problem' }],
+      events: [
+        { key: 'Display|4101|9001', when: t(20), kind: 'Display driver reset', source: 'Display', eventId: 4101, message: 'Display driver nvlddmkm stopped responding and has successfully recovered.' },
+        { key: 'Kernel-Power|41|8800', when: t(70), kind: 'Unexpected shutdown', source: 'Microsoft-Windows-Kernel-Power', eventId: 41, message: 'The system has rebooted without cleanly shutting down first.' },
+      ],
+      oldDrivers: [{ name: 'Realtek High Definition Audio', provider: 'Realtek', version: '6.0.1.7548', date: '2015-07-01' }],
+      unsignedDrivers: [], thirdPartyDrivers: 41 };
+  },
+  async scanDevices() { await wait(800); return { ok: true }; },
+  async setAutoStart() { await wait(200); return { ok: true }; },
 };

@@ -1,0 +1,29 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching "version" in package.json) to build the Windows
+# installer and publish it as a GitHub release. The release includes latest.yml,
+# which installed copies of OpenSweep read to update themselves.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - name: Build and publish
+        run: npx electron-builder --win --x64 --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

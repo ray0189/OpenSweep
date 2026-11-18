@@ -54,7 +54,7 @@ const S = { page: 'home', timers: [], C: null, info: null, settings: null, cache
 const NAV = [
   ['Overview', [['home', '⌂', 'Home'], ['cleanup', '✧', 'Cleanup'], ['optimize', '⚡', 'Optimize'], ['debloat', '✂', 'Debloat & AI']]],
   ['Manage', [['startup', '⏻', 'Startup apps'], ['apps', '▦', 'Installed apps'], ['processes', '≋', 'Processes'], ['storage', '◔', 'Storage']]],
-  ['Protect', [['security', '⛨', 'Security'], ['updates', '⟳', 'Windows Update'], ['network', '⇅', 'Network']]],
+  ['Protect', [['security', '⛨', 'Security'], ['stability', '⚕', 'Drivers & stability'], ['updates', '⟳', 'Windows Update'], ['network', '⇅', 'Network']]],
   ['Tools', [['repair', '✚', 'Repair & power'], ['toolbox', '⚒', 'Toolbox'], ['system', 'ⓘ', 'System info'], ['history', '↺', 'History & undo'], ['settings', '⚙', 'Settings']]],
 ];
 function renderNav() {
@@ -68,8 +68,17 @@ function renderNav() {
 function go(page) {
   S.timers.forEach(clearInterval); S.timers = [];
   S.page = page; renderNav();
-  const main = $('#main'); main.scrollTop = 0; main.replaceChildren();
+  const main = $('#main'); main.scrollTop = 0; main.replaceChildren(...banners());
   (PAGES[page] || PAGES.home)(main).catch(e => { console.error(e); main.append(h('div', { class: 'banner' }, 'Something went wrong: ' + e.message)); });
+}
+
+function banners() {
+  const out = [];
+  if (S.info && !S.info.demo && !S.info.isAdmin) out.push(h('div', { class: 'banner' }, 'OpenSweep is not running as administrator, so many changes cannot be applied. ',
+    h('button', { class: 'btn small primary', onclick: () => call('relaunchAsAdmin') }, 'Restart as administrator')));
+  if (S.update && S.update.state === 'ready') out.push(h('div', { class: 'banner good' }, `OpenSweep ${S.update.version} is ready. `,
+    h('button', { class: 'btn small primary', onclick: () => call('installUpdate') }, 'Restart to update')));
+  return out;
 }
 
 // ------------------------------------------------------------------ shared actions
@@ -86,9 +95,20 @@ async function applyTweaks(list, label) {
   if (!changes.length) { toast('Everything in this set is already applied.'); return false; }
   const admin = list.some(t => t.admin && !states[t.id]);
   if (!(await confirmDlg(label, `${changes.length} setting(s) will change.${admin ? '\nWindows will ask for administrator permission.' : ''}\nYou can undo this from History & undo.\nTip: create a restore point first (Repair & power).`, 'Apply'))) return false;
-  await call('setTweaks', { changes, label });
-  toast(`${label}: ${changes.length} setting(s) applied`);
+  const r = await call('setTweaks', { changes, label });
+  reportTweaks(r, label);
   return true;
+}
+// Every apply is read back from Windows; show what really stuck.
+function reportTweaks(r, label) {
+  if (!r || !r.failed) return toast(`${label}: done`);
+  if (!r.failed.length) return toast(`✓ ${label}: ${r.applied} setting(s) applied and verified`);
+  toast(`${label}: ${r.applied} verified, ${r.failed.length} did not apply — ${r.failed.slice(0, 3).map(f => `${f.title} (${f.error})`).join('; ')}${r.failed.length > 3 ? '…' : ''}`, true);
+}
+function reportList(results, label, nameOf) {
+  const bad = (results || []).filter(x => !x.ok);
+  if (!bad.length) return toast(`✓ ${label}: ${(results || []).length} change(s) verified`);
+  toast(`${label}: ${bad.length} did not apply — ${bad.slice(0, 3).map(x => `${nameOf(x)}${x.error ? ` (${x.error})` : ''}`).join('; ')}`, true);
 }
 async function runFix(action, btn) {
   const C = S.C;
@@ -241,7 +261,7 @@ PAGES.optimize = async (main) => {
           h('div', { class: 'body' }, h('div', { class: 'title' }, t.title, recTag(t.rec), adminTag(t.admin)), t.desc ? h('div', { class: 'desc' }, t.desc) : null),
           toggle(!!states[t.id], async (on, input) => {
             input.disabled = true;
-            try { await call('setTweaks', { changes: [{ id: t.id, on }], label: `${on ? 'Applied' : 'Reverted'}: ${t.title}` }); states[t.id] = on; toast(`${on ? 'Applied' : 'Reverted'}: ${t.title}`); }
+            try { const r = await call('setTweaks', { changes: [{ id: t.id, on }], label: `${on ? 'Applied' : 'Reverted'}: ${t.title}` }); if (r && r.states) states = r.states; else states[t.id] = on; reportTweaks(r, `${on ? 'Applied' : 'Reverted'}: ${t.title}`); }
             catch { input.checked = !on; }
             finally { input.disabled = false; draw(); }
           }))))));
@@ -269,9 +289,9 @@ PAGES.debloat = async (main) => {
     btn.onclick = () => busy(btn, async () => {
       const changes = aiTweaks.filter(t => !states[t.id]).map(t => ({ id: t.id, on: true }));
       if (!(await confirmDlg('Remove Microsoft AI?', `This turns off ${changes.length} AI feature(s) via official Windows policies${aiApps.length ? ` and uninstalls ${aiApps.length} AI app(s) (${aiApps.map(a => a.name).join(', ')})` : ''}.\nWindows will ask for administrator permission. Policies can be undone from History & undo.`, 'Remove'))) return;
-      if (changes.length) await call('setTweaks', { changes, label: 'Remove Microsoft AI' });
-      if (aiApps.length) await call('removeApps', { pkgs: aiApps.map(a => a.pkg), allUsers: false });
-      toast('Microsoft AI features removed. Sign out or restart to finish.');
+      if (changes.length) reportTweaks(await call('setTweaks', { changes, label: 'Remove Microsoft AI' }), 'AI settings');
+      if (aiApps.length) reportList((await call('removeApps', { pkgs: aiApps.map(a => a.pkg), allUsers: false })).map(x => ({ ...x, name: x.pkg })), 'AI apps', x => x.name);
+      toast('Sign out or restart to finish removing Microsoft AI.');
       draw();
     }, 'Removing…');
     return [h('div', { class: 'card' }, h('div', { class: 'row' }, h('div', { style: { flex: 1 } }, h('h2', {}, 'AI-free Windows'), h('div', { class: 'sub' }, 'Copilot, Recall, Click to Do, generative AI access, and AI in Edge, Paint, Notepad and Search — switched off with documented Windows policies, plus the AI apps uninstalled.')), btn)),
@@ -305,7 +325,7 @@ PAGES.debloat = async (main) => {
   async function drawServices() {
     const st = Object.fromEntries((await call('servicesStatus')).map(s => [s.name, s]));
     const pending = {};
-    const apply = async (changes, label) => { if (!changes.length) return toast('Nothing to change'); if (!(await confirmDlg(label, `${changes.length} service(s) will change. Windows will ask for administrator permission.`, 'Apply'))) return; await call('setServices', { changes }); toast(`${label}: done`); draw(); };
+    const apply = async (changes, label) => { if (!changes.length) return toast('Nothing to change'); if (!(await confirmDlg(label, `${changes.length} service(s) will change. Windows will ask for administrator permission.`, 'Apply'))) return; reportList(await call('setServices', { changes }), label, x => (C.SERVICES.find(s => s.name === x.name) || {}).title || x.name); draw(); };
     const svc = C.SERVICES.filter(s => st[s.name] && st[s.name].status !== 'Missing');
     return [h('div', { class: 'card' }, h('div', { class: 'row' }, h('div', { class: 'sub', style: { flex: 1 } }, 'Background services that collect telemetry or are rarely needed. Change start type per service, or use a preset.'),
       h('button', { class: 'btn small', onclick: () => apply(svc.filter(s => st[s.name].startType !== s.rec).map(s => ({ name: s.name, type: s.rec })), 'Apply recommended') }, 'Apply recommended'),
@@ -322,10 +342,10 @@ PAGES.debloat = async (main) => {
     const tasks = C.SCHEDULED_TASKS.filter(t => st[t.path + t.name] !== 'Missing');
     const enabledOnes = tasks.filter(t => st[t.path + t.name] !== 'Disabled');
     return [h('div', { class: 'card' }, h('div', { class: 'row' }, h('div', { class: 'sub', style: { flex: 1 } }, 'Scheduled tasks that collect and upload telemetry in the background.'),
-      h('button', { class: 'btn primary small', disabled: !enabledOnes.length, onclick: async (e) => { if (!(await confirmDlg('Disable telemetry tasks?', `${enabledOnes.length} task(s) will be disabled. Needs admin permission.`, 'Disable'))) return; await busy(e.currentTarget, () => call('setTasks', { changes: enabledOnes.map(t => ({ id: t.path + t.name, enable: false })) })); toast('Telemetry tasks disabled'); draw(); } }, 'Disable all'))),
+      h('button', { class: 'btn primary small', disabled: !enabledOnes.length, onclick: async (e) => { if (!(await confirmDlg('Disable telemetry tasks?', `${enabledOnes.length} task(s) will be disabled. Needs admin permission.`, 'Disable'))) return; const r = await busy(e.currentTarget, () => call('setTasks', { changes: enabledOnes.map(t => ({ id: t.path + t.name, enable: false })) })); reportList(r.results, 'Telemetry tasks', x => x.id.split('\\').pop()); draw(); } }, 'Disable all'))),
       h('div', { class: 'card' }, h('div', { class: 'list' }, tasks.map(t => h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, t.name), h('div', { class: 'desc' }, t.desc, ' ', h('span', { class: 'mono' }, t.path))),
         h('span', { class: 'meta' }, st[t.path + t.name] === 'Disabled' ? 'Disabled' : 'Enabled'),
-        toggle(st[t.path + t.name] !== 'Disabled', async (on, input) => { input.disabled = true; try { await call('setTasks', { changes: [{ id: t.path + t.name, enable: on }] }); } catch { input.checked = !on; } draw(); })))))];
+        toggle(st[t.path + t.name] !== 'Disabled', async (on, input) => { input.disabled = true; try { const r = await call('setTasks', { changes: [{ id: t.path + t.name, enable: on }] }); reportList(r.results, t.name, x => x.id.split('\\').pop()); } catch { input.checked = !on; } draw(); })))))];
   }
 
   async function draw() {
@@ -534,7 +554,7 @@ PAGES.updates = async (main) => {
         h('div', { class: 'card' }, h('h3', {}, 'Stay on this version'), h('div', { class: 'sub', style: { marginBottom: '10px' } }, st.lockedVersion ? `Locked to ${st.product} ${st.lockedVersion}. You still get security updates, but no big feature upgrades.` : `You are on ${st.product} ${st.displayVersion}. Lock it to skip feature upgrades (and their new AI features and bugs) while still getting security fixes.`),
           st.lockedVersion ? act('Unlock', { action: 'unlock' }, 'Version unlocked') : act(`Lock to ${st.displayVersion}`, { action: 'lock', version: st.displayVersion }, `Locked to ${st.displayVersion}`)),
         h('div', { class: 'card' }, h('h3', {}, 'Update behaviour'), h('div', { class: 'list' }, tw.map(t => h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, t.title, recTag(t.rec)), t.desc ? h('div', { class: 'desc' }, t.desc) : null),
-          toggle(!!states[t.id], async (on, input) => { input.disabled = true; try { await call('setTweaks', { changes: [{ id: t.id, on }], label: `${on ? 'Applied' : 'Reverted'}: ${t.title}` }); toast(`${on ? 'Applied' : 'Reverted'}: ${t.title}`); } catch { input.checked = !on; } draw(); })))))),
+          toggle(!!states[t.id], async (on, input) => { input.disabled = true; try { reportTweaks(await call('setTweaks', { changes: [{ id: t.id, on }], label: `${on ? 'Applied' : 'Reverted'}: ${t.title}` }), `${on ? 'Applied' : 'Reverted'}: ${t.title}`); } catch { input.checked = !on; } draw(); })))))),
       h('div', { class: 'section-title' }, 'Recently installed updates'),
       h('div', { class: 'card' }, h('div', { class: 'sub', style: { marginBottom: '6px' } }, 'If something broke after an update, uninstall it here. Some combined updates cannot be removed — use Update history → Uninstall updates for those.'),
         h('div', { class: 'list' }, (st.hotfixes || []).map(u => h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, u.kb), h('div', { class: 'desc' }, `${u.desc} · installed ${(u.installed || '').slice(0, 10)} (${ago(u.installed)})`)),
@@ -629,8 +649,50 @@ PAGES.settings = async (main) => {
       row('Keep running in the tray', 'Closing the window hides OpenSweep to the notification area.', toggle(s.minimizeToTray, (v) => set({ minimizeToTray: v }))),
       row('Start with Windows', 'Starts hidden in the tray.', toggle(s.launchAtLogin, (v) => set({ launchAtLogin: v }))),
       row('Ask before making changes', 'Show a confirmation before cleaning, removing or changing settings.', toggle(s.confirmActions, (v) => set({ confirmActions: v }))),
-      row('Run as administrator', 'Avoids a permission prompt for every admin action.', h('button', { class: 'btn small', onclick: async () => { const r = await call('relaunchAsAdmin'); if (r.demo) toast('Not available in demo mode'); } }, 'Restart as admin')))),
-    h('div', { class: 'card' }, h('h3', {}, 'About OpenSweep'), h('div', { class: 'sub' }, `Version ${S.info.version}${S.info.demo ? ' · demo mode' : ''}. Free and open source (MIT). No telemetry, no ads, no account — OpenSweep only connects to the internet when you press "Test latency".`)));
+      row('Background stability check', 'Checks drivers, blue screens and hardware errors about once an hour at the lowest CPU priority.', toggle(s.stabilityMonitor, (v) => set({ stabilityMonitor: v }))),
+      row('Stability notifications', 'Show a Windows notification when a new driver problem or crash is found.', toggle(s.stabilityNotify, (v) => set({ stabilityNotify: v }))),
+      row('Administrator mode', S.info.isAdmin ? 'Running as administrator ✓ — changes apply directly, no prompts.' : 'Not running as administrator.', S.info.isAdmin ? h('span', { class: 'tag good' }, 'admin') : h('button', { class: 'btn small', onclick: async () => { const r = await call('relaunchAsAdmin'); if (r.demo) toast('Not available in demo mode'); } }, 'Restart as admin')))),
+    updateCard(set),
+    h('div', { class: 'card' }, h('h3', {}, 'About OpenSweep'), h('div', { class: 'sub' }, `Version ${S.info.version}${S.info.demo ? ' · demo mode' : ''}. Free and open source (MIT). No telemetry, no ads, no account. OpenSweep only goes online to check GitHub for updates (if turned on) and when you press "Test latency".`)));
+};
+
+function updateCard(set) {
+  const u = S.update || {};
+  const status = { disabled: S.info.demo ? 'Not available in demo mode.' : 'Updates work in the installed app.', idle: 'Not checked yet.', checking: 'Checking GitHub…', latest: `You have the latest version (${S.info.version}).`,
+    downloading: `Downloading ${u.version}… ${u.progress || 0}%`, ready: `Version ${u.version} is downloaded and ready.`, error: `Could not check for updates: ${u.error}` }[u.state] || '';
+  return h('div', { class: 'card' }, h('h3', {}, 'Updates'), h('div', { class: 'list' },
+    h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, 'Update automatically'), h('div', { class: 'desc' }, 'Downloads new versions from the OpenSweep GitHub releases in the background. If OpenSweep is in the tray it updates itself straight away; otherwise it asks you to restart.')), toggle(S.settings.autoUpdate, (v) => set({ autoUpdate: v }))),
+    h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, `Version ${S.info.version}`), h('div', { class: 'desc' }, status)),
+      u.state === 'ready' ? h('button', { class: 'btn small primary', onclick: () => call('installUpdate') }, 'Restart to update')
+        : h('button', { class: 'btn small', disabled: u.state === 'disabled' || u.state === 'checking' || u.state === 'downloading', onclick: async (e) => { S.update = await busy(e.currentTarget, () => call('checkUpdate'), 'Checking…'); if (S.page === 'settings') go('settings'); } }, 'Check now'))));
+}
+
+PAGES.stability = async (main) => {
+  const body = h('div', {}, loading('Checking drivers and the event log…'));
+  const refresh = h('button', { class: 'btn', onclick: (e) => busy(e.currentTarget, () => load(true), 'Checking…') }, 'Check now');
+  main.append(pageHead('Drivers & stability', 'Finds devices with driver problems, blue screens, unexpected shutdowns, hardware errors and display driver crashes from the last 7 days. Runs in the background at low priority.', refresh,
+    h('button', { class: 'btn', onclick: (e) => busy(e.currentTarget, async () => { await call('scanDevices'); toast('Scanned for hardware changes'); await load(true); }) }, 'Scan for hardware changes', adminTag(true))), body);
+  const tool = (label, id) => h('button', { class: 'btn small', onclick: () => call('launchTool', { id }).catch(() => {}) }, label);
+  async function load(refreshNow) {
+    const r = await call('stability', { refresh: !!refreshNow });
+    const ok = (x) => h('div', { class: 'empty' }, x);
+    const toolIds = new Set((S.C.TOOLBOX || []).map(t => t.id));
+    body.replaceChildren(
+      h('div', { class: 'grid g3' },
+        h('div', { class: 'card stat' }, h('div', { class: 'sub' }, 'Devices with problems'), h('div', { class: 'big ' + (r.devices.length ? 'bad' : 'good') }, String(r.devices.length))),
+        h('div', { class: 'card stat' }, h('div', { class: 'sub' }, `Stability events (${r.days} days)`), h('div', { class: 'big ' + (r.events.length ? 'warn' : 'good') }, String(r.events.length))),
+        h('div', { class: 'card stat' }, h('div', { class: 'sub' }, 'Third-party drivers'), h('div', { class: 'big' }, String(r.thirdPartyDrivers)))),
+      h('div', { class: 'card' }, h('h3', {}, 'Devices with driver problems'), r.devices.length ? h('div', { class: 'list' }, r.devices.map(d => h('div', { class: 'item' }, h('span', { class: 'tag warn' }, `code ${d.code}`),
+        h('div', { class: 'body' }, h('div', { class: 'title' }, d.name), h('div', { class: 'desc' }, `${d.problem}${d.cls ? ' · ' + d.cls : ''}`))))) : ok('✓ All devices are working.'),
+        h('div', { class: 'row', style: { marginTop: '10px' } }, h('button', { class: 'btn small', onclick: () => call('openUri', { uri: 'ms-settings:windowsupdate-optionalupdates' }) }, 'Optional driver updates'), toolIds.has('devmgmt') ? tool('Device Manager', 'devmgmt') : null, toolIds.has('reliability') ? tool('Reliability Monitor', 'reliability') : null)),
+      h('div', { class: 'card' }, h('h3', {}, 'Crashes & hardware errors'), r.events.length ? h('div', { class: 'list' }, r.events.map(e => h('div', { class: 'item' }, h('span', { class: 'tag ' + (e.kind === 'Blue screen' || e.kind === 'Hardware error' ? 'bad' : 'warn') }, e.kind),
+        h('div', { class: 'body' }, h('div', { class: 'desc' }, e.message), h('div', { class: 'desc mono' }, `${new Date(e.when).toLocaleString()} · ${e.source} ${e.eventId}`))))) : ok('✓ No crashes or hardware errors.')),
+      r.oldDrivers.length || r.unsignedDrivers.length ? h('div', { class: 'card' }, h('h3', {}, 'Drivers worth updating'), h('div', { class: 'list' },
+        r.unsignedDrivers.map(d => h('div', { class: 'item' }, h('span', { class: 'tag bad' }, 'unsigned'), h('div', { class: 'body' }, h('div', { class: 'title' }, d.name), h('div', { class: 'desc' }, `${d.provider} · ${d.version}`)))),
+        r.oldDrivers.map(d => h('div', { class: 'item' }, h('span', { class: 'tag warn' }, d.date.slice(0, 4)), h('div', { class: 'body' }, h('div', { class: 'title' }, d.name), h('div', { class: 'desc' }, `${d.provider} · ${d.version} · over 5 years old — check the maker's website`)))))) : null,
+      h('div', { class: 'sub' }, `Last checked ${new Date(r.checkedAt).toLocaleString()}.`));
+  }
+  load(false).catch(e => body.replaceChildren(h('div', { class: 'banner' }, 'Could not check: ' + e.message)));
 };
 
 // ------------------------------------------------------------------ boot
@@ -638,5 +700,10 @@ function applyTheme() { const t = S.settings.theme; if (t === 'system') document
 (async function boot() {
   [S.info, S.C, S.settings] = await Promise.all([window.api.call('info'), window.api.call('catalog'), window.api.call('getSettings')]);
   applyTheme();
+  S.update = await window.api.call('updateStatus').catch(() => null);
+  window.api.on((name, data) => {
+    if (name === 'go') go(data);
+    else if (name === 'update') { const was = S.update && S.update.state; S.update = data; if (data.state === 'ready' && was !== 'ready') go(S.page); else if (S.page === 'settings' && data.state !== 'downloading') go('settings'); }
+  });
   go('home');
 })();

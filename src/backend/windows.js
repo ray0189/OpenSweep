@@ -49,14 +49,31 @@ function ps(script, args, { timeout = 120000, json = true } = {}) {
   });
 }
 
-// Run a script elevated (UAC prompt). With wait, resolves with the script's JSON result
-// (scripts write it via Out-Result). visible=true opens a console the user can watch.
+// Is this process already elevated? (The installed app asks for admin at launch, so
+// normally yes; then admin work runs directly, errors come back, and there is no UAC prompt.)
+let adminP = null;
+function isAdmin() {
+  if (!adminP) adminP = ps('Out-Json ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)')
+    .then(Boolean).catch(() => false);
+  return adminP;
+}
+
+// Run a script with admin rights. Scripts report their result with Out-Result.
+// Already admin: runs in-process and returns the result (or throws the real error).
+// Not admin: UAC prompt; with wait, resolves with the script's result.
+// visible=true opens a console the user can watch (not awaited).
 async function elevated(script, args, { wait = true, visible = false, timeout = 30 * 60 * 1000 } = {}) {
+  const admin = await isAdmin();
+  if (admin && !visible) {
+    const r = await ps(`function Out-Result($x){ Out-Json $x }\n${script}`, args, { timeout });
+    return r === null || r === undefined ? { ok: true } : r;
+  }
   const resultFile = tmpFile('.json');
   const body = withArgs(`function Out-Result($x){ Out-Json $x | Out-File -LiteralPath '${resultFile}' -Encoding utf8 }\n${script}`, args);
   const inner = writeScript(visible ? `${body}\nWrite-Host ''\nWrite-Host 'Finished. You can close this window.' -ForegroundColor Green` : body);
-  const argList = ['-NoProfile', '-ExecutionPolicy', 'Bypass'].concat(visible ? ['-NoExit'] : []).concat(['-File', inner]);
-  const launcher = `$p = Start-Process -FilePath '${PS}' -Verb RunAs -WindowStyle ${visible ? 'Normal' : 'Hidden'} -PassThru ${wait ? '-Wait' : ''} -ArgumentList @(${argList.map(x => `'${x.replace(/'/g, "''")}'`).join(',')})
+  // Start-Process joins -ArgumentList with spaces, so the file path must be quoted (user names can contain spaces).
+  const argList = ['-NoProfile', '-ExecutionPolicy', 'Bypass'].concat(visible ? ['-NoExit'] : []).concat(['-File', `"${inner}"`]);
+  const launcher = `$p = Start-Process -FilePath '${PS}' ${admin ? '' : '-Verb RunAs'} -WindowStyle ${visible ? 'Normal' : 'Hidden'} -PassThru ${wait && !visible ? '-Wait' : ''} -ArgumentList @(${argList.map(x => `'${x.replace(/'/g, "''")}'`).join(',')})
 Out-Json @{ ok = [bool]$p }`;
   try {
     await ps(launcher, undefined, { timeout });
@@ -65,13 +82,12 @@ Out-Json @{ ok = [bool]$p }`;
     if (/canceled|cancelled/i.test(e.message)) throw new Error('Administrator permission was declined.');
     throw e;
   }
-  if (!wait) { setTimeout(() => fs.rm(inner, { force: true }, () => {}), 60000); return { ok: true }; }
+  if (!wait || visible) { setTimeout(() => fs.rm(inner, { force: true }, () => {}), 60000); return { ok: true }; }
   fs.rm(inner, { force: true }, () => {});
-  try {
-    const text = fs.readFileSync(resultFile, 'utf8').replace(/^\ufeff/, '').trim();
-    fs.rm(resultFile, { force: true }, () => {});
-    return text ? JSON.parse(text) : { ok: true };
-  } catch { return { ok: true }; }
+  let text = '';
+  try { text = fs.readFileSync(resultFile, 'utf8').replace(/^\ufeff/, '').trim(); fs.rm(resultFile, { force: true }, () => {}); }
+  catch { throw new Error('The admin step did not finish (no result was written). Try running OpenSweep as administrator.'); }
+  return text ? JSON.parse(text) : { ok: true };
 }
 
 // ---------------------------------------------------------------- system
@@ -339,16 +355,27 @@ Out-Json @(foreach ($q in $a) { $p = 'Registry::' + $q.key
   return states;
 }
 const TWEAK_SET = `
+$errs = @()
 foreach ($o in $a) { $p = 'Registry::' + $o.key
-  if ($o.kind -eq 'absent') { if ($o.on) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue }; continue }
-  if ($o.kind -eq 'key') {
-    if ($o.on) { New-Item -Path $p -Force | Out-Null; Set-Item -LiteralPath $p -Value '' }
-    else { Remove-Item -LiteralPath ('Registry::' + $o.removeKey) -Recurse -Force -ErrorAction SilentlyContinue }
-    continue }
-  $val = $(if ($o.on) { $o.onValue } else { $o.offValue })
-  if ($null -eq $val) { Remove-ItemProperty -LiteralPath $p -Name $o.name -Force -ErrorAction SilentlyContinue }
-  else { if (-not (Test-Path -LiteralPath $p)) { New-Item -Path $p -Force | Out-Null }; New-ItemProperty -LiteralPath $p -Name $o.name -Value $val -PropertyType $o.type -Force | Out-Null }
+  try {
+    if ($o.kind -eq 'absent') { if ($o.on -and (Test-Path -LiteralPath $p)) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop } }
+    elseif ($o.kind -eq 'key') {
+      if ($o.on) { if (-not (Test-Path -LiteralPath $p)) { New-Item -Path $p -Force -ErrorAction Stop | Out-Null }; Set-Item -LiteralPath $p -Value '' -ErrorAction Stop }
+      else { $rk = 'Registry::' + $o.removeKey; if (Test-Path -LiteralPath $rk) { Remove-Item -LiteralPath $rk -Recurse -Force -ErrorAction Stop } }
+    } else {
+      $val = $(if ($o.on) { $o.onValue } else { $o.offValue })
+      if ($null -eq $val) { if (Test-Path -LiteralPath $p) { Remove-ItemProperty -LiteralPath $p -Name $o.name -Force -ErrorAction SilentlyContinue } }
+      else {
+        if (-not (Test-Path -LiteralPath $p)) { New-Item -Path $p -Force -ErrorAction Stop | Out-Null }
+        if ($o.type -eq 'DWord') { $val = [int]$val } else { $val = [string]$val }
+        New-ItemProperty -LiteralPath $p -Name $o.name -Value $val -PropertyType $o.type -Force -ErrorAction Stop | Out-Null
+      }
+    }
+  } catch { $errs += [pscustomobject]@{ id=$o.id; error=$_.Exception.Message } }
 }`;
+const asList = x => (Array.isArray(x) ? x : x && typeof x === 'object' && x.id ? [x] : []);
+
+// Applies the changes, then reads every value back so the UI reports what really applied.
 async function setTweaks(changes) {
   const ops = [];
   let restartExplorer = false;
@@ -356,14 +383,28 @@ async function setTweaks(changes) {
     const t = C.TWEAKS.find(x => x.id === id);
     if (!t) continue;
     if (t.explorer) restartExplorer = true;
-    for (const v of t.values) ops.push({ key: v.key, name: v.name, type: v.type, kind: v.kind || 'value', removeKey: v.removeKey, on: !!on, onValue: toS32(v.on), offValue: toS32(v.off) });
+    for (const v of t.values) ops.push({ id, key: v.key, name: v.name, type: v.type, kind: v.kind || 'value', removeKey: v.removeKey, on: !!on, onValue: toS32(v.on), offValue: toS32(v.off) });
   }
   const user = ops.filter(o => !o.key.startsWith('HKEY_LOCAL_MACHINE'));
   const machine = ops.filter(o => o.key.startsWith('HKEY_LOCAL_MACHINE'));
-  if (machine.length) await elevated(`${TWEAK_SET}\nOut-Result @{ ok=$true }`, machine);
-  if (user.length) await ps(`${TWEAK_SET}\nOut-Json @{ ok=$true }`, user);
-  if (restartExplorer) await ps('Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue; Out-Json @{ ok=$true }');
-  return { ok: true };
+  const errors = [];
+  if (machine.length) {
+    try { errors.push(...asList(await elevated(`${TWEAK_SET}\nOut-Result @($errs)`, machine))); }
+    catch (e) { [...new Set(machine.map(o => o.id))].forEach(id => errors.push({ id, error: e.message })); }
+  }
+  if (user.length) errors.push(...asList(await ps(`${TWEAK_SET}\nOut-Json @($errs)`, user)));
+  if (restartExplorer) await ps('Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 1500; if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }; Out-Json @{ ok=$true }');
+  return verifyTweaks(changes, errors);
+}
+async function verifyTweaks(changes, errors = []) {
+  const states = await tweakStates();
+  const failed = [];
+  for (const { id, on } of changes) {
+    if (!(id in states) || states[id] === !!on) continue;
+    const e = errors.find(x => x.id === id);
+    failed.push({ id, title: (C.TWEAKS.find(t => t.id === id) || {}).title || id, error: e ? e.error : 'Value did not stick (Windows or a policy may be overriding it).' });
+  }
+  return { ok: !failed.length, applied: changes.length - failed.length, failed, states };
 }
 
 // ---------------------------------------------------------------- debloat / services / tasks
@@ -388,20 +429,100 @@ async function servicesStatus() {
   if ($s) { [pscustomobject]@{ name=$n; status=[string]$s.Status; startType=[string]$s.StartType } } else { [pscustomobject]@{ name=$n; status='Missing'; startType=$null } } })`, C.SERVICES.map(s => s.name));
 }
 async function setServices(changes) {
-  return elevated(`
-$res = @(foreach ($c in $a) { $ok=$true
-  try { Set-Service -Name $c.name -StartupType $c.type -ErrorAction Stop; if ($c.type -eq 'Disabled') { Stop-Service -Name $c.name -Force -ErrorAction SilentlyContinue } } catch { $ok=$false }
-  [pscustomobject]@{ name=$c.name; ok=$ok } })
+  let res = [];
+  try {
+    res = await elevated(`
+$res = @(foreach ($c in $a) { $ok=$true; $err=$null
+  try { Set-Service -Name $c.name -StartupType $c.type -ErrorAction Stop; if ($c.type -eq 'Disabled') { Stop-Service -Name $c.name -Force -ErrorAction SilentlyContinue } }
+  catch {
+    # Some services refuse Set-Service; sc.exe / the registry Start value work for most of those.
+    $start = @{ Automatic=2; Manual=3; Disabled=4 }[$c.type]
+    try { Set-ItemProperty -LiteralPath ('HKLM:\\SYSTEM\\CurrentControlSet\\Services\\' + $c.name) -Name Start -Value $start -ErrorAction Stop } catch { $ok=$false; $err=$_.Exception.Message }
+  }
+  [pscustomobject]@{ name=$c.name; ok=$ok; error=$err } })
 Out-Result $res`, changes);
+  } catch (e) { res = changes.map(c => ({ name: c.name, ok: false, error: e.message })); }
+  res = Array.isArray(res) ? res : [res];
+  // Verify by reading the start type back.
+  const now = await servicesStatus();
+  return changes.map(c => {
+    const r = res.find(x => x && x.name === c.name) || {};
+    const st = (now || []).find(x => x.name === c.name) || {};
+    const ok = st.startType === c.type;
+    return { name: c.name, ok, error: ok ? null : (r.error || `Still ${st.startType || 'unknown'} (Windows may protect this service).`) };
+  });
 }
 async function tasksStatus() {
   return ps(`Out-Json @(foreach ($t in $a) { $x = Get-ScheduledTask -TaskPath $t.path -TaskName $t.name -ErrorAction SilentlyContinue
   [pscustomobject]@{ id=($t.path+$t.name); state=$(if ($x) { [string]$x.State } else { 'Missing' }) } })`, C.SCHEDULED_TASKS.map(t => ({ path: t.path, name: t.name })));
 }
 async function setTasks(changes) {
-  return elevated(`
+  let err = null;
+  try {
+    await elevated(`
 foreach ($c in $a) { if ($c.enable) { Enable-ScheduledTask -TaskPath $c.path -TaskName $c.name -ErrorAction SilentlyContinue | Out-Null } else { Disable-ScheduledTask -TaskPath $c.path -TaskName $c.name -ErrorAction SilentlyContinue | Out-Null } }
 Out-Result @{ ok=$true }`, changes);
+  } catch (e) { err = e.message; }
+  const now = await ps(`Out-Json @(foreach ($t in $a) { $x = Get-ScheduledTask -TaskPath $t.path -TaskName $t.name -ErrorAction SilentlyContinue
+  [pscustomobject]@{ id=($t.path+$t.name); state=$(if ($x) { [string]$x.State } else { 'Missing' }) } })`, changes.map(c => ({ path: c.path, name: c.name })));
+  const results = changes.map(c => {
+    const st = ((Array.isArray(now) ? now : [now]).find(x => x && x.id === c.path + c.name) || {}).state;
+    const ok = st === 'Missing' || (c.enable ? st !== 'Disabled' : st === 'Disabled');
+    return { id: c.path + c.name, ok, error: ok ? null : (err || `Task is still ${st}.`) };
+  });
+  return { ok: results.every(r => r.ok), results };
+}
+
+// ---------------------------------------------------------------- drivers & stability
+// Low-cost check meant to run in the background: problem devices from PnP, plus the
+// System event log entries that matter for stability (blue screens, unexpected
+// shutdowns, hardware/WHEA errors, display driver resets, disk errors).
+async function stabilityCheck({ days = 7 } = {}) {
+  return ps(`
+try { (Get-Process -Id $PID).PriorityClass = 'Idle' } catch {}
+$codes = @{ 1='Not configured correctly'; 3='Driver may be corrupted'; 10='Device cannot start'; 12='Not enough resources'; 14='Needs a restart'; 18='Reinstall the driver'; 19='Registry problem'; 21='Being removed'; 22='Disabled'; 24='Not present or not working'; 28='Driver not installed'; 31='Not working properly'; 32='Driver disabled'; 37='Driver failed to load'; 39='Driver missing or corrupted'; 41='Driver loaded but device not found'; 43='Device reported a problem'; 45='Not connected'; 48='Driver blocked'; 52='Driver signature problem' }
+$devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' -ErrorAction SilentlyContinue | Where-Object { $_.ConfigManagerErrorCode -notin 22,45 } | ForEach-Object {
+  $c = [int]$_.ConfigManagerErrorCode
+  [pscustomobject]@{ id=[string]$_.PNPDeviceID; name=$(if ($_.Name) { $_.Name } else { $_.PNPDeviceID }); cls=[string]$_.PNPClass; code=$c; problem=$(if ($codes[$c]) { $codes[$c] } else { "Error code $c" }) } })
+$since = (Get-Date).AddDays(-[int]$a.days)
+$filters = @(
+  @{ LogName='System'; ProviderName='Microsoft-Windows-WER-SystemErrorReporting'; Id=1001 },
+  @{ LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=41 },
+  @{ LogName='System'; ProviderName='Microsoft-Windows-WHEA-Logger'; Level=1,2,3 },
+  @{ LogName='System'; ProviderName='Display'; Id=4101 },
+  @{ LogName='System'; ProviderName='disk'; Id=7,51,153 },
+  @{ LogName='System'; ProviderName='Ntfs'; Id=55 })
+$kinds = @{ 'Microsoft-Windows-WER-SystemErrorReporting'='Blue screen'; 'Microsoft-Windows-Kernel-Power'='Unexpected shutdown'; 'Microsoft-Windows-WHEA-Logger'='Hardware error'; 'Display'='Display driver reset'; 'disk'='Disk error'; 'Ntfs'='File system error' }
+$events = @(foreach ($f in $filters) { $f.StartTime = $since
+  Get-WinEvent -FilterHashtable $f -MaxEvents 20 -ErrorAction SilentlyContinue | ForEach-Object {
+    $m = [string]$_.Message; if ($m.Length -gt 300) { $m = $m.Substring(0,300) + '...' }
+    [pscustomobject]@{ key=("{0}|{1}|{2}" -f $_.ProviderName, $_.Id, $_.RecordId); when=$_.TimeCreated.ToString('s'); kind=$kinds[$f.ProviderName]; source=$_.ProviderName; eventId=$_.Id; message=$m } } })
+$events = @($events | Sort-Object when -Descending)
+$drivers = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object { $_.DeviceName -and $_.DriverProviderName -and $_.DriverProviderName -ne 'Microsoft' })
+$old = @($drivers | Where-Object { $_.DriverDate -and $_.DriverDate -lt (Get-Date).AddYears(-5) } | Sort-Object DriverDate | Select-Object -First 30 | ForEach-Object { [pscustomobject]@{ name=$_.DeviceName; provider=$_.DriverProviderName; version=$_.DriverVersion; date=$_.DriverDate.ToString('yyyy-MM-dd') } })
+$unsigned = @($drivers | Where-Object { $_.IsSigned -eq $false } | ForEach-Object { [pscustomobject]@{ name=$_.DeviceName; provider=$_.DriverProviderName; version=$_.DriverVersion } })
+Out-Json ([pscustomobject]@{ checkedAt=(Get-Date).ToString('s'); days=[int]$a.days; devices=$devices; events=$events; oldDrivers=$old; unsignedDrivers=$unsigned; thirdPartyDrivers=$drivers.Count })`, { days }, { timeout: 5 * 60 * 1000 });
+}
+async function scanDevices() {
+  return elevated('pnputil /scan-devices | Out-Null; Out-Result @{ ok=$true }');
+}
+
+// ---------------------------------------------------------------- start with Windows (elevated app)
+// Windows will not start an app that needs admin from the Run key, so a logon task
+// with "highest privileges" is used instead.
+async function setAutoStart({ enabled, exe }) {
+  return elevated(`
+$name = 'OpenSweep'
+Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+if ($a.enabled) {
+  $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $act = New-ScheduledTaskAction -Execute $a.exe -Argument '--hidden'
+  $trg = New-ScheduledTaskTrigger -AtLogOn -User $user
+  $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+  $pr = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+  Register-ScheduledTask -TaskName $name -Action $act -Trigger $trg -Settings $set -Principal $pr -Force -ErrorAction Stop | Out-Null
+}
+Out-Result @{ ok=$true; enabled=[bool](Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) }`, { enabled: !!enabled, exe });
 }
 
 // ---------------------------------------------------------------- Windows Update control
@@ -472,4 +593,5 @@ module.exports = {
   installedApps, uninstallApp, startupItems, setStartup, security, defenderAction, threats, network, networkAction,
   tweakStates, setTweaks, bloatStatus, removeApps, servicesStatus, setServices, tasksStatus, setTasks,
   powerPlans, setPowerPlan, runRepair, launchTool, updatesStatus, updatesAction,
+  isAdmin, verifyTweaks, stabilityCheck, scanDevices, setAutoStart,
 };

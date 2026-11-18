@@ -1,7 +1,7 @@
 {
   "name": "opensweep",
   "productName": "OpenSweep",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Free, open-source PC care toolkit for Windows 10/11: cleanup, boost, startup, privacy, tweaks, repair and more.",
   "main": "src/main.js",
   "license": "MIT",
@@ -11,7 +11,8 @@
     "demo": "electron . --demo",
     "check": "node --check src/main.js && node --check src/preload.js && node --check src/backend/windows.js && node --check src/backend/mock.js && node --check src/backend/catalog.js && node --check src/renderer/app.js",
     "dist:win": "electron-builder --win --x64",
-    "dist:win-arm64": "electron-builder --win --arm64"
+    "dist:win-arm64": "electron-builder --win --arm64",
+    "test:windows": "node test/windows-smoke.js"
   },
   "build": {
     "appId": "org.opensweep.app",
@@ -29,16 +30,31 @@
         "zip"
       ],
       "signAndEditExecutable": false,
-      "requestedExecutionLevel": "asInvoker"
+      "requestedExecutionLevel": "requireAdministrator"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "ray0189",
+        "repo": "OpenSweep",
+        "releaseType": "release"
+      }
+    ]
   },
   "devDependencies": {
     "electron": "^45.3.4",
     "electron-builder": "^26.18.0"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ray0189/OpenSweep.git"
   }
 }

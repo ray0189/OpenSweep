@@ -156,3 +156,7 @@ dialog .row { justify-content: flex-end; }
 .kv { display: grid; grid-template-columns: 170px 1fr; gap: 6px 14px; font-size: 13px; }
 .kv div:nth-child(odd) { color: var(--muted); }
 .ring circle { transition: stroke-dashoffset .8s; }
+.banner.good { border-color: color-mix(in srgb, var(--good) 45%, transparent); background: color-mix(in srgb, var(--good) 10%, transparent); }
+.banner .btn { margin-left: 8px; }
+.card.stat .sub { font-size: 12px; font-weight: 400; }
+.card.stat .big.good { color: var(--good); } .card.stat .big.bad { color: var(--bad); } .card.stat .big.warn { color: var(--warn); }
