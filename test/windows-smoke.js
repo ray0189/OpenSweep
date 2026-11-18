@@ -94,6 +94,7 @@ Register-ScheduledTask -TaskName 'OpenSweepFakeAppUpdate' -Action (New-Scheduled
   const left = await step('leftoverScan (fake app)', () => W.leftoverScan({ name: 'OpenSweepFakeApp', publisher: 'Nobody Inc', location: fakeDir, regKey: null }));
   if (left) {
     for (const want of ['dir', 'reg', 'run', 'task']) if (!left.some(i => i.type === want)) fail('leftoverScan', `did not find the ${want} leftover`);
+    if (left.length < 4) { console.log('  found:', JSON.stringify(left.map(i => [i.type, i.path]))); console.log('  Run key:', JSON.stringify(await W._ps("Out-Json (Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -ErrorAction SilentlyContinue)"))); }
     const nonFile = left.filter(i => i.type !== 'dir' && i.type !== 'file');
     const rm = await step('removeLeftovers', () => W.removeLeftovers(nonFile, 'FakeApp'));
     if (rm) { for (const r of rm.results.filter(x => !x.ok)) fail('removeLeftovers', `${r.id}: ${r.error}`);
