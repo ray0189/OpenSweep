@@ -441,7 +441,7 @@ PAGES.apps = async (main) => {
     }
   }
   async function features(out) {
-    out.append(loading('Reading Windows features (takes a few seconds)…'));
+    out.append(loading('Reading Windows features (this can take up to a minute)…'));
     const list = await call('optionalFeatures');
     out.replaceChildren();
     const names = S.C.FEATURE_NAMES || {};

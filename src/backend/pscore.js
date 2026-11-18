@@ -130,7 +130,8 @@ Out-Result @{ ok = $true }`, { file, name, result: resultFile }, { timeout: time
 function stream(script, args, onData, onExit) {
   const file = writeScript(withArgs(script, args));
   const p = spawn(PS, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { windowsHide: true });
-  let buf = '';
+  let buf = '', err = '';
+  p.stderr.on('data', d => { err = (err + d.toString('utf8')).slice(-4000); }); // always drain stderr so the script can't block
   p.stdout.on('data', d => {
     buf += d.toString('utf8');
     let i;
@@ -139,7 +140,7 @@ function stream(script, args, onData, onExit) {
       if (line.startsWith('{') || line.startsWith('[')) { try { onData(JSON.parse(line)); } catch { /* partial */ } }
     }
   });
-  p.on('exit', () => { fs.rm(file, { force: true }, () => {}); if (onExit) onExit(); });
+  p.on('exit', (code) => { fs.rm(file, { force: true }, () => {}); if (onExit) onExit(code, err); });
   return () => { try { p.kill(); } catch { /* gone */ } };
 }
 

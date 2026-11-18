@@ -76,7 +76,7 @@ async function step(name, fn) {
   const rel = await step('reliability', () => W.reliability({ days: 14 }));
   if (rel && rel.days.length !== 14) fail('reliability', 'wrong number of days');
   // live process stream: wait for 2 samples
-  await step('process stream', () => new Promise((res, rej) => { let n = 0; const stop = W.startProcessStream(d => { if (++n === 2) { stop(); res({ procs: d.procs.length }); } }); setTimeout(() => { stop(); rej(new Error('no data from stream')); }, 30000); }));
+  await step('process stream', () => new Promise((res, rej) => { let n = 0; let errText = ''; const stop = W.startProcessStream(d => { if (++n === 2) { stop(); res({ procs: d.procs.length }); } }, (code, e) => { errText = `exit ${code}: ${e}`; }); setTimeout(() => { stop(); rej(new Error('no data from stream. ' + errText.slice(-1500))); }, 45000); }));
   await step('oldDrivers', () => W.oldDrivers());
   await step('windowsOldSize', () => W.windowsOldSize());
   await step('emptyFolders', () => W.emptyFolders(require('os').homedir()));
