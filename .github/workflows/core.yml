@@ -1,0 +1,51 @@
+name: OpenSweep Core
+
+# Builds and tests the native OpenSweep Core service.
+#  - portable-linux: the platform-independent parts (cmake + ctest) and the Node pipe client unit test.
+#  - windows: the real service build, unit tests, and the named-pipe / service lifecycle integration test.
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'core/**'
+      - 'src/core-client.js'
+      - 'test/core-*.js'
+      - '.github/workflows/core.yml'
+  workflow_dispatch:
+
+jobs:
+  portable-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S core -B core/build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build core/build --config Release -j 4
+      - name: Unit tests
+        run: ctest --test-dir core/build -C Release --output-on-failure
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Pipe client unit test (mock server)
+        run: node test/core-client.js
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S core -B core/build -A x64
+      - name: Build
+        run: cmake --build core/build --config Release
+      - name: Unit tests
+        run: ctest --test-dir core/build -C Release --output-on-failure
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Pipe client unit test (mock server)
+        run: node test/core-client.js
+      - name: IPC + service lifecycle integration test
+        run: node test/core-ipc.js core/build/Release/OpenSweepCore.exe

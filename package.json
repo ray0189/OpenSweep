@@ -10,9 +10,13 @@
     "start": "electron .",
     "demo": "electron . --demo",
     "check": "node test/check.js",
-    "dist:win": "electron-builder --win --x64",
-    "dist:win-arm64": "electron-builder --win --arm64",
-    "test:windows": "node test/windows-smoke.js"
+    "core:build": "cmake -S core -B core/build -A x64 && cmake --build core/build --config Release",
+    "core:test": "ctest --test-dir core/build -C Release --output-on-failure",
+    "prepare-core": "node scripts/prepare-core.js",
+    "dist:win": "node scripts/prepare-core.js && electron-builder --win --x64",
+    "dist:win-arm64": "node scripts/prepare-core.js && electron-builder --win --arm64",
+    "test:windows": "node test/windows-smoke.js",
+    "test:core": "node test/core-ipc.js"
   },
   "build": {
     "appId": "org.opensweep.app",
@@ -20,6 +24,12 @@
     "files": [
       "src/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build-resources/core",
+        "to": "core"
+      }
     ],
     "directories": {
       "output": "dist"

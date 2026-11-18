@@ -292,8 +292,62 @@ async function latency() {
   return out;
 }
 
+// ------------------------------------------------------------------ OpenSweep Core (native monitor service, Windows only)
+// The renderer only picks a method; the exe path, service name and commands are fixed here.
+const CORE_SERVICE = 'OpenSweepCore';
+let coreClient = null;
+const core = () => coreClient || (coreClient = require('./core-client').createCoreClient());
+const coreExe = () => (app.isPackaged ? path.join(process.resourcesPath, 'core', 'OpenSweepCore.exe') : path.join(__dirname, '..', 'core', 'build', 'Release', 'OpenSweepCore.exe'));
+const scExe = () => path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'sc.exe');
+// 'running' | 'stopped' | 'start_pending' | 'stop_pending' | ... | 'not_installed' | 'unknown'
+function coreServiceState() {
+  return new Promise(resolve => {
+    require('child_process').execFile(scExe(), ['query', CORE_SERVICE], { windowsHide: true, timeout: 10000 }, (err, stdout) => {
+      const m = /STATE\s*:\s*\d+\s+(\w+)/.exec(stdout || '');
+      if (m) return resolve(m[1].toLowerCase());
+      resolve(/1060/.test(stdout || '') || (err && err.code === 1060) ? 'not_installed' : 'unknown');
+    });
+  });
+}
+async function coreStatus() {
+  if (DEMO) return backend.coreStatus();
+  const [serviceState, hello] = await Promise.all([coreServiceState(), core().call('hello', undefined, { timeout: 1500 }).catch(e => ({ _err: e }))]);
+  let health = null, error = null;
+  if (hello._err) error = { code: hello._err.code || 'internal', message: hello._err.message };
+  else health = await core().call('health').catch(() => null);
+  const ok = !hello._err;
+  return { available: ok, running: ok || serviceState === 'running', installed: serviceState === 'unknown' ? null : serviceState !== 'not_installed', serviceState,
+    hello: ok ? hello : null, health, exePresent: fs.existsSync(coreExe()), error };
+}
+async function coreAction(action) {
+  if (DEMO) { await backend.coreAction(action); logHistory({ kind: 'core', summary: `OpenSweep Core: ${action} (simulated)` }); return backend.coreStatus(); }
+  const exe = coreExe();
+  if (action === 'install' && !fs.existsSync(exe)) throw new Error('OpenSweep Core is not included in this build of OpenSweep.');
+  const run = (cmd) => `$o = ${cmd} 2>&1 | Out-String; Out-Result @{ code = $LASTEXITCODE; out = $o }`;
+  const scripts = {
+    install: run('& $a.exe --install'),
+    uninstall: `if (Test-Path -LiteralPath $a.exe) { ${run('& $a.exe --uninstall')} } else { & $a.sc stop $a.svc | Out-Null; ${run('& $a.sc delete $a.svc')} }`,
+    start: run('& $a.sc start $a.svc'),
+    stop: run('& $a.sc stop $a.svc'),
+  };
+  const { elevated } = require('./backend/pscore');
+  const r = await elevated(scripts[action], { exe, sc: scExe(), svc: CORE_SERVICE }, { timeout: 60000 }) || {};
+  // 1056 = already running, 1062 = not started: the wanted state already holds.
+  if (r.code && !(action === 'start' && r.code === 1056) && !(action === 'stop' && r.code === 1062)) {
+    throw new Error(`OpenSweep Core ${action} failed (code ${r.code}): ${String(r.out || '').trim().split(/\r?\n/).filter(Boolean).slice(-2).join(' ')}`);
+  }
+  const want = { start: 'running', stop: 'stopped', uninstall: 'not_installed' }[action];
+  let st = await coreServiceState();
+  for (let i = 0; want && st !== want && i < 30; i++) { await new Promise(res => setTimeout(res, 500)); st = await coreServiceState(); }
+  if (want && st !== want) throw new Error(`OpenSweep Core ${action}: the service is "${st}" instead of "${want}".`);
+  if (action === 'install' && st === 'not_installed') throw new Error('OpenSweep Core install: the service was not registered.');
+  if (action === 'stop' || action === 'uninstall') { try { coreClient && coreClient.close(); } catch { /* ignore */ } }
+  logHistory({ kind: 'core', summary: `OpenSweep Core: ${{ install: 'installed', uninstall: 'uninstalled', start: 'started', stop: 'stopped' }[action]}` });
+  return coreStatus();
+}
+
 // ------------------------------------------------------------------ IPC API
-const str = (x, max = 4096) => { if (typeof x !== 'string' || x.length > max) throw new Error('Invalid argument'); return x; };
+const str =(x, max = 4096) => { if (typeof x !== 'string' || x.length > max) throw new Error('Invalid argument'); return x; };
 const SERVICE_TYPES = ['Automatic', 'Manual', 'Disabled'];
 
 const api = {
@@ -509,6 +563,15 @@ const api = {
   checkUpdate: async () => { if (!updater) return { ...upd }; await updater.checkForUpdates().catch(e => setUpd({ state: 'error', error: e.message })); return { ...upd }; },
   installUpdate: () => installUpdate(),
   closeWidget: () => { settings.showWidget = false; saveSettings(); applySettings(); return { ok: true }; },
+
+  // OpenSweep Core: no renderer input is used, only the method name.
+  coreStatus: () => coreStatus(),
+  coreMetrics: () => (DEMO ? backend.coreMetrics() : core().call('metrics')),
+  coreTopology: () => (DEMO ? backend.coreTopology() : core().call('topology')),
+  coreInstall: () => coreAction('install'),
+  coreUninstall: () => coreAction('uninstall'),
+  coreStart: () => coreAction('start'),
+  coreStop: () => coreAction('stop'),
 };
 
 const extra = require('./api-extra')({ recycle, backend, DEMO, app, shell, dialog, send: (...a) => send(...a), logHistory, fmt, getWin: () => win });
@@ -594,7 +657,7 @@ else {
     scheduleStability();
     if (!DEMO) setTimeout(() => runGuard().catch(() => {}), 120e3);
   });
-  app.on('before-quit', () => { quitting = true; try { extra._stopAll(); } catch { /* ignore */ } });
+  app.on('before-quit', () => { quitting = true; try { extra._stopAll(); } catch { /* ignore */ } try { if (coreClient) coreClient.close(); } catch { /* ignore */ } });
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
   app.on('activate', showMain);
 }

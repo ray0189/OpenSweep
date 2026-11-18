@@ -23,6 +23,14 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - name: Build OpenSweep Core (native service)
+        run: |
+          cmake -S core -B core/build -A x64
+          cmake --build core/build --config Release
+      - name: Test OpenSweep Core
+        run: ctest --test-dir core/build -C Release --output-on-failure
+      - name: Stage OpenSweep Core for packaging
+        run: node scripts/prepare-core.js --require
       - name: Build and publish
         run: npx electron-builder --win --x64 --publish always
         env:

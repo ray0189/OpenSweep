@@ -646,3 +646,120 @@ PAGES.processes = async (main) => {
   S.timers.push(setInterval(() => call('procKeepAlive').catch(() => {}), 60e3));
   S.onLeave = () => call('procStop').catch(() => {});
 };
+
+// =====================================================================================
+// OpenSweep Core (native monitor service)
+// =====================================================================================
+const fmtDur = (s) => { if (s === null || s === undefined || isNaN(s)) return '—'; s = Math.max(0, Math.floor(s)); const d = Math.floor(s / 86400), hh = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${hh}h ${m}m` : hh ? `${hh}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`; };
+PAGES.core = async (main) => {
+  let st = null, topo = null, statusAt = 0;
+  const hist = { cpu: [], mem: [] };
+  const wrap = h('div');
+  // live elements (rebuilt by draw(), updated by tick())
+  let live = null;
+  main.append(pageHead('OpenSweep Core', 'Native background service that measures CPU, memory and commit pressure. Phase 1 runs in Monitor mode: it reads telemetry and never changes Windows settings.',
+    btn('Refresh', () => refresh(true), { ic: 'refresh' })), wrap);
+
+  const stateLabel = (s) => (s.demo ? (s.running ? 'Running' : s.installed ? 'Stopped' : 'Not installed')
+    : s.available ? 'Running' : s.serviceState === 'not_installed' ? 'Not installed' : s.serviceState === 'running' ? 'Running (pipe not answering)' : s.serviceState === 'unknown' ? 'Unknown' : s.serviceState ? s.serviceState.replace('_', ' ').replace(/^\w/, c => c.toUpperCase()) : 'Stopped');
+  const action = (method, title, text, okLabel, kind) => btn(okLabel, async (e) => {
+    const b = e.currentTarget; // null once the handler awaits
+    if (!(await confirmDlg(title, text, okLabel))) return;
+    const r = await busy(b, () => call(method), 'Working…');
+    toast(`✓ OpenSweep Core: ${okLabel.toLowerCase()} done`);
+    st = r; statusAt = Date.now(); hist.cpu.length = hist.mem.length = 0; draw();
+  }, { small: true, kind });
+
+  function draw() {
+    const s = st, demo = !!s.demo, running = demo ? s.running : s.available;
+    const installed = s.installed !== false;
+    const hello = s.hello || {}, health = s.health || {};
+    const cpuV = h('div', { class: 'value' }, '–'), memV = h('div', { class: 'value' }, '–'), comV = h('div', { class: 'value' }, '–');
+    const cpuSp = h('div'), memSp = h('div'), comM = h('div'), comSub = h('div', { class: 'desc' });
+    const memSub = h('div', { class: 'desc' }), sysKv = h('div', { class: 'kv' }), upV = h('div', { class: 'value' }, fmtDur(health.uptimeSec ?? hello.uptimeSec));
+    const metricsNote = h('div', { class: 'foot-note' });
+    live = { cpuV, memV, comV, cpuSp, memSp, comM, comSub, memSub, sysKv, upV, metricsNote, running };
+    const dotState = running ? 'on' : installed && s.serviceState !== 'not_installed' ? 'fail' : 'off';
+    const canInstall = demo ? !s.installed : s.installed === false && s.exePresent;
+    wrap.replaceChildren(
+      demo ? h('div', { class: 'banner info' }, icon('info'), h('b', {}, 'Simulated data (demo mode).'), ' No OpenSweep Core service runs in demo mode — every number on this page is made up.') : null,
+      !demo && !s.exePresent && s.installed === false ? h('div', { class: 'banner' }, icon('alert'), 'OpenSweep Core is not included in this build, so it cannot be installed from here.') : null,
+      !demo && s.error && s.installed !== false && !s.available ? h('div', { class: 'banner' }, icon('alert'), `The service is not answering on its pipe: ${s.error.message}`) : null,
+      h('div', { class: 'gap-16' }),
+      h('div', { class: 'card' }, h('div', { class: 'card-head' },
+        stateDot(dotState, running ? 'Running' : 'Not running'),
+        h('div', { class: 't' }, h('h2', {}, `Service: ${stateLabel(s)}`),
+          h('div', { class: 'sub' }, running ? [h('span', { class: 'tag good', style: { marginLeft: 0 } }, 'Mode: Monitor'), h('span', { class: 'tag' }, `v${hello.version || '?'}`), h('span', { class: 'tag' }, `protocol ${hello.protocol ?? '?'}`), hello.pid ? h('span', { class: 'tag' }, `PID ${hello.pid}`) : null, demo ? h('span', { class: 'tag warn' }, 'simulated') : null]
+            : installed && s.installed !== null ? 'Installed but not running. Start it to see live measurements.' : 'Not installed. Install it to collect live CPU and memory measurements in the background.')),
+        canInstall ? action('coreInstall', 'Install OpenSweep Core?', 'Registers the OpenSweepCore Windows service (Monitor mode: read-only telemetry, no changes to Windows settings). It can be uninstalled at any time.', 'Install', 'primary') : null,
+        installed && s.installed !== null && !running ? action('coreStart', 'Start OpenSweep Core?', 'Starts the OpenSweepCore service.', 'Start', 'primary') : null,
+        running ? action('coreStop', 'Stop OpenSweep Core?', 'Stops the OpenSweepCore service. Live measurements stop until it is started again.', 'Stop') : null,
+        installed && s.installed !== null ? action('coreUninstall', 'Uninstall OpenSweep Core?', 'Stops the service and removes it from Windows. OpenSweep keeps working without it.', 'Uninstall', 'danger') : null)),
+      running ? [
+        h('div', { class: 'gap-16' }),
+        h('div', { class: 'grid g4' },
+          h('div', { class: 'card tight kpi' }, h('div', { class: 'label' }, icon('history', 'sm'), 'Uptime'), upV, hello.startedAt ? h('div', { class: 'desc' }, `since ${new Date(hello.startedAt).toLocaleString()}`) : null),
+          kpi('Service RAM', fmt(health.workingSetBytes), '', 'memory', h('div', { class: 'desc' }, `${fmt(health.privateBytes)} private`)),
+          kpi('Service CPU time', health.cpuTimeMs === undefined ? '—' : `${(health.cpuTimeMs / 1000).toFixed(1)} s`, '', 'cpu'),
+          kpi('Requests served', health.requests === undefined ? '—' : health.requests.toLocaleString(), health.errors ? 'warn' : '', 'activity', h('div', { class: 'desc' }, `${health.clients ?? 0} client(s) · ${health.errors ?? 0} error(s)`))),
+        h('div', { class: 'section-title' }, 'Live system measurements', demo ? h('span', { class: 'tag warn' }, 'simulated') : h('span', { class: 'tag good' }, 'from the service')),
+        h('div', { class: 'grid g3' },
+          h('div', { class: 'card tight kpi' }, h('div', { class: 'label' }, icon('cpu', 'sm'), 'CPU'), cpuV, cpuSp),
+          h('div', { class: 'card tight kpi' }, h('div', { class: 'label' }, icon('memory', 'sm'), 'Physical memory'), memV, memSp, memSub),
+          h('div', { class: 'card tight kpi' }, h('div', { class: 'label' }, icon('layers', 'sm'), 'Commit charge'), comV, comM, comSub)),
+        h('div', { class: 'gap-16' }),
+        h('div', { class: 'grid g2', style: { alignItems: 'start' } },
+          h('div', { class: 'card' }, h('h3', {}, 'System'), sysKv),
+          h('div', { class: 'card' }, h('h3', {}, 'Processor topology', demo ? h('span', { class: 'tag warn' }, 'simulated') : null), topo ? h('div', { class: 'kv' },
+            h('div', {}, 'Logical processors'), h('div', {}, String(topo.logicalProcessors)),
+            h('div', {}, 'Physical cores'), h('div', {}, String(topo.cores)),
+            h('div', {}, 'Packages (sockets)'), h('div', {}, String(topo.packages)),
+            h('div', {}, 'NUMA nodes'), h('div', {}, String(topo.numaNodes)),
+            h('div', {}, 'Processor groups'), h('div', {}, String(topo.groups)),
+            h('div', {}, 'Hybrid (P/E cores)'), h('div', {}, topo.hybrid ? `Yes — ${(topo.efficiencyClasses || []).map((n, i) => `${n} in class ${i}`).join(', ')}` : 'No'),
+            h('div', {}, 'L3 caches'), h('div', {}, String(topo.l3Caches))) : emptyState('Topology not available.', 'info', false))),
+        metricsNote,
+      ] : h('div', { class: 'card' }, emptyState(installed && s.installed !== null ? 'The service is stopped — live measurements appear here once it runs.' : 'Install and start OpenSweep Core to see live measurements here.', 'cpu', false)),
+    );
+    if (running) tick();
+  }
+
+  async function tick() {
+    if (!live || !live.running) return;
+    const L = live;
+    if (st && st.health) L.upV.textContent = fmtDur((st.health.uptimeSec || 0) + (Date.now() - statusAt) / 1000);
+    let m;
+    try { m = await window.api.call('coreMetrics'); } catch (e) { if (L === live) L.metricsNote.textContent = `Could not read measurements: ${String(e.message || e).replace(/^Error invoking remote method 'api': (Error: )?/, '')}`; return; }
+    if (L !== live) return;
+    const mem = m.memory || {}, cpu = Math.max(0, Math.min(100, Number((m.cpu || {}).percent) || 0));
+    hist.cpu.push(cpu); hist.mem.push(mem.loadPercent || 0); if (hist.cpu.length > 60) { hist.cpu.shift(); hist.mem.shift(); }
+    L.cpuV.replaceChildren(cpu.toFixed(1), h('small', {}, ' %')); L.cpuSp.replaceChildren(sparkline(hist.cpu));
+    L.memV.replaceChildren(String(mem.loadPercent ?? '—'), h('small', {}, ' %')); L.memSp.replaceChildren(sparkline(hist.mem, { color: 'var(--c2)' }));
+    L.memSub.textContent = `${fmt(mem.totalPhys - mem.availPhys)} of ${fmt(mem.totalPhys)} in use · cache ${fmt(mem.systemCache)}`;
+    const cp = pct(mem.commitTotal, mem.commitLimit);
+    L.comV.replaceChildren(String(cp), h('small', {}, ` %  ·  ${fmt(mem.commitTotal)} of ${fmt(mem.commitLimit)}`)); L.comM.replaceChildren(meter(cp, 80, 92));
+    L.comSub.textContent = `Peak ${fmt(mem.commitPeak)} · kernel paged ${fmt(mem.kernelPaged)} · non-paged ${fmt(mem.kernelNonpaged)}`;
+    const sy = m.system || {};
+    L.sysKv.replaceChildren(h('div', {}, 'Processes'), h('div', {}, (sy.processes ?? 0).toLocaleString()), h('div', {}, 'Threads'), h('div', {}, (sy.threads ?? 0).toLocaleString()),
+      h('div', {}, 'Handles'), h('div', {}, (sy.handles ?? 0).toLocaleString()), h('div', {}, 'Page size'), h('div', {}, fmt(m.pageSize)));
+    L.metricsNote.textContent = `${st.demo ? 'Simulated' : 'Measured by OpenSweep Core'} · updated ${new Date(m.timestamp || Date.now()).toLocaleTimeString()} · every 2 seconds`;
+  }
+
+  async function refresh(full) {
+    const s = await call('coreStatus');
+    st = s; statusAt = Date.now();
+    if ((s.demo ? s.running : s.available) && (full || !topo)) topo = await window.api.call('coreTopology').catch(() => null);
+    draw();
+  }
+  wrap.append(h('div', { class: 'card' }, loading('Checking OpenSweep Core…')));
+  await refresh(true);
+  S.timers.push(setInterval(tick, 2000));
+  // Service status (RAM, CPU time, requests, running/stopped) every 10 s; not while an action is in progress.
+  S.timers.push(setInterval(async () => {
+    if (wrap.querySelector('button:disabled')) return;
+    const s = await window.api.call('coreStatus').catch(() => null); if (!s || S.page !== 'core' || wrap.querySelector('button:disabled')) return;
+    st = s; statusAt = Date.now();
+    if ((s.demo ? s.running : s.available) && !topo) topo = await window.api.call('coreTopology').catch(() => null);
+    draw();
+  }, 10000));
+};

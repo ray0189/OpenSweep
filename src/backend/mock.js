@@ -247,4 +247,38 @@ module.exports = {
   async hunt() { await wait(1500); return { pid: 1037, name: 'Discord', path: 'C:\\Program Files\\Discord\\Discord.exe', title: 'Discord', company: 'Discord Inc.' }; },
   async wingetUpgrades() { await wait(1200); return [{ name: 'Google Chrome', id: 'Google.Chrome', version: '130.0.6723.117', available: '131.0.6778.86' }, { name: '7-Zip', id: '7zip.7zip', version: '23.01', available: '24.08' }, { name: 'Discord', id: 'Discord.Discord', version: '1.0.9160', available: '1.0.9170' }]; },
   async wingetUpgrade() { await wait(2500); return { ok: true }; },
+
+  // ---------------- OpenSweep Core (SIMULATED — no native service exists in demo mode)
+  async coreStatus() {
+    await wait(200);
+    const c = state.core || (state.core = { installed: true, running: true, startedAt: Date.now() - 3 * 3600e3 - 17 * 60e3, requests: 1240, cpuMs: 4100 });
+    const up = Math.round((Date.now() - c.startedAt) / 1000);
+    if (c.running) { c.requests += rnd(1, 4); c.cpuMs += rnd(5, 30); }
+    return {
+      available: false, demo: true, simulated: true, exePresent: true, installed: c.installed, running: c.running,
+      serviceState: !c.installed ? 'not_installed' : c.running ? 'running' : 'stopped',
+      hello: c.running ? { service: 'OpenSweepCore', version: '0.1.0', protocol: 1, pid: 4312, mode: 'monitor', startedAt: new Date(c.startedAt).toISOString(), uptimeSec: up } : null,
+      health: c.running ? { status: 'running', mode: 'monitor', uptimeSec: up, workingSetBytes: 6.8 * MB, privateBytes: 3.1 * MB, cpuTimeMs: c.cpuMs, clients: 1, requests: c.requests, errors: 0 } : null,
+    };
+  },
+  async coreMetrics() {
+    if (!state.core || !state.core.running) { const e = new Error('Simulated OpenSweep Core is stopped'); e.code = 'unavailable'; throw e; }
+    const total = 32 * GB, load = rnd(38, 52), limit = 37.9 * GB, commit = Math.round((14 + Math.random() * 3) * GB);
+    return { simulated: true, timestamp: new Date().toISOString(), cpu: { percent: Math.round(Math.random() * 180) / 10 + 3 },
+      memory: { totalPhys: total, availPhys: Math.round(total * (1 - load / 100)), loadPercent: load, commitTotal: commit, commitLimit: limit, commitPeak: 22.4 * GB, systemCache: 6.2 * GB, kernelPaged: 610 * MB, kernelNonpaged: 280 * MB },
+      system: { processes: rnd(238, 251), threads: rnd(3300, 3500), handles: rnd(118000, 124000) }, pageSize: 4096 };
+  },
+  async coreTopology() {
+    await wait(100);
+    return { simulated: true, logicalProcessors: 16, cores: 8, packages: 1, numaNodes: 1, groups: 1, hybrid: false, efficiencyClasses: [8], l3Caches: 1 };
+  },
+  async coreAction(action) {
+    await wait(900);
+    const c = state.core || (state.core = { installed: true, running: true, startedAt: Date.now(), requests: 0, cpuMs: 0 });
+    if (action === 'install') { c.installed = true; }
+    if (action === 'start') { if (!c.installed) throw new Error('Simulated: the service is not installed'); if (!c.running) { c.running = true; c.startedAt = Date.now(); c.requests = 0; c.cpuMs = 0; } }
+    if (action === 'stop') c.running = false;
+    if (action === 'uninstall') { c.installed = false; c.running = false; }
+    return { ok: true, simulated: true };
+  },
 };

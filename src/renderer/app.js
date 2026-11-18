@@ -104,7 +104,7 @@ const S = { page: 'home', timers: [], C: null, info: null, settings: null, cache
 const NAV = [
   ['Overview', [['home', 'home', 'Home'], ['clean', 'sparkles', 'Clean everything'], ['optimize', 'sliders', 'Optimize'], ['debloat', 'scissors', 'Debloat & AI']]],
   ['Manage', [['apps', 'package', 'Uninstaller'], ['storage', 'pie', 'Space analyzer'], ['startup', 'power', 'Startup apps'], ['processes', 'activity', 'Processes']]],
-  ['Protect', [['security', 'shield', 'Security'], ['reliability', 'pulse', 'Reliability'], ['updates', 'refresh', 'Windows Update'], ['network', 'wifi', 'Network']]],
+  ['Protect', [['security', 'shield', 'Security'], ['reliability', 'pulse', 'Reliability'], ['updates', 'refresh', 'Windows Update'], ['network', 'wifi', 'Network'], ['core', 'cpu', 'OpenSweep Core']]],
   ['Tools', [['repair', 'repair', 'Repair & power'], ['toolbox', 'grid', 'Toolbox'], ['system', 'info', 'System info'], ['history', 'history', 'History & undo'], ['settings', 'gear', 'Settings']]],
 ];
 const HIDDEN_ROUTES = { cleanup: 'sparkles', stability: 'pulse' };
