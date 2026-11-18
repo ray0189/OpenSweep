@@ -489,17 +489,17 @@ async function storageTools(main, tab) {
     },
     downloads: async (out) => {
       const res = h('div', {}, loading());
-      out.append(h('div', { class: 'card' }, h('div', { class: 'sub' }, 'Sorts the files in a folder into sub-folders by type (Images, Documents, Videos, Installers…). Nothing is deleted.'), res));
-      S.cache.orgWhere = S.cache.orgWhere || 'downloads';
+      out.append(h('div', { class: 'card' }, h('div', { class: 'sub' }, 'Sorts loose files by type. "All my folders" tidies Desktop, Downloads, Documents, Pictures, Videos and Music at once — photos to Pictures, videos to Videos, music to Music, documents to Documents, installers and archives into Downloads sub-folders. Only loose files move (never sub-folders or system files), nothing is deleted, and History can undo it.'), res));
+      S.cache.orgWhere = S.cache.orgWhere || 'all';
       const where = S.cache.orgWhere;
-      const pick = h('div', { class: 'pill-group', style: { margin: '10px 0' } }, [['downloads', 'Downloads'], ['desktop', 'Desktop'], ['documents', 'Documents'], ['custom', 'Other folder…']].map(([id, l]) =>
+      const pick = h('div', { class: 'pill-group', style: { margin: '10px 0' } }, [['all', 'All my folders'], ['downloads', 'Downloads'], ['desktop', 'Desktop'], ['documents', 'Documents'], ['custom', 'Other folder…']].map(([id, l]) =>
         h('button', { class: 'chip' + (where === id ? ' active' : ''), onclick: async () => { if (id === 'custom' && !(await call('organizePick'))) return; S.cache.orgWhere = id; out.replaceChildren(); views.downloads(out); } }, l)));
       res.before(pick);
       const preview = await call('organizeDownloads', { apply: false, where });
       const by = {};
       preview.moves.forEach(m => { (by[m.folder] = by[m.folder] || []).push(m); });
       const btn = h('button', { class: 'btn primary', disabled: !preview.moves.length }, `Organise ${preview.moves.length} files`);
-      btn.onclick = () => busy(btn, async () => { const r = await call('organizeDownloads', { apply: true, where }); toast(r.applied ? `Organised ${r.moves.length} files` : 'Demo mode: no files were moved'); });
+      btn.onclick = () => busy(btn, async () => { const r = await call('organizeDownloads', { apply: true, where }); toast(r.applied ? `Organised ${r.moved} files — undo any time from History` : 'Demo mode: no files were moved'); });
       res.replaceChildren(h('div', { class: 'list', style: { margin: '10px 0' } }, Object.entries(by).map(([k, v]) => h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, k), h('div', { class: 'desc' }, v.slice(0, 4).map(x => x.name).join(', ') + (v.length > 4 ? ` +${v.length - 4} more` : ''))), h('div', { class: 'meta' }, `${v.length} files · ${fmt(v.reduce((a, x) => a + x.size, 0))}`)))),
         preview.moves.length ? null : h('div', { class: 'empty' }, 'This folder is already tidy.'), btn);
     },

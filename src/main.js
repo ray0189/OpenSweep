@@ -231,28 +231,42 @@ function organizeTarget(where) {
   if (where === 'custom' && organizeDir) return organizeDir;
   return app.getPath('downloads');
 }
+// Sort loose files by type. "all" = system-wide: every personal folder, each type sent to its library.
 function organizeDownloads({ apply, where }) {
-  const dir = organizeTarget(where);
+  const lib = { Images: 'pictures', Videos: 'videos', Music: 'music', Documents: 'documents' };
+  const sources = where === 'all' ? ['desktop', 'downloads', 'documents', 'pictures', 'videos', 'music'].map(k => app.getPath(k)) : [organizeTarget(where)];
   const moves = [];
-  let names = []; try { names = fs.readdirSync(dir); } catch { return { dir, moves, applied: false }; }
-  for (const name of names) {
-    const full = path.join(dir, name);
-    let st; try { st = fs.statSync(full); } catch { continue; }
-    if (!st.isFile() || name.startsWith('.') || /\.(crdownload|part|tmp)$/i.test(name)) continue;
-    const ext = path.extname(name).toLowerCase();
-    const folder = Object.keys(C.DOWNLOAD_TYPES).find(k => C.DOWNLOAD_TYPES[k].includes(ext));
-    if (folder) moves.push({ name, folder, size: st.size });
-  }
-  if (apply && !DEMO) {
-    for (const mv of moves) {
-      const destDir = path.join(dir, mv.folder);
-      fs.mkdirSync(destDir, { recursive: true });
-      let dest = path.join(destDir, mv.name), n = 1;
-      while (fs.existsSync(dest)) { const e = path.extname(mv.name); dest = path.join(destDir, `${path.basename(mv.name, e)} (${n++})${e}`); }
-      fs.renameSync(path.join(dir, mv.name), dest);
+  for (const dir of sources) {
+    let names = []; try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const name of names) {
+      const full = path.join(dir, name);
+      let st; try { st = fs.statSync(full); } catch { continue; }
+      if (!st.isFile() || name.startsWith('.') || /\.(crdownload|part|tmp)$/i.test(name) || name.toLowerCase() === 'desktop.ini') continue;
+      const ext = path.extname(name).toLowerCase();
+      const folder = Object.keys(C.DOWNLOAD_TYPES).find(k => C.DOWNLOAD_TYPES[k].includes(ext));
+      if (!folder) continue;
+      let destDir;
+      if (where !== 'all') destDir = path.join(dir, folder);
+      else if (lib[folder]) destDir = app.getPath(lib[folder]);
+      else destDir = path.join(app.getPath(folder === 'Code' ? 'documents' : 'downloads'), folder);
+      if (path.resolve(destDir) === path.resolve(dir)) continue; // already in the right place
+      moves.push({ name, from: full, destDir, folder: where === 'all' ? `${folder} → ${destDir}` : folder, size: st.size });
     }
   }
-  return { dir, moves, applied: !!apply && !DEMO };
+  const done = [];
+  if (apply && !DEMO) {
+    for (const mv of moves) {
+      try {
+        fs.mkdirSync(mv.destDir, { recursive: true });
+        let dest = path.join(mv.destDir, mv.name), n = 1;
+        while (fs.existsSync(dest)) { const e = path.extname(mv.name); dest = path.join(mv.destDir, `${path.basename(mv.name, e)} (${n++})${e}`); }
+        fs.renameSync(mv.from, dest);
+        done.push({ from: mv.from, to: dest });
+      } catch { /* in use: skip */ }
+    }
+    if (done.length) logHistory({ kind: 'files', summary: `Organised ${done.length} file(s)${where === 'all' ? ' across your folders' : ''}`, undo: { fn: 'organizeUndo', args: { moves: done } } });
+  }
+  return { dir: sources.join(', '), moves: moves.map(m => ({ name: m.name, folder: m.folder, size: m.size })), applied: !!apply && !DEMO, moved: done.length };
 }
 
 // ------------------------------------------------------------------ network latency (TCP connect time; only on user request)
@@ -320,6 +334,11 @@ const api = {
   },
   revealFile: ({ path: p }) => { if (cache.deletable.has(p) && !DEMO) shell.showItemInFolder(p); return { ok: true }; },
   organizeDownloads: ({ apply, where }) => organizeDownloads({ apply: !!apply, where }),
+  organizeUndo: ({ moves }) => {
+    let n = 0;
+    for (const m of moves || []) { try { if (fs.existsSync(m.to) && !fs.existsSync(m.from)) { fs.renameSync(m.to, m.from); n++; } } catch { /* skip */ } }
+    return { ok: true, restored: n };
+  },
   organizePick: async () => { const r = await dialog.showOpenDialog(win, { title: 'Folder to organise', properties: ['openDirectory'] }); if (r.canceled) return null; organizeDir = r.filePaths[0]; return organizeDir; },
 
   installedApps: async () => { const r = await backend.installedApps(); cache.apps = new Map((r || []).map(a => [a.id, a])); return r; },
@@ -498,8 +517,9 @@ Object.assign(api, extra, {
   guardRun: () => runGuard({ manual: true }),
 });
 
+const INTERNAL_ONLY = new Set(['organizeUndo', 'restoreBackup', '_stopAll']); // only reachable through History & undo
 ipcMain.handle('api', async (_e, method, args) => {
-  if (!Object.prototype.hasOwnProperty.call(api, method)) throw new Error('Unknown method ' + method);
+  if (!Object.prototype.hasOwnProperty.call(api, method) || INTERNAL_ONLY.has(method)) throw new Error('Unknown method ' + method);
   return api[method](args || {});
 });
 
