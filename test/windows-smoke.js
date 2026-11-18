@@ -69,6 +69,57 @@ async function step(name, fn) {
   if (as && !as.enabled) fail('setAutoStart', 'task not registered');
   await step('setAutoStart off', () => W.setAutoStart({ enabled: false, exe }));
 
+  // ---------------- v0.3 features
+  await step('isAdmin', () => W.isAdmin());
+  const sys = await step('asSystem whoami', () => W.asSystem('Out-Result @{ who = [Security.Principal.WindowsIdentity]::GetCurrent().Name }'));
+  if (sys && !/SYSTEM/i.test(sys.who || '')) fail('asSystem', `ran as ${sys && sys.who}`);
+  const rel = await step('reliability', () => W.reliability({ days: 14 }));
+  if (rel && rel.days.length !== 14) fail('reliability', 'wrong number of days');
+  // live process stream: wait for 2 samples
+  await step('process stream', () => new Promise((res, rej) => { let n = 0; const stop = W.startProcessStream(d => { if (++n === 2) { stop(); res({ procs: d.procs.length }); } }); setTimeout(() => { stop(); rej(new Error('no data from stream')); }, 30000); }));
+  await step('oldDrivers', () => W.oldDrivers());
+  await step('windowsOldSize', () => W.windowsOldSize());
+  await step('emptyFolders', () => W.emptyFolders(require('os').homedir()));
+  const progs = await step('programs', () => W.programs());
+  await step('browserExtensions', () => W.browserExtensions());
+  await step('optionalFeatures', () => W.optionalFeatures());
+  await step('wingetUpgrades', () => W.wingetUpgrades());
+  await step('orphanScan', () => W.orphanScan(progs || []));
+  // Fake app: folder + registry + Run entry + scheduled task; leftovers must find and remove them.
+  const fs = require('fs'), path = require('path');
+  const fakeDir = path.join(process.env.ProgramData, 'OpenSweepFakeApp');
+  fs.mkdirSync(fakeDir, { recursive: true }); fs.writeFileSync(path.join(fakeDir, 'fake.exe'), 'x'.repeat(5000));
+  await W._ps(`New-Item -Path 'HKCU:\\Software\\OpenSweepFakeApp' -Force | Out-Null; New-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'OpenSweepFakeApp' -Value ('"' + $a + '\\fake.exe"') -Force | Out-Null
+Register-ScheduledTask -TaskName 'OpenSweepFakeAppUpdate' -Action (New-ScheduledTaskAction -Execute ($a + '\\fake.exe')) -Trigger (New-ScheduledTaskTrigger -Daily -At 3am) -Force | Out-Null; Out-Json @{ ok=$true }`, fakeDir);
+  const left = await step('leftoverScan (fake app)', () => W.leftoverScan({ name: 'OpenSweepFakeApp', publisher: 'Nobody Inc', location: fakeDir, regKey: null }));
+  if (left) {
+    for (const want of ['dir', 'reg', 'run', 'task']) if (!left.some(i => i.type === want)) fail('leftoverScan', `did not find the ${want} leftover`);
+    const nonFile = left.filter(i => i.type !== 'dir' && i.type !== 'file');
+    const rm = await step('removeLeftovers', () => W.removeLeftovers(nonFile, 'FakeApp'));
+    if (rm) { for (const r of rm.results.filter(x => !x.ok)) fail('removeLeftovers', `${r.id}: ${r.error}`);
+      const again = await W.leftoverScan({ name: 'OpenSweepFakeApp', publisher: '', location: null, regKey: null });
+      if (again.some(i => i.type !== 'dir')) fail('removeLeftovers', 'items still present after removal');
+      await step('restoreBackup', () => W.restoreBackup(rm.backup));
+      const back = await W._ps("Out-Json (Test-Path 'HKCU:\\Software\\OpenSweepFakeApp')");
+      if (!back) fail('restoreBackup', 'registry key was not restored'); }
+    fs.rmSync(fakeDir, { recursive: true, force: true });
+    await W._ps("Remove-Item 'HKCU:\\Software\\OpenSweepFakeApp' -Recurse -Force -ErrorAction SilentlyContinue; Remove-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name OpenSweepFakeApp -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName OpenSweepFakeAppUpdate -Confirm:$false -ErrorAction SilentlyContinue; Out-Json 1");
+  }
+  // Install tracker: a folder created between start and finish must show up.
+  const t = await step('trackStart', () => W.trackStart('Smoke test'));
+  if (t) {
+    const trackDir = path.join(process.env.LOCALAPPDATA, 'OpenSweepTrackTest'); fs.mkdirSync(trackDir, { recursive: true });
+    const done = await step('trackFinish', () => W.trackFinish(t.id));
+    if (done && !done.diff.dirs.some(d => d.toLowerCase() === trackDir.toLowerCase())) fail('install tracker', 'new folder not detected');
+    fs.rmSync(trackDir, { recursive: true, force: true });
+  }
+  // Space analyzer worker on the user profile
+  const disk = require('../src/backend/disk');
+  const ds = await step('disk scan', () => disk.start(process.env.USERPROFILE, () => {}));
+  if (ds && !(ds.files > 0)) fail('disk scan', 'no files found');
+  await step('setCleanSchedule weekly', () => W.setCleanSchedule({ freq: 'weekly', exe: process.execPath }));
+  await step('setCleanSchedule off', () => W.setCleanSchedule({ freq: 'off', exe: process.execPath }));
+
   console.log(failures ? `\n${failures} problem(s) found` : '\nAll good');
   process.exit(failures ? 1 : 0);
 })().catch(e => { console.error(e); process.exit(1); });

@@ -1,7 +1,7 @@
 {
   "name": "opensweep",
   "productName": "OpenSweep",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Free, open-source PC care toolkit for Windows 10/11: cleanup, boost, startup, privacy, tweaks, repair and more.",
   "main": "src/main.js",
   "license": "MIT",
@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron .",
     "demo": "electron . --demo",
-    "check": "node --check src/main.js && node --check src/preload.js && node --check src/backend/windows.js && node --check src/backend/mock.js && node --check src/backend/catalog.js && node --check src/renderer/app.js",
+    "check": "node test/check.js",
     "dist:win": "electron-builder --win --x64",
     "dist:win-arm64": "electron-builder --win --arm64",
     "test:windows": "node test/windows-smoke.js"
