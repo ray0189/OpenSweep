@@ -107,7 +107,7 @@ PAGES.storage = async (main) => {
   const wrap = h('div');
   main.append(pageHead('Space analyzer', 'See exactly what fills your drives, find what you can remove, and track how folders grow.'), wrap);
   const draw = async () => {
-    wrap.replaceChildren(tabs([['analyzer', 'Analyzer', 'pie'], ['dupes', 'Duplicates', 'copy'], ['large', 'Large files', 'file'], ['downloads', 'Organise Downloads', 'download']], tab, (id) => { tab = S.cache.storageTab = id; draw(); }));
+    wrap.replaceChildren(tabs([['analyzer', 'Analyzer', 'pie'], ['dupes', 'Duplicates', 'copy'], ['large', 'Large files', 'file'], ['downloads', 'Organise files', 'folder']], tab, (id) => { tab = S.cache.storageTab = id; draw(); }));
     const out = h('div'); wrap.append(out);
     if (tab === 'analyzer') await analyzer(out); else await storageTools(out, tab);
   };

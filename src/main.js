@@ -213,11 +213,29 @@ function installUpdate() {
 
 function fmt(b) { const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++; } return `${b.toFixed(i > 1 ? 1 : 0)} ${u[i]}`; }
 
+// Move to the Recycle Bin; if Electron's call fails (seen on some elevated setups), use Windows' own API.
+async function recycle(p) {
+  try { await shell.trashItem(p); }
+  catch (e) {
+    if (process.platform !== 'win32') throw e;
+    await backend.recycle(p);
+  }
+  if (fs.existsSync(p)) throw new Error('Windows did not delete it (the file may be open in another app)');
+}
+
 // ------------------------------------------------------------------ downloads organiser (pure Node)
-function organizeDownloads({ apply }) {
-  const dir = app.getPath('downloads');
+let organizeDir = null; // a folder the user picked with the folder dialog
+function organizeTarget(where) {
+  if (where === 'desktop') return app.getPath('desktop');
+  if (where === 'documents') return app.getPath('documents');
+  if (where === 'custom' && organizeDir) return organizeDir;
+  return app.getPath('downloads');
+}
+function organizeDownloads({ apply, where }) {
+  const dir = organizeTarget(where);
   const moves = [];
-  for (const name of fs.readdirSync(dir)) {
+  let names = []; try { names = fs.readdirSync(dir); } catch { return { dir, moves, applied: false }; }
+  for (const name of names) {
     const full = path.join(dir, name);
     let st; try { st = fs.statSync(full); } catch { continue; }
     if (!st.isFile() || name.startsWith('.') || /\.(crdownload|part|tmp)$/i.test(name)) continue;
@@ -294,14 +312,15 @@ const api = {
     const res = [];
     for (const p of paths || []) {
       if (!cache.deletable.has(p)) { res.push({ path: p, ok: false, error: 'Not from a scan result' }); continue; }
-      try { if (!DEMO) await shell.trashItem(p); cache.deletable.delete(p); res.push({ path: p, ok: true }); }
+      try { if (!DEMO) await recycle(p); cache.deletable.delete(p); res.push({ path: p, ok: true }); }
       catch (e) { res.push({ path: p, ok: false, error: e.message }); }
     }
     logHistory({ kind: 'files', summary: `Moved ${res.filter(r => r.ok).length} file(s) to the Recycle Bin` });
     return res;
   },
   revealFile: ({ path: p }) => { if (cache.deletable.has(p) && !DEMO) shell.showItemInFolder(p); return { ok: true }; },
-  organizeDownloads: ({ apply }) => organizeDownloads({ apply: !!apply }),
+  organizeDownloads: ({ apply, where }) => organizeDownloads({ apply: !!apply, where }),
+  organizePick: async () => { const r = await dialog.showOpenDialog(win, { title: 'Folder to organise', properties: ['openDirectory'] }); if (r.canceled) return null; organizeDir = r.filePaths[0]; return organizeDir; },
 
   installedApps: async () => { const r = await backend.installedApps(); cache.apps = new Map((r || []).map(a => [a.id, a])); return r; },
   uninstallApp: async ({ id }) => {
@@ -473,7 +492,7 @@ const api = {
   closeWidget: () => { settings.showWidget = false; saveSettings(); applySettings(); return { ok: true }; },
 };
 
-const extra = require('./api-extra')({ backend, DEMO, app, shell, dialog, send: (...a) => send(...a), logHistory, fmt, getWin: () => win });
+const extra = require('./api-extra')({ recycle, backend, DEMO, app, shell, dialog, send: (...a) => send(...a), logHistory, fmt, getWin: () => win });
 Object.assign(api, extra, {
   guardStatus: () => ({ enabled: !!settings.settingsGuard, count: (settings.guardTweaks || []).length }),
   guardRun: () => runGuard({ manual: true }),

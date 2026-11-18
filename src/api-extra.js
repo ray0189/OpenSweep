@@ -9,10 +9,10 @@ const C = require('./backend/catalog');
 const disk = require('./backend/disk');
 
 module.exports = function extraApi(ctx) {
-  const { backend, DEMO, app, shell, dialog, send, logHistory, fmt, getWin } = ctx;
+  const { backend, DEMO, app, shell, dialog, send, logHistory, fmt, getWin, recycle } = ctx;
   const cache = { programs: new Map(), leftovers: new Map(), clean: new Map(), exts: new Map(), features: new Set(), winget: new Map(), procs: new Map() };
   const str = (x, max = 4096) => { if (typeof x !== 'string' || x.length > max) throw new Error('Invalid argument'); return x; };
-  const trash = async (p) => { if (DEMO) return; await shell.trashItem(p); };
+  const trash = async (p) => { if (DEMO) return; await recycle(p); };
 
   // ------------------------------------------------------------ Clean everything
   async function cleanAllScan() {

@@ -489,14 +489,19 @@ async function storageTools(main, tab) {
     },
     downloads: async (out) => {
       const res = h('div', {}, loading());
-      out.append(h('div', { class: 'card' }, h('div', { class: 'sub' }, 'Sorts files in your Downloads folder into sub-folders by type (Images, Documents, Installers…). Nothing is deleted.'), res));
-      const preview = await call('organizeDownloads', { apply: false });
+      out.append(h('div', { class: 'card' }, h('div', { class: 'sub' }, 'Sorts the files in a folder into sub-folders by type (Images, Documents, Videos, Installers…). Nothing is deleted.'), res));
+      S.cache.orgWhere = S.cache.orgWhere || 'downloads';
+      const where = S.cache.orgWhere;
+      const pick = h('div', { class: 'pill-group', style: { margin: '10px 0' } }, [['downloads', 'Downloads'], ['desktop', 'Desktop'], ['documents', 'Documents'], ['custom', 'Other folder…']].map(([id, l]) =>
+        h('button', { class: 'chip' + (where === id ? ' active' : ''), onclick: async () => { if (id === 'custom' && !(await call('organizePick'))) return; S.cache.orgWhere = id; out.replaceChildren(); views.downloads(out); } }, l)));
+      res.before(pick);
+      const preview = await call('organizeDownloads', { apply: false, where });
       const by = {};
       preview.moves.forEach(m => { (by[m.folder] = by[m.folder] || []).push(m); });
       const btn = h('button', { class: 'btn primary', disabled: !preview.moves.length }, `Organise ${preview.moves.length} files`);
-      btn.onclick = () => busy(btn, async () => { const r = await call('organizeDownloads', { apply: true }); toast(r.applied ? `Organised ${r.moves.length} files` : 'Demo mode: no files were moved'); });
+      btn.onclick = () => busy(btn, async () => { const r = await call('organizeDownloads', { apply: true, where }); toast(r.applied ? `Organised ${r.moves.length} files` : 'Demo mode: no files were moved'); });
       res.replaceChildren(h('div', { class: 'list', style: { margin: '10px 0' } }, Object.entries(by).map(([k, v]) => h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, k), h('div', { class: 'desc' }, v.slice(0, 4).map(x => x.name).join(', ') + (v.length > 4 ? ` +${v.length - 4} more` : ''))), h('div', { class: 'meta' }, `${v.length} files · ${fmt(v.reduce((a, x) => a + x.size, 0))}`)))),
-        preview.moves.length ? null : h('div', { class: 'empty' }, 'Downloads is already tidy.'), btn);
+        preview.moves.length ? null : h('div', { class: 'empty' }, 'This folder is already tidy.'), btn);
     },
   };
   const out = h('div');

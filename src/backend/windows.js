@@ -540,8 +540,15 @@ if ($a.freq -ne 'off') {
 Out-Result @{ ok=$true; enabled=[bool](Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) }`, { freq, exe });
 }
 
+async function recycle(p) {
+  return ps(`Add-Type -AssemblyName Microsoft.VisualBasic
+if (Test-Path -LiteralPath $a -PathType Container) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($a, 'OnlyErrorDialogs', 'SendToRecycleBin') }
+else { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($a, 'OnlyErrorDialogs', 'SendToRecycleBin') }
+Out-Json @{ ok = $true }`, p, { timeout: 10 * 60 * 1000 });
+}
+
 module.exports = {
-  ...extra, setCleanSchedule,
+  ...extra, setCleanSchedule, recycle,
   demo: false,
   systemInfo, processes, killProcess, boost, cleanupScan, cleanupRun, largeFiles, duplicates, folderSizes,
   installedApps, uninstallApp, startupItems, setStartup, security, defenderAction, threats, network, networkAction,
