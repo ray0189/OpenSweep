@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, screen, Notification, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, screen, Notification, powerMonitor, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -14,7 +14,7 @@ let win = null, widget = null, tray = null, quitting = false;
 // ------------------------------------------------------------------ settings
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
 const DEFAULTS = { theme: 'system', minimizeToTray: true, showWidget: false, launchAtLogin: false, confirmActions: true, scanRoot: '', shortcuts: [], history: [],
-  autoUpdate: true, stabilityMonitor: true, stabilityNotify: true, stabilitySeen: null };
+  autoUpdate: true, stabilityMonitor: true, stabilityNotify: true, stabilitySeen: null, settingsGuard: true, guardTweaks: [], autoClean: 'off' };
 let settings = { ...DEFAULTS };
 function loadSettings() { try { settings = { ...DEFAULTS, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) }; } catch { settings = { ...DEFAULTS }; } }
 function saveSettings() { try { fs.mkdirSync(path.dirname(settingsFile()), { recursive: true }); fs.writeFileSync(settingsFile(), JSON.stringify(settings, null, 2)); } catch { /* non-fatal */ } }
@@ -90,11 +90,11 @@ async function health() {
   const stab = stability && Date.now() - new Date(stability.checkedAt).getTime() < 3 * 3600e3 ? stability : await runStability({ manual: true }).catch(() => null);
   if (stab) {
     const dev = (stab.devices || []).length;
-    if (dev) add('high', `${dev} device${dev > 1 ? 's have' : ' has'} a driver problem`, (stab.devices || []).slice(0, 3).map(d => `${d.name}: ${d.problem}`).join(' · '), { go: 'stability' });
+    if (dev) add('high', `${dev} device${dev > 1 ? 's have' : ' has'} a driver problem`, (stab.devices || []).slice(0, 3).map(d => `${d.name}: ${d.problem}`).join(' · '), { go: 'reliability' });
     const bsod = (stab.events || []).filter(e => e.kind === 'Blue screen').length;
-    if (bsod) add('high', `${bsod} blue screen${bsod > 1 ? 's' : ''} in the last ${stab.days} days`, 'Usually a driver or hardware problem.', { go: 'stability' });
+    if (bsod) add('high', `${bsod} blue screen${bsod > 1 ? 's' : ''} in the last ${stab.days} days`, 'Usually a driver or hardware problem.', { go: 'reliability' });
     const other = (stab.events || []).filter(e => e.kind !== 'Blue screen').length;
-    if (other) add('medium', `${other} stability warning${other > 1 ? 's' : ''} in the last ${stab.days} days`, [...new Set((stab.events || []).filter(e => e.kind !== 'Blue screen').map(e => e.kind))].join(', '), { go: 'stability' });
+    if (other) add('medium', `${other} stability warning${other > 1 ? 's' : ''} in the last ${stab.days} days`, [...new Set((stab.events || []).filter(e => e.kind !== 'Blue screen').map(e => e.kind))].join(', '), { go: 'reliability' });
   }
   if (m.memPct > 85) add('medium', `Memory is ${m.memPct}% used`, '', { fix: 'boost', label: 'Boost' });
 
@@ -124,7 +124,7 @@ function runStability({ manual = false } = {}) {
       settings.stabilitySeen = keys.slice(0, 500); saveSettings();
       if (!manual && !first && fresh.length && settings.stabilityNotify) {
         const nd = fresh.filter(k => k.startsWith('dev|')).length, ne = fresh.length - nd;
-        notify('OpenSweep: stability check', [nd ? `${nd} device(s) have a driver problem` : '', ne ? `${ne} new crash/hardware event(s)` : ''].filter(Boolean).join(' · '), () => { showMain(); send('go', 'stability'); });
+        notify('OpenSweep: stability check', [nd ? `${nd} device(s) have a driver problem` : '', ne ? `${ne} new crash/hardware event(s)` : ''].filter(Boolean).join(' · '), () => { showMain(); send('go', 'reliability'); });
       }
       send('stability', r);
       return r;
@@ -141,9 +141,42 @@ function scheduleStability() {
     if (Date.now() - last < every - 60e3) return;
     last = Date.now();
     runStability().catch(() => {});
+    runGuard().catch(() => {});
   };
   setTimeout(tick, 90e3);
   setInterval(tick, 15 * 60e3);
+}
+
+// ------------------------------------------------------------------ settings guard (keeps your tweaks applied)
+let guardRunning = false;
+async function runGuard({ manual = false } = {}) {
+  if (DEMO || guardRunning || (!settings.settingsGuard && !manual)) return { restored: [] };
+  const ids = (settings.guardTweaks || []).filter(id => C.TWEAKS.some(t => t.id === id));
+  if (!ids.length) return { restored: [], checked: 0 };
+  guardRunning = true;
+  try {
+    const states = await backend.tweakStates();
+    const reverted = ids.filter(id => states[id] === false);
+    if (!reverted.length) return { restored: [], checked: ids.length };
+    const r = await backend.setTweaks(reverted.map(id => ({ id, on: true })));
+    const failedIds = new Set((r.failed || []).map(f => f.id));
+    const restored = reverted.filter(id => !failedIds.has(id)).map(id => C.TWEAKS.find(t => t.id === id).title);
+    if (restored.length) {
+      logHistory({ kind: 'guard', summary: `Settings guard: Windows undid ${restored.length} setting(s) — restored (${restored.slice(0, 3).join(', ')}${restored.length > 3 ? '…' : ''})` });
+      notify('OpenSweep kept your settings', `Windows undid ${restored.length} of your settings. They have been put back.`, () => { showMain(); send('go', 'history'); });
+    }
+    return { restored, failed: r.failed || [], checked: ids.length };
+  } finally { guardRunning = false; }
+}
+
+// ------------------------------------------------------------------ scheduled cleaning (--auto-clean)
+async function autoClean() {
+  const ids = C.CLEANUP.filter(c => c.rec).map(c => c.id);
+  const r = await backend.cleanupRun({ ids, elevate: true });
+  const freed = (r || []).reduce((a, x) => a + (x.freed || 0), 0);
+  logHistory({ kind: 'cleanup', summary: `Scheduled clean freed ${fmt(freed)}` });
+  notify('OpenSweep cleaned your PC', `Scheduled clean freed ${fmt(freed)}.`);
+  return freed;
 }
 
 // ------------------------------------------------------------------ auto-update from GitHub Releases
@@ -325,6 +358,10 @@ const api = {
     if (!valid.length) return { ok: true };
     const r = await backend.setTweaks(valid);
     const done = valid.filter(c => !(r.failed || []).some(f => f.id === c.id));
+    // Settings guard remembers what you turned on, and forgets what you turned off.
+    const g = new Set(settings.guardTweaks || []);
+    done.forEach(c => (c.on ? g.add(c.id) : g.delete(c.id)));
+    settings.guardTweaks = [...g];
     if (done.length) logHistory({ kind: 'tweaks', summary: `${label || 'Settings changed'} (${done.length} verified${r.failed && r.failed.length ? `, ${r.failed.length} failed` : ''})`, undo: { fn: 'setTweaks', args: { changes: done.map(c => ({ id: c.id, on: !c.on })), label: `Undo: ${label || 'settings'}` } } });
     return r;
   },
@@ -400,13 +437,16 @@ const api = {
   },
   openRepo: () => shell.openExternal('https://github.com/'),
 
-  getSettings: () => ({ ...settings, history: undefined, stabilitySeen: undefined }),
+  getSettings: () => ({ ...settings, history: undefined, stabilitySeen: undefined, guardTweaks: undefined, guardCount: (settings.guardTweaks || []).length }),
   setSettings: ({ patch }) => {
-    const allowed = ['theme', 'minimizeToTray', 'showWidget', 'launchAtLogin', 'confirmActions', 'scanRoot', 'shortcuts', 'autoUpdate', 'stabilityMonitor', 'stabilityNotify'];
+    const allowed = ['theme', 'minimizeToTray', 'showWidget', 'launchAtLogin', 'confirmActions', 'scanRoot', 'shortcuts', 'autoUpdate', 'stabilityMonitor', 'stabilityNotify', 'settingsGuard', 'autoClean', 'compactNav'];
+    if ('autoClean' in (patch || {}) && !['off', 'weekly', 'monthly'].includes(patch.autoClean)) throw new Error('Invalid schedule');
+    const cleanChanged = 'autoClean' in (patch || {}) && patch.autoClean !== settings.autoClean;
     for (const k of allowed) if (k in (patch || {})) settings[k] = patch[k];
     if (Array.isArray(settings.shortcuts)) settings.shortcuts = settings.shortcuts.slice(0, 50).map(s => ({ name: String(s.name).slice(0, 60), target: String(s.target).slice(0, 1024) }));
     saveSettings();
     applySettings();
+    if (cleanChanged && !DEMO) backend.setCleanSchedule({ freq: settings.autoClean, exe: process.execPath }).catch(e => logHistory({ kind: 'cleanup', summary: `Could not set the cleaning schedule: ${e.message}` }));
     return api.getSettings();
   },
   history: () => settings.history,
@@ -432,6 +472,12 @@ const api = {
   installUpdate: () => installUpdate(),
   closeWidget: () => { settings.showWidget = false; saveSettings(); applySettings(); return { ok: true }; },
 };
+
+const extra = require('./api-extra')({ backend, DEMO, app, shell, dialog, send: (...a) => send(...a), logHistory, fmt, getWin: () => win });
+Object.assign(api, extra, {
+  guardStatus: () => ({ enabled: !!settings.settingsGuard, count: (settings.guardTweaks || []).length }),
+  guardRun: () => runGuard({ manual: true }),
+});
 
 ipcMain.handle('api', async (_e, method, args) => {
   if (!Object.prototype.hasOwnProperty.call(api, method)) throw new Error('Unknown method ' + method);
@@ -491,10 +537,15 @@ let autoStartApplied = null;
 
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
-  app.on('second-instance', showMain);
+  app.on('second-instance', (_e, argv) => { if (argv.includes('--auto-clean')) autoClean().catch(() => {}); else showMain(); });
   app.whenReady().then(() => {
     app.setAppUserModelId('org.opensweep.app');
     loadSettings();
+    if (process.argv.includes('--auto-clean')) {
+      // Scheduled run: clean quietly, then quit.
+      autoClean().catch(() => {}).finally(() => setTimeout(() => { quitting = true; app.quit(); }, 8000));
+      return;
+    }
     createMain();
     if (process.argv.includes('--hidden')) win.once('ready-to-show', () => win.hide());
     try { createTray(); } catch { /* tray unsupported */ }
@@ -502,8 +553,9 @@ else {
     applySettings();
     setupUpdater();
     scheduleStability();
+    if (!DEMO) setTimeout(() => runGuard().catch(() => {}), 120e3);
   });
-  app.on('before-quit', () => { quitting = true; });
+  app.on('before-quit', () => { quitting = true; try { extra._stopAll(); } catch { /* ignore */ } });
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
   app.on('activate', showMain);
 }

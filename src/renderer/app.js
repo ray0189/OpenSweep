@@ -4,6 +4,9 @@
 
 // ------------------------------------------------------------------ helpers
 const $ = (s, r = document) => r.querySelector(s);
+// Let append/replaceChildren/prepend/after skip null/false (used for optional pieces of UI).
+for (const proto of [Element.prototype, DocumentFragment.prototype]) for (const m of ['append', 'replaceChildren', 'prepend']) { const orig = proto[m]; proto[m] = function (...a) { return orig.apply(this, a.flat(Infinity).filter(x => x !== null && x !== undefined && x !== false)); }; }
+{ const orig = Element.prototype.after; Element.prototype.after = function (...a) { return orig.apply(this, a.filter(x => x !== null && x !== undefined && x !== false)); }; }
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -21,7 +24,7 @@ const fmt = (b) => { if (b === null || b === undefined || isNaN(b)) return '—'
 const pct = (a, b) => (b ? Math.round((100 * a) / b) : 0);
 const ago = (iso) => { if (!iso) return '—'; const d = (Date.now() - new Date(iso).getTime()) / 86400e3; return d < 1 ? 'today' : `${Math.floor(d)} day${d >= 2 ? 's' : ''} ago`; };
 
-function toast(msg, err) { const t = h('div', { class: 'toast' + (err ? ' err' : '') }, msg); $('#toasts').append(t); setTimeout(() => t.remove(), err ? 7000 : 3800); }
+function toast(msg, err) { const t = h('div', { class: 'toast' + (err ? ' err' : '') }, icon(err ? 'alert' : 'check'), h('div', {}, String(msg).replace(/^✓\s*/, ''))); $('#toasts').append(t); setTimeout(() => t.remove(), err ? 8000 : 4000); }
 async function call(method, args) {
   try { return await window.api.call(method, args); }
   catch (e) { toast(String(e.message || e).replace(/^Error invoking remote method 'api': (Error: )?/, ''), true); throw e; }
@@ -38,56 +41,114 @@ function confirmDlg(title, text, okLabel = 'Continue') {
   });
 }
 const loading = (msg = 'Loading…') => h('div', { class: 'loading' }, h('span', { class: 'spinner' }), msg);
+const emptyState = (msg, ico = 'check', good = true) => h('div', { class: 'empty' + (good ? ' good' : '') }, icon(ico), h('div', {}, msg));
+const skeleton = (n = 4) => h('div', {}, [...Array(n)].map((_, i) => h('div', { class: 'skeleton sk-line', style: { width: `${90 - i * 12}%` } })));
+// Status circle shown at the far right of every setting: ✓ applied, ✗ not applied, ! Windows didn't keep it.
+function stateDot(st, reason) {
+  const map = { on: ['check', 'Applied — verified with Windows'], off: ['x', 'Not applied'], fail: ['alert', reason || "Windows didn't keep this setting"], busy: [null, 'Applying…'] };
+  const [ic, tip] = map[st] || map.off;
+  return h('span', { class: 'state ' + st, title: tip, role: 'img', 'aria-label': tip }, ic ? icon(ic) : null);
+}
+let S_FAILS = {}; // tweak id -> reason it did not apply (from the last attempt)
+function tweakState(id, states) { return S_FAILS[id] && !states[id] ? 'fail' : states[id] ? 'on' : 'off'; }
+// One row for a registry tweak: title, tags, description, toggle and status circle.
+function settingRow(t, states, after) {
+  const dot = stateDot(tweakState(t.id, states), S_FAILS[t.id]);
+  const tg = toggle(!!states[t.id], async (on, input) => {
+    input.disabled = true; dot.replaceWith(stateDot('busy'));
+    try { const r = await call('setTweaks', { changes: [{ id: t.id, on }], label: `${on ? 'Applied' : 'Reverted'}: ${t.title}` }); if (r && r.states) Object.assign(states, r.states); else states[t.id] = on; reportTweaks(r, `${on ? 'Applied' : 'Reverted'}: ${t.title}`); }
+    catch { /* toast shown */ }
+    finally { if (after) after(); }
+  });
+  return h('div', { class: 'item' },
+    h('div', { class: 'body' }, h('div', { class: 'title' }, t.title, recTag(t.rec), adminTag(t.admin)), t.desc ? h('div', { class: 'desc' }, t.desc) : null),
+    h('div', { class: 'controls' }, tg, dot));
+}
 const toggle = (checked, onchange, disabled) => h('label', { class: 'toggle' }, h('input', { type: 'checkbox', checked, disabled, onchange: (e) => onchange(e.target.checked, e.target) }), h('span'));
 async function busy(btn, fn, label) {
   const old = btn.textContent; btn.disabled = true; btn.replaceChildren(h('span', { class: 'spinner' }), ' ', label || old);
   try { return await fn(); } finally { btn.disabled = false; btn.textContent = old; }
 }
-function pageHead(title, sub, ...actions) { return h('div', { class: 'page-head' }, h('div', {}, h('h1', {}, title), sub ? h('p', {}, sub) : null), h('div', { class: 'row' }, actions)); }
-function tabs(names, active, onpick) { return h('div', { class: 'tabs' }, names.map(([id, label]) => h('button', { class: 'tab' + (id === active ? ' active' : ''), onclick: () => onpick(id) }, label))); }
-const adminTag = (x) => (x ? h('span', { class: 'tag admin', title: 'Windows will ask for administrator permission' }, 'admin') : null);
+function pageHead(title, sub, ...actions) {
+  const nav = NAV.flatMap(g => g[1]).find(x => x[0] === S.page);
+  return h('div', { class: 'page-head' }, h('div', { class: 'ttl' }, icon(nav ? nav[1] : HIDDEN_ROUTES[S.page] || 'dots'), h('div', {}, h('h1', {}, title), sub ? h('p', {}, sub) : null)), h('div', { class: 'row' }, actions));
+}
+function tabs(names, active, onpick) { return h('div', { class: 'tabs', role: 'tablist' }, names.map(([id, label, ic, count]) => h('button', { class: 'tab' + (id === active ? ' active' : ''), role: 'tab', 'aria-selected': id === active ? 'true' : 'false', onclick: () => onpick(id) }, ic ? icon(ic) : null, label, count !== undefined && count !== null ? h('span', { class: 'count' }, String(count)) : null))); }
+const btn = (label, onclick, { kind = '', ic = null, small = false, disabled = false, title = null } = {}) => h('button', { class: `btn ${kind}${small ? ' small' : ''}`, onclick, disabled, title }, ic ? icon(ic) : null, label);
+function searchBox(placeholder, oninput, value = '') { const i = h('input', { type: 'search', placeholder, value, oninput }); return [h('label', { class: 'search' }, icon('search'), i), i]; }
+function menu(ev, items) {
+  document.querySelectorAll('.menu').forEach(m => m.remove());
+  const m = h('div', { class: 'menu', role: 'menu' }, items.map(it => it === '-' ? h('hr') : h('button', { class: it.danger ? 'danger' : '', onclick: () => { m.remove(); it.run(); } }, icon(it.icon || 'dots'), it.label)));
+  document.body.append(m);
+  const r = m.getBoundingClientRect();
+  m.style.left = Math.min(ev.clientX, innerWidth - r.width - 8) + 'px'; m.style.top = Math.min(ev.clientY, innerHeight - r.height - 8) + 'px';
+  setTimeout(() => document.addEventListener('click', () => m.remove(), { once: true }), 0);
+}
+const COLORS = ['var(--c1)', 'var(--c2)', 'var(--c3)', 'var(--c4)', 'var(--c5)', 'var(--c6)', 'var(--c7)', 'var(--c8)', 'var(--c9)', 'var(--c10)'];
+function sparkline(values, { max = 100, color = 'var(--accent)', h: H = 44 } = {}) {
+  const W = 200, n = Math.max(2, values.length);
+  const pts = values.map((v, i) => `${(i / (n - 1)) * W},${H - (Math.min(max, v) / max) * (H - 4) - 2}`).join(' ');
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`); svg.setAttribute('preserveAspectRatio', 'none'); svg.setAttribute('class', 'spark');
+  svg.innerHTML = values.length > 1 ? `<polyline points="0,${H} ${pts} ${W},${H}" fill="${color}" fill-opacity=".12" stroke="none"/><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>` : '';
+  return svg;
+}
+const adminTag = (x) => (!x ? null : S.info && S.info.isAdmin
+  ? h('span', { class: 'tag admin ok', title: 'Needs administrator rights — OpenSweep is running as administrator' }, icon('check'), 'admin')
+  : h('span', { class: 'tag admin', title: 'Needs administrator rights — Windows will ask for permission' }, 'admin'));
 const recTag = (x) => (x ? h('span', { class: 'tag rec' }, 'recommended') : null);
 function meter(p, warnAt = 75, badAt = 90) { return h('div', { class: 'meter' + (p >= badAt ? ' bad' : p >= warnAt ? ' warn' : '') }, h('div', { style: { width: Math.min(100, p) + '%' } })); }
 
 // ------------------------------------------------------------------ state + router
-const S = { page: 'home', timers: [], C: null, info: null, settings: null, cache: {} };
+const S = { page: 'home', timers: [], C: null, info: null, settings: null, cache: {}, listeners: {}, onLeave: null };
 const NAV = [
-  ['Overview', [['home', '⌂', 'Home'], ['cleanup', '✧', 'Cleanup'], ['optimize', '⚡', 'Optimize'], ['debloat', '✂', 'Debloat & AI']]],
-  ['Manage', [['startup', '⏻', 'Startup apps'], ['apps', '▦', 'Installed apps'], ['processes', '≋', 'Processes'], ['storage', '◔', 'Storage']]],
-  ['Protect', [['security', '⛨', 'Security'], ['stability', '⚕', 'Drivers & stability'], ['updates', '⟳', 'Windows Update'], ['network', '⇅', 'Network']]],
-  ['Tools', [['repair', '✚', 'Repair & power'], ['toolbox', '⚒', 'Toolbox'], ['system', 'ⓘ', 'System info'], ['history', '↺', 'History & undo'], ['settings', '⚙', 'Settings']]],
+  ['Overview', [['home', 'home', 'Home'], ['clean', 'sparkles', 'Clean everything'], ['optimize', 'sliders', 'Optimize'], ['debloat', 'scissors', 'Debloat & AI']]],
+  ['Manage', [['apps', 'package', 'Uninstaller'], ['storage', 'pie', 'Space analyzer'], ['startup', 'power', 'Startup apps'], ['processes', 'activity', 'Processes']]],
+  ['Protect', [['security', 'shield', 'Security'], ['reliability', 'pulse', 'Reliability'], ['updates', 'refresh', 'Windows Update'], ['network', 'wifi', 'Network']]],
+  ['Tools', [['repair', 'repair', 'Repair & power'], ['toolbox', 'grid', 'Toolbox'], ['system', 'info', 'System info'], ['history', 'history', 'History & undo'], ['settings', 'gear', 'Settings']]],
 ];
+const HIDDEN_ROUTES = { cleanup: 'sparkles', stability: 'pulse' };
 function renderNav() {
   const nav = $('#sidebar');
+  const u = S.update || {};
   nav.replaceChildren(
-    h('div', { class: 'brand' }, h('div', { class: 'logo' }, '✦'), 'OpenSweep'),
+    h('div', { class: 'brand' }, h('div', { class: 'logo' }, icon('sparkles')), h('span', { class: 'name' }, 'OpenSweep')),
     ...NAV.map(([label, items]) => h('div', { class: 'nav-group' }, h('div', { class: 'nav-label' }, label),
-      items.map(([id, ico, name]) => h('button', { class: 'nav-item' + (S.page === id ? ' active' : ''), onclick: () => go(id) }, h('span', { class: 'ico' }, ico), name)))),
-    h('div', { class: 'sidebar-foot' }, S.info.demo ? h('div', {}, h('span', { class: 'demo-badge' }, 'DEMO'), ' sample data — no changes are made') : null, h('div', {}, `v${S.info.version} · MIT licensed`)));
+      items.map(([id, ic, name]) => h('button', { class: 'nav-item' + (S.page === id ? ' active' : ''), title: name, onclick: () => go(id) }, icon(ic), h('span', {}, name))))),
+    h('div', { class: 'sidebar-foot' },
+      S.info.demo ? h('div', { class: 'line' }, h('span', { class: 'demo-badge' }, 'DEMO'), h('span', { class: 'txt' }, 'sample data, no changes')) : null,
+      h('div', { class: 'line', title: S.info.isAdmin ? 'Running as administrator' : 'Not running as administrator' }, h('span', { class: 'state ' + (S.info.isAdmin ? 'on' : 'fail'), style: { width: '16px', height: '16px' } }, icon(S.info.isAdmin ? 'check' : 'alert')), h('span', { class: 'txt' }, S.info.isAdmin ? 'Administrator' : 'Limited mode')),
+      h('div', { class: 'line txt' }, `v${S.info.version}${u.state === 'ready' ? ' · update ready' : u.state === 'downloading' ? ` · updating ${u.progress || 0}%` : ''} · MIT`)));
 }
 function go(page) {
-  S.timers.forEach(clearInterval); S.timers = [];
+  S.timers.forEach(clearInterval); S.timers = []; S.listeners = {};
   S.page = page; renderNav();
-  const main = $('#main'); main.scrollTop = 0; main.replaceChildren(...banners());
-  (PAGES[page] || PAGES.home)(main).catch(e => { console.error(e); main.append(h('div', { class: 'banner' }, 'Something went wrong: ' + e.message)); });
+  document.querySelectorAll('.menu').forEach(m => m.remove());
+  if (S.onLeave) { try { S.onLeave(); } catch { /* ignore */ } S.onLeave = null; }
+  const main = $('#main'); main.scrollTop = 0;
+  const pg = h('div', { class: 'page' });
+  main.replaceChildren(pg);
+  const fn = PAGES[S.page] || PAGES.home;
+  fn(pg).then(() => { const bs = banners(); if (bs.length) pg.querySelector('.page-head')?.after(...bs); })
+    .catch(e => { console.error(e); pg.append(h('div', { class: 'banner bad' }, icon('alert'), 'Something went wrong: ' + e.message)); });
 }
 
 function banners() {
   const out = [];
-  if (S.info && !S.info.demo && !S.info.isAdmin) out.push(h('div', { class: 'banner' }, 'OpenSweep is not running as administrator, so many changes cannot be applied. ',
+  if (S.info && !S.info.demo && !S.info.isAdmin) out.push(h('div', { class: 'banner' }, icon('alert'), 'OpenSweep is not running as administrator, so many changes cannot be applied.',
     h('button', { class: 'btn small primary', onclick: () => call('relaunchAsAdmin') }, 'Restart as administrator')));
-  if (S.update && S.update.state === 'ready') out.push(h('div', { class: 'banner good' }, `OpenSweep ${S.update.version} is ready. `,
+  if (S.update && S.update.state === 'ready') out.push(h('div', { class: 'banner good' }, icon('download'), `OpenSweep ${S.update.version} is ready to install.`,
     h('button', { class: 'btn small primary', onclick: () => call('installUpdate') }, 'Restart to update')));
   return out;
 }
 
 // ------------------------------------------------------------------ shared actions
 const PRESETS = [
-  { id: 'annoy', ico: '☺', t: 'Fix Windows annoyances', d: 'The most-complained-about things: slow folders, forced restarts, account nags, Sticky Keys, Edge tabs in Alt+Tab, Outlook reinstalling.', tweaks: (C) => C.TWEAKS.filter(t => C.ANNOYANCE_FIXES.includes(t.id)) },
-  { id: 'recommended', ico: '★', t: 'Recommended', d: 'All recommended tweaks: no ads, no AI, less telemetry, faster UI. Safe for everyone.', tweaks: (C) => C.TWEAKS.filter(t => t.rec) },
-  { id: 'ai', ico: '✦', t: 'AI-free Windows', d: 'Turns off Copilot, Recall, Click to Do and AI in Edge, Paint, Notepad and search.', tweaks: (C) => C.TWEAKS.filter(t => t.cat === 'ai') },
-  { id: 'gaming', ico: '◆', t: 'Gaming', d: 'Game Mode, no background recording, GPU scheduling, raw mouse input, foreground priority.', tweaks: (C) => C.TWEAKS.filter(t => t.cat === 'gaming' || (t.cat === 'performance' && t.rec)) },
-  { id: 'privacy', ico: '◉', t: 'Maximum privacy', d: 'Every privacy and ad tweak, including location, error reporting and app tracking.', tweaks: (C) => C.TWEAKS.filter(t => ['privacy', 'popups', 'ai'].includes(t.cat) && t.id !== 'privacy.onedrive') },
+  { id: 'annoy', ico: 'bell', t: 'Fix Windows annoyances', d: 'The most-complained-about things: slow folders, forced restarts, account nags, Sticky Keys, Edge tabs in Alt+Tab, Outlook reinstalling.', tweaks: (C) => C.TWEAKS.filter(t => C.ANNOYANCE_FIXES.includes(t.id)) },
+  { id: 'recommended', ico: 'star', t: 'Recommended', d: 'All recommended tweaks: no ads, no AI, less telemetry, faster UI. Safe for everyone.', tweaks: (C) => C.TWEAKS.filter(t => t.rec) },
+  { id: 'ai', ico: 'ai', t: 'AI-free Windows', d: 'Turns off Copilot, Recall, Click to Do and AI in Edge, Paint, Notepad and search.', tweaks: (C) => C.TWEAKS.filter(t => t.cat === 'ai') },
+  { id: 'gaming', ico: 'game', t: 'Gaming', d: 'Game Mode, no background recording, GPU scheduling, raw mouse input, foreground priority.', tweaks: (C) => C.TWEAKS.filter(t => t.cat === 'gaming' || (t.cat === 'performance' && t.rec)) },
+  { id: 'privacy', ico: 'privacy', t: 'Maximum privacy', d: 'Every privacy and ad tweak, including location, error reporting and app tracking.', tweaks: (C) => C.TWEAKS.filter(t => ['privacy', 'popups', 'ai'].includes(t.cat) && t.id !== 'privacy.onedrive') },
 ];
 async function applyTweaks(list, label) {
   const states = await call('tweakStates');
@@ -101,6 +162,7 @@ async function applyTweaks(list, label) {
 }
 // Every apply is read back from Windows; show what really stuck.
 function reportTweaks(r, label) {
+  if (r && r.failed) { for (const f of r.failed) S_FAILS[f.id] = f.error; for (const id of Object.keys(r.states || {})) if (r.states[id] && S_FAILS[id]) delete S_FAILS[id]; }
   if (!r || !r.failed) return toast(`${label}: done`);
   if (!r.failed.length) return toast(`✓ ${label}: ${r.applied} setting(s) applied and verified`);
   toast(`${label}: ${r.applied} verified, ${r.failed.length} did not apply — ${r.failed.slice(0, 3).map(f => `${f.title} (${f.error})`).join('; ')}${r.failed.length > 3 ? '…' : ''}`, true);
@@ -139,7 +201,7 @@ PAGES.home = async (main) => {
   const checkBtn = h('button', { class: 'btn primary big' }, 'Run health check');
   const cpuEl = h('div', { class: 'stat' }, '–'), memEl = h('div', { class: 'stat' }, '–');
   const cpuM = h('div'), memM = h('div'), memSub = h('div', { class: 'sub' });
-  const boostBtn = h('button', { class: 'btn primary' }, '⚡ Boost');
+  const boostBtn = h('button', { class: 'btn primary small' }, icon('zap'), 'Boost');
 
   function drawRing(score) {
     const r = 54, c = 2 * Math.PI * r, col = score >= 80 ? 'var(--good)' : score >= 55 ? 'var(--warn)' : 'var(--bad)';
@@ -172,14 +234,14 @@ PAGES.home = async (main) => {
   tick(); S.timers.push(setInterval(tick, 2000));
 
   const tiles = [
-    ['cleanup', '✧', 'Deep cleanup', 'Temp files, caches, browsers, apps'],
-    ['debloat', '✦', 'Remove Microsoft AI', 'Copilot, Recall & preinstalled apps'],
-    ['optimize', '⚡', 'Optimize Windows', 'Presets & ~100 tweaks'],
-    ['startup', '⏻', 'Startup apps', 'Boot faster'],
-    ['storage', '◔', 'Find large files', 'Large files & duplicates'],
-    ['security', '⛨', 'Security scan', 'Defender, firewall, updates'],
-    ['updates', '⟳', 'Control updates', 'No forced restarts, pause, roll back'],
-    ['repair', '✚', 'Repair Windows', 'SFC, DISM, update reset'],
+    ['clean', 'sparkles', 'Clean everything', 'Junk, caches, old drivers and more in one click'],
+    ['debloat', 'ai', 'Remove Microsoft AI', 'Copilot, Recall and preinstalled apps'],
+    ['optimize', 'sliders', 'Optimize Windows', 'Presets and about 100 tweaks'],
+    ['apps', 'package', 'Uninstall apps', 'Deep uninstall with leftover cleanup'],
+    ['storage', 'pie', 'Space analyzer', 'See what fills your drives'],
+    ['reliability', 'pulse', 'Reliability', 'Crashes, drivers and stability score'],
+    ['updates', 'refresh', 'Control updates', 'No forced restarts, pause, roll back'],
+    ['repair', 'repair', 'Repair Windows', 'SFC, DISM, update reset and more'],
   ];
 
   main.append(
@@ -191,7 +253,7 @@ PAGES.home = async (main) => {
         h('div', { style: { marginTop: '12px' } }, h('h3', {}, 'CPU'), cpuEl, cpuM))),
     h('div', { class: 'section-title' }, 'Issues'), h('div', { class: 'card' }, issues),
     h('div', { class: 'section-title' }, 'Quick actions'),
-    h('div', { class: 'grid g4' }, tiles.map(([id, ico, t, d]) => h('button', { class: 'tile', onclick: () => go(id) }, h('span', { class: 'ico' }, ico), h('span', { class: 't' }, t), h('span', { class: 'd' }, d)))),
+    h('div', { class: 'grid g4' }, tiles.map(([id, ic, t, d]) => h('button', { class: 'tile', onclick: () => go(id) }, icon(ic), h('span', { class: 't' }, t), h('span', { class: 'd' }, d)))),
   );
   if (S.cache.health) drawIssues(S.cache.health); else issues.replaceChildren(h('div', { class: 'empty' }, 'Run a health check to find issues.'));
 };
@@ -242,6 +304,7 @@ PAGES.cleanup = async (main) => {
   if (!sizes) scan();
 };
 
+const CAT_ICONS = { ai: 'ai', popups: 'ads', privacy: 'privacy', performance: 'zap', gaming: 'game', explorer: 'taskbar', edge: 'edge', updates: 'refresh' };
 PAGES.optimize = async (main) => {
   const C = S.C;
   let cat = S.cache.optCat || 'ai';
@@ -252,24 +315,17 @@ PAGES.optimize = async (main) => {
     const list = C.TWEAKS.filter(t => t.cat === cat);
     const onCount = list.filter(t => states[t.id]).length;
     wrap.replaceChildren(
-      tabs(C.TWEAK_CATEGORIES.map(c => [c.id, `${c.icon} ${c.name}`]), cat, (id) => { cat = S.cache.optCat = id; draw(); }),
+      tabs(C.TWEAK_CATEGORIES.map(c => [c.id, c.name, CAT_ICONS[c.id], `${C.TWEAKS.filter(t => t.cat === c.id && states[t.id]).length}/${C.TWEAKS.filter(t => t.cat === c.id).length}`]), cat, (id) => { cat = S.cache.optCat = id; draw(); }),
       h('div', { class: 'card' },
         h('div', { class: 'row', style: { marginBottom: '6px' } }, h('div', {}, h('h2', {}, catInfo.name), h('div', { class: 'sub' }, catInfo.blurb, ` · ${onCount}/${list.length} applied`)), h('div', { class: 'spacer' }),
-          h('button', { class: 'btn small', onclick: async (e) => { if (await busy(e.currentTarget, () => applyTweaks(list.filter(t => t.rec), catInfo.name + ' (recommended)'))) { states = await call('tweakStates'); draw(); } } }, 'Apply recommended'),
-          h('button', { class: 'btn small', onclick: async (e) => { if (await busy(e.currentTarget, () => applyTweaks(list, catInfo.name + ' (all)'))) { states = await call('tweakStates'); draw(); } } }, 'Apply all')),
-        h('div', { class: 'list' }, list.map(t => h('div', { class: 'item' },
-          h('div', { class: 'body' }, h('div', { class: 'title' }, t.title, recTag(t.rec), adminTag(t.admin)), t.desc ? h('div', { class: 'desc' }, t.desc) : null),
-          toggle(!!states[t.id], async (on, input) => {
-            input.disabled = true;
-            try { const r = await call('setTweaks', { changes: [{ id: t.id, on }], label: `${on ? 'Applied' : 'Reverted'}: ${t.title}` }); if (r && r.states) states = r.states; else states[t.id] = on; reportTweaks(r, `${on ? 'Applied' : 'Reverted'}: ${t.title}`); }
-            catch { input.checked = !on; }
-            finally { input.disabled = false; draw(); }
-          }))))));
+          h('button', { class: 'btn small primary', onclick: async (e) => { if (await busy(e.currentTarget, () => applyTweaks(list.filter(t => t.rec), catInfo.name + ' (recommended)'))) { Object.assign(states, await call('tweakStates')); draw(); } } }, 'Apply recommended'),
+          h('button', { class: 'btn small', onclick: async (e) => { if (await busy(e.currentTarget, () => applyTweaks(list, catInfo.name + ' (all)'))) { Object.assign(states, await call('tweakStates')); draw(); } } }, 'Apply all')),
+        h('div', { class: 'list' }, list.map(t => settingRow(t, states, draw)))));
   }
   main.append(pageHead('Optimize', 'One-click presets or fine-grained control. Every change can be undone from History & undo.',
-    h('button', { class: 'btn', onclick: () => go('repair') }, 'Create restore point first')),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' } }, PRESETS.map(p => h('div', { class: 'preset' }, h('div', { class: 'ico' }, p.ico), h('div', { class: 't' }, p.t), h('div', { class: 'd' }, p.d),
-      h('button', { class: 'btn primary small', onclick: async (e) => { if (await busy(e.currentTarget, () => applyTweaks(p.tweaks(C), `Preset: ${p.t}`))) { states = await call('tweakStates'); draw(); } } }, 'Apply')))),
+    btn('Create restore point first', () => go('repair'), { ic: 'shield' })),
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' } }, PRESETS.map(p => h('div', { class: 'preset' }, icon(p.ico), h('div', { class: 't' }, p.t), h('div', { class: 'd' }, p.d),
+      h('button', { class: 'btn primary small', onclick: async (e) => { if (await busy(e.currentTarget, () => applyTweaks(p.tweaks(C), `Preset: ${p.t}`))) { Object.assign(states, await call('tweakStates')); draw(); } } }, 'Apply')))),
     h('div', { style: { height: '18px' } }), wrap);
   draw();
 };
@@ -296,8 +352,8 @@ PAGES.debloat = async (main) => {
     }, 'Removing…');
     return [h('div', { class: 'card' }, h('div', { class: 'row' }, h('div', { style: { flex: 1 } }, h('h2', {}, 'AI-free Windows'), h('div', { class: 'sub' }, 'Copilot, Recall, Click to Do, generative AI access, and AI in Edge, Paint, Notepad and Search — switched off with documented Windows policies, plus the AI apps uninstalled.')), btn)),
       h('div', { class: 'card' }, h('h3', {}, 'What gets changed'), h('div', { class: 'list' },
-        aiTweaks.map(t => h('div', { class: 'item' }, h('span', { class: 'tag ' + (states[t.id] ? 'good' : 'warn') }, states[t.id] ? 'off ✓' : 'active'), h('div', { class: 'body' }, h('div', { class: 'title' }, t.title, adminTag(t.admin)), h('div', { class: 'desc' }, t.desc)))),
-        C.BLOAT_APPS.filter(a => a.group === 'AI').map(a => h('div', { class: 'item' }, h('span', { class: 'tag ' + (installed.has(a.pkg) ? 'warn' : 'good') }, installed.has(a.pkg) ? 'installed' : 'removed ✓'), h('div', { class: 'body' }, h('div', { class: 'title' }, `App: ${a.name}`), h('div', { class: 'desc mono' }, a.pkg))))))];
+        aiTweaks.map(t => h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, t.title, adminTag(t.admin)), h('div', { class: 'desc' }, t.desc)), h('span', { class: 'meta' }, states[t.id] ? 'Turned off' : 'Still active'), stateDot(tweakState(t.id, states), S_FAILS[t.id]))),
+        C.BLOAT_APPS.filter(a => a.group === 'AI').map(a => h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, `App: ${a.name}`), h('div', { class: 'desc mono' }, a.pkg)), h('span', { class: 'meta' }, installed.has(a.pkg) ? 'Installed' : 'Removed'), stateDot(installed.has(a.pkg) ? 'off' : 'on')))))];
   }
 
   async function drawApps() {
@@ -331,10 +387,10 @@ PAGES.debloat = async (main) => {
       h('button', { class: 'btn small', onclick: () => apply(svc.filter(s => st[s.name].startType !== s.rec).map(s => ({ name: s.name, type: s.rec })), 'Apply recommended') }, 'Apply recommended'),
       h('button', { class: 'btn small', onclick: () => apply(svc.filter(s => st[s.name].startType !== s.orig).map(s => ({ name: s.name, type: s.orig })), 'Restore Windows defaults') }, 'Restore defaults'),
       h('button', { class: 'btn primary small', onclick: () => apply(Object.entries(pending).map(([name, type]) => ({ name, type })), 'Apply changes') }, 'Apply changes'))),
-      h('div', { class: 'card' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Service'), h('th', {}, 'Status'), h('th', {}, 'Recommended'), h('th', {}, 'Start type'))),
+      h('div', { class: 'card' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Service'), h('th', {}, 'Running'), h('th', {}, 'Recommended'), h('th', {}, 'Start type'), h('th', { title: 'Set to the recommended start type?' }, ''))),
         h('tbody', {}, svc.map(s => h('tr', {}, h('td', {}, h('div', { class: 'title' }, s.title), h('div', { class: 'desc' }, s.desc, ' ', h('span', { class: 'mono' }, s.name))),
           h('td', {}, st[s.name].status), h('td', {}, s.rec),
-          h('td', {}, h('select', { onchange: (e) => { pending[s.name] = e.target.value; } }, ['Automatic', 'Manual', 'Disabled'].map(t => h('option', { value: t, selected: st[s.name].startType === t }, t)))))))))];
+          h('td', {}, h('select', { onchange: (e) => { pending[s.name] = e.target.value; } }, ['Automatic', 'Manual', 'Disabled'].map(t => h('option', { value: t, selected: st[s.name].startType === t }, t)))), h('td', {}, stateDot(st[s.name].startType === s.rec ? 'on' : 'off')))))))];
   }
 
   async function drawTasks() {
@@ -344,12 +400,13 @@ PAGES.debloat = async (main) => {
     return [h('div', { class: 'card' }, h('div', { class: 'row' }, h('div', { class: 'sub', style: { flex: 1 } }, 'Scheduled tasks that collect and upload telemetry in the background.'),
       h('button', { class: 'btn primary small', disabled: !enabledOnes.length, onclick: async (e) => { if (!(await confirmDlg('Disable telemetry tasks?', `${enabledOnes.length} task(s) will be disabled. Needs admin permission.`, 'Disable'))) return; const r = await busy(e.currentTarget, () => call('setTasks', { changes: enabledOnes.map(t => ({ id: t.path + t.name, enable: false })) })); reportList(r.results, 'Telemetry tasks', x => x.id.split('\\').pop()); draw(); } }, 'Disable all'))),
       h('div', { class: 'card' }, h('div', { class: 'list' }, tasks.map(t => h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, t.name), h('div', { class: 'desc' }, t.desc, ' ', h('span', { class: 'mono' }, t.path))),
-        h('span', { class: 'meta' }, st[t.path + t.name] === 'Disabled' ? 'Disabled' : 'Enabled'),
-        toggle(st[t.path + t.name] !== 'Disabled', async (on, input) => { input.disabled = true; try { const r = await call('setTasks', { changes: [{ id: t.path + t.name, enable: on }] }); reportList(r.results, t.name, x => x.id.split('\\').pop()); } catch { input.checked = !on; } draw(); })))))];
+        h('span', { class: 'meta' }, st[t.path + t.name] === 'Disabled' ? 'Disabled' : 'Running'),
+        h('div', { class: 'controls' }, toggle(st[t.path + t.name] !== 'Disabled', async (on, input) => { input.disabled = true; try { const r = await call('setTasks', { changes: [{ id: t.path + t.name, enable: on }] }); reportList(r.results, t.name, x => x.id.split('\\').pop()); } catch { input.checked = !on; } draw(); }),
+          stateDot(st[t.path + t.name] === 'Disabled' ? 'on' : 'off'))))))];
   }
 
   async function draw() {
-    wrap.replaceChildren(tabs([['ai', '✦ Microsoft AI'], ['apps', 'Preinstalled apps'], ['services', 'Services'], ['tasks', 'Telemetry tasks']], tab, (id) => { tab = S.cache.debloatTab = id; draw(); }), loading());
+    wrap.replaceChildren(tabs([['ai', 'Microsoft AI', 'ai'], ['apps', 'Preinstalled apps', 'package'], ['services', 'Services', 'gear'], ['tasks', 'Telemetry tasks', 'eye']], tab, (id) => { tab = S.cache.debloatTab = id; draw(); }), loading());
     const parts = await ({ ai: drawAI, apps: drawApps, services: drawServices, tasks: drawTasks }[tab])();
     wrap.lastChild.replaceWith(h('div', {}, parts));
   }
@@ -373,62 +430,8 @@ PAGES.startup = async (main) => {
   load();
 };
 
-PAGES.apps = async (main) => {
-  const q = h('input', { type: 'text', placeholder: 'Search apps…', oninput: () => draw() });
-  const kind = h('select', { onchange: () => draw() }, h('option', { value: 'all' }, 'All apps'), h('option', { value: 'desktop' }, 'Desktop apps'), h('option', { value: 'store' }, 'Store apps'));
-  const tbody = h('tbody');
-  let apps = [];
-  let sort = 'name';
-  function draw() {
-    const term = q.value.toLowerCase();
-    const rows = apps.filter(a => (kind.value === 'all' || a.kind === kind.value) && (`${a.name} ${a.publisher}`.toLowerCase().includes(term)))
-      .sort((a, b) => (sort === 'size' ? (b.sizeKB || 0) - (a.sizeKB || 0) : a.name.localeCompare(b.name)));
-    tbody.replaceChildren(...rows.map(a => h('tr', {}, h('td', {}, h('div', { class: 'title' }, a.name), h('div', { class: 'desc' }, a.publisher || '')), h('td', {}, a.version || ''), h('td', {}, a.kind === 'store' ? 'Store' : 'Desktop'),
-      h('td', { class: 'num' }, a.sizeKB ? fmt(a.sizeKB * 1024) : '—'),
-      h('td', { class: 'num' }, h('button', { class: 'btn small danger', onclick: async (e) => { if (!(await confirmDlg(`Uninstall ${a.name}?`, a.kind === 'store' ? 'The app will be removed for your account.' : "The app's own uninstaller will open.", 'Uninstall'))) return; await busy(e.currentTarget, () => call('uninstallApp', { id: a.id })); toast(a.kind === 'store' ? `${a.name} removed` : `Uninstaller for ${a.name} opened`); if (a.kind === 'store') load(); } }, 'Uninstall')))));
-    if (!rows.length) tbody.replaceChildren(h('tr', {}, h('td', { colspan: 5, class: 'empty' }, 'No apps match.')));
-  }
-  async function load() { tbody.replaceChildren(h('tr', {}, h('td', { colspan: 5 }, loading()))); apps = await call('installedApps'); draw(); }
-  main.append(pageHead('Installed apps', 'Desktop and Microsoft Store apps. Sort by size to find space hogs.', q, kind),
-    h('div', { class: 'card' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', { onclick: () => { sort = 'name'; draw(); } }, 'Name ↕'), h('th', {}, 'Version'), h('th', {}, 'Type'), h('th', { class: 'num', onclick: () => { sort = 'size'; draw(); } }, 'Size ↕'), h('th'))), tbody)));
-  load();
-};
-
-PAGES.processes = async (main) => {
-  const C = S.C;
-  const q = h('input', { type: 'text', placeholder: 'Filter…', oninput: () => draw() });
-  const tbody = h('tbody');
-  let procs = [], sort = 'mem';
-  const auto = h('input', { type: 'checkbox', checked: true });
-  function draw() {
-    const groups = {};
-    for (const p of procs) { const g = groups[p.name] || (groups[p.name] = { name: p.name, company: p.company, pids: [], mem: 0, cpu: 0 }); g.pids.push(p.pid); g.mem += p.memMB; g.cpu += p.cpu; }
-    const rows = Object.values(groups).filter(g => g.name.toLowerCase().includes(q.value.toLowerCase())).sort((a, b) => (sort === 'cpu' ? b.cpu - a.cpu : sort === 'name' ? a.name.localeCompare(b.name) : b.mem - a.mem)).slice(0, 150);
-    tbody.replaceChildren(...rows.map(g => {
-      const prot = C.PROTECTED_PROCESSES.includes(g.name.toLowerCase());
-      return h('tr', {}, h('td', {}, h('div', { class: 'title' }, g.name, g.pids.length > 1 ? h('span', { class: 'tag' }, `×${g.pids.length}`) : null, prot ? h('span', { class: 'tag' }, 'system') : null), h('div', { class: 'desc' }, g.company || '')),
-        h('td', { class: 'num' }, `${g.cpu.toFixed(1)} %`), h('td', { class: 'num' }, `${Math.round(g.mem).toLocaleString()} MB`),
-        h('td', { class: 'num' }, prot ? null : h('button', { class: 'btn small danger', onclick: async (e) => {
-          if (!(await confirmDlg(`End ${g.name}?`, `${g.pids.length} process(es) will be closed. Unsaved work in that app will be lost.`, 'End task'))) return;
-          await busy(e.currentTarget, async () => { for (const pid of g.pids) await call('killProcess', { pid, name: g.name }).catch(() => {}); });
-          toast(`Ended ${g.name}`); load();
-        } }, 'End task')));
-    }));
-  }
-  async function load() { procs = await window.api.call('processes'); draw(); }
-  main.append(pageHead('Processes', 'Everything running right now, grouped by app. Critical Windows processes are protected.', q, h('label', { class: 'row', style: { gap: '6px' } }, auto, 'Live')),
-    h('div', { class: 'card' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', { onclick: () => { sort = 'name'; draw(); } }, 'Name ↕'), h('th', { class: 'num', onclick: () => { sort = 'cpu'; draw(); } }, 'CPU ↕'), h('th', { class: 'num', onclick: () => { sort = 'mem'; draw(); } }, 'Memory ↕'), h('th'))), tbody)));
-  tbody.replaceChildren(h('tr', {}, h('td', { colspan: 4 }, loading())));
-  await load();
-  S.timers.push(setInterval(() => { if (auto.checked && document.activeElement !== q) load(); }, 3000));
-};
-
-PAGES.storage = async (main) => {
-  let tab = S.cache.storageTab || 'large';
+async function storageTools(main, tab) {
   const root = h('input', { type: 'text', value: S.settings.scanRoot || S.info.home });
-  const disks = h('div', { class: 'grid g3' }, loading());
-  const wrap = h('div');
-  call('systemInfo').then(si => disks.replaceChildren(...si.disks.map(d => { const used = d.total - d.free, p = pct(used, d.total); return h('div', { class: 'card' }, h('div', { class: 'row' }, h('h3', {}, `${d.name} ${d.label || ''}`), h('div', { class: 'spacer' }), h('span', { class: 'sub' }, `${p}%`)), meter(p, 80, 90), h('div', { class: 'sub', style: { marginTop: '6px' } }, `${fmt(d.free)} free of ${fmt(d.total)}`)); })));
 
   function fileTable(files, sel) {
     return h('table', {}, h('thead', {}, h('tr', {}, h('th'), h('th', {}, 'File'), h('th', { class: 'num' }, 'Size'), h('th', {}, 'Modified'), h('th'))),
@@ -496,37 +499,34 @@ PAGES.storage = async (main) => {
         preview.moves.length ? null : h('div', { class: 'empty' }, 'Downloads is already tidy.'), btn);
     },
   };
-  async function draw() {
-    wrap.replaceChildren(tabs([['large', 'Large files'], ['dupes', 'Duplicates'], ['folders', 'Folder sizes'], ['downloads', 'Organise Downloads']], tab, (id) => { tab = S.cache.storageTab = id; draw(); }));
-    const out = h('div'); wrap.append(out); await views[tab](out);
-  }
-  main.append(pageHead('Storage', 'See what fills your drives, find large and duplicate files, and tidy Downloads.'), disks, h('div', { class: 'row', style: { margin: '16px 0' } }, 'Folder to scan:', root, h('button', { class: 'btn small', onclick: () => { call('setSettings', { patch: { scanRoot: root.value } }).then(s => { S.settings = s; toast('Saved as default'); }); } }, 'Save as default')), wrap);
-  draw();
-};
+  const out = h('div');
+  main.append(h('div', { class: 'row', style: { margin: '0 0 12px' } }, h('span', { class: 'sub' }, 'Folder to scan:'), root, btn('Browse…', async () => { const f = await call('chooseFolder'); if (f) root.value = f; }, { small: true, ic: 'folder' }), btn('Save as default', () => { call('setSettings', { patch: { scanRoot: root.value } }).then(st => { S.settings = st; toast('Saved as default'); }); }, { small: true })), out);
+  await views[tab](out);
+}
 
 PAGES.security = async (main) => {
   const body = h('div', {}, loading('Reading Windows Security status…'));
   main.append(pageHead('Security', 'Your Windows protection at a glance, with one-click fixes.', h('button', { class: 'btn', onclick: () => call('openUri', { uri: 'windowsdefender:' }) }, 'Open Windows Security')), body);
   const [s, threats] = await Promise.all([call('security'), call('threats').catch(() => [])]);
   const d = s.defender || {};
-  const status = (ok, good, bad) => h('span', { class: 'tag ' + (ok ? 'good' : 'bad') }, ok ? good : bad);
+  const status = (ok, good, bad) => h('span', { class: 'row nowrap', style: { gap: '8px' } }, h('span', { class: 'meta' }, ok ? good : bad), stateDot(ok ? 'on' : 'fail'));
   const scanBtn = (label, action, primary) => h('button', { class: 'btn' + (primary ? ' primary' : ''), onclick: (e) => busy(e.currentTarget, async () => { if (action !== 'update') toast(`${label} running — you can keep using the PC`); await call('defenderAction', { action }); toast(`${label} finished`); PAGES.security(main.replaceChildren() || main); }, 'Running…') }, label);
   const rows = [
     ['Real-time protection', status(d.realtime, 'On', 'Off'), d.realtime ? null : h('button', { class: 'btn small', onclick: () => call('openUri', { uri: 'windowsdefender:' }) }, 'Turn on')],
     ['Virus definitions', status(d.signatureAge <= 3, `${d.signatureAge} day(s) old`, `${d.signatureAge} days old`), scanBtn('Update', 'update')],
     ['Last quick scan', status(d.quickScanAge <= 14, `${d.quickScanAge} day(s) ago`, `${d.quickScanAge} days ago`), null],
     ['Tamper protection', status(d.tamper, 'On', 'Off'), null],
-    ['Firewall', h('span', {}, (s.firewall || []).map(f => status(f.enabled, `${f.name} on`, `${f.name} off`))), (s.firewall || []).some(f => !f.enabled) ? h('button', { class: 'btn small', onclick: (e) => busy(e.currentTarget, () => runFix({ fix: 'firewall-on' })) }, 'Turn all on') : null],
+    ['Firewall', status((s.firewall || []).every(f => f.enabled), 'On for all networks', `Off for ${(s.firewall || []).filter(f => !f.enabled).map(f => f.name).join(', ')}`), (s.firewall || []).some(f => !f.enabled) ? h('button', { class: 'btn small', onclick: (e) => busy(e.currentTarget, () => runFix({ fix: 'firewall-on' })) }, 'Turn all on') : null],
     ['Windows Update', status(s.lastUpdate && (Date.now() - new Date(s.lastUpdate)) / 86400e3 < 30, `Last installed ${ago(s.lastUpdate)}`, `Last installed ${ago(s.lastUpdate)}`), h('button', { class: 'btn small', onclick: () => call('openUri', { uri: 'ms-settings:windowsupdate' }) }, 'Check')],
     ['User Account Control', status(s.uac, 'On', 'Off'), null],
     ['SmartScreen', status(s.smartscreen !== 'Off', s.smartscreen || 'Default', 'Off'), null],
-    ['BitLocker (system drive)', h('span', { class: 'tag' }, s.bitlocker || 'Unknown'), null],
+    ['BitLocker (system drive)', h('span', { class: 'meta' }, s.bitlocker || 'Unknown'), null],
     ['Remote Desktop', status(!s.rdpEnabled, 'Off', 'On — exposed'), s.rdpEnabled ? h('button', { class: 'btn small', onclick: (e) => busy(e.currentTarget, () => runFix({ fix: 'rdp-off' })) }, 'Turn off') : null],
     ['SMB1 (legacy sharing)', status(!s.smb1, 'Off', 'On — insecure'), s.smb1 ? h('button', { class: 'btn small', onclick: (e) => busy(e.currentTarget, () => runFix({ fix: 'smb1-off' })) }, 'Turn off') : null],
   ];
   body.replaceChildren(
     h('div', { class: 'card' }, h('div', { class: 'row' }, h('div', { style: { flex: 1 } }, h('h2', {}, 'Virus & threat scan'), h('div', { class: 'sub' }, `Antivirus: ${(s.antivirus || []).join(', ') || 'Microsoft Defender'}`)), scanBtn('Quick scan', 'quick', true), scanBtn('Full scan', 'full'))),
-    h('div', { class: 'card' }, h('div', { class: 'list' }, rows.map(([k, v, a]) => h('div', { class: 'item' }, h('div', { class: 'body title' }, k), v, a)))),
+    h('div', { class: 'card' }, h('div', { class: 'list' }, rows.map(([k, v, a]) => h('div', { class: 'item' }, h('div', { class: 'body title' }, k), a, v)))),
     h('div', { class: 'section-title' }, 'Recent threats'),
     h('div', { class: 'card' }, threats.length ? h('div', { class: 'list' }, threats.map(t => h('div', { class: 'item' }, h('span', { class: 'sev ' + (t.severity >= 4 ? 'high' : 'medium') }), h('div', { class: 'body' }, h('div', { class: 'title' }, t.name), h('div', { class: 'desc mono' }, (t.resources || []).join(', '))), h('div', { class: 'meta' }, `${(t.when || '').slice(0, 10)} · ${t.action ? 'removed' : 'action needed'}`)))) : h('div', { class: 'empty' }, 'No threats detected.')));
 };
@@ -553,8 +553,7 @@ PAGES.updates = async (main) => {
           h('div', { class: 'row' }, 'From', startSel, 'to', endSel, h('button', { class: 'btn primary small', onclick: (e) => busy(e.currentTarget, async () => { await call('updatesAction', { action: 'active-hours', start: Number(startSel.value), end: Number(endSel.value) }); toast('Active hours saved'); draw(); }) }, 'Save'))),
         h('div', { class: 'card' }, h('h3', {}, 'Stay on this version'), h('div', { class: 'sub', style: { marginBottom: '10px' } }, st.lockedVersion ? `Locked to ${st.product} ${st.lockedVersion}. You still get security updates, but no big feature upgrades.` : `You are on ${st.product} ${st.displayVersion}. Lock it to skip feature upgrades (and their new AI features and bugs) while still getting security fixes.`),
           st.lockedVersion ? act('Unlock', { action: 'unlock' }, 'Version unlocked') : act(`Lock to ${st.displayVersion}`, { action: 'lock', version: st.displayVersion }, `Locked to ${st.displayVersion}`)),
-        h('div', { class: 'card' }, h('h3', {}, 'Update behaviour'), h('div', { class: 'list' }, tw.map(t => h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, t.title, recTag(t.rec)), t.desc ? h('div', { class: 'desc' }, t.desc) : null),
-          toggle(!!states[t.id], async (on, input) => { input.disabled = true; try { reportTweaks(await call('setTweaks', { changes: [{ id: t.id, on }], label: `${on ? 'Applied' : 'Reverted'}: ${t.title}` }), `${on ? 'Applied' : 'Reverted'}: ${t.title}`); } catch { input.checked = !on; } draw(); })))))),
+        h('div', { class: 'card' }, h('h3', {}, 'Update behaviour'), h('div', { class: 'list' }, tw.map(t => settingRow(t, states, draw))))),
       h('div', { class: 'section-title' }, 'Recently installed updates'),
       h('div', { class: 'card' }, h('div', { class: 'sub', style: { marginBottom: '6px' } }, 'If something broke after an update, uninstall it here. Some combined updates cannot be removed — use Update history → Uninstall updates for those.'),
         h('div', { class: 'list' }, (st.hotfixes || []).map(u => h('div', { class: 'item' }, h('div', { class: 'body' }, h('div', { class: 'title' }, u.kb), h('div', { class: 'desc' }, `${u.desc} · installed ${(u.installed || '').slice(0, 10)} (${ago(u.installed)})`)),
@@ -649,6 +648,8 @@ PAGES.settings = async (main) => {
       row('Keep running in the tray', 'Closing the window hides OpenSweep to the notification area.', toggle(s.minimizeToTray, (v) => set({ minimizeToTray: v }))),
       row('Start with Windows', 'Starts hidden in the tray.', toggle(s.launchAtLogin, (v) => set({ launchAtLogin: v }))),
       row('Ask before making changes', 'Show a confirmation before cleaning, removing or changing settings.', toggle(s.confirmActions, (v) => set({ confirmActions: v }))),
+      row('Settings guard', `Keeps your tweaks applied. If a Windows update switches something back, OpenSweep puts it back and tells you. Watching ${S.settings.guardCount || 0} setting(s).`, h('div', { class: 'controls' }, btn('Check now', async (e) => { const r = await busy(e.currentTarget, () => call('guardRun')); toast(r.restored && r.restored.length ? `Restored ${r.restored.length} setting(s)` : `All ${r.checked || 0} setting(s) are still applied`); }, { small: true }), toggle(s.settingsGuard !== false, (v) => set({ settingsGuard: v })))),
+      row('Compact sidebar', 'Show only icons in the sidebar.', toggle(!!s.compactNav, (v) => set({ compactNav: v }))),
       row('Background stability check', 'Checks drivers, blue screens and hardware errors about once an hour at the lowest CPU priority.', toggle(s.stabilityMonitor, (v) => set({ stabilityMonitor: v }))),
       row('Stability notifications', 'Show a Windows notification when a new driver problem or crash is found.', toggle(s.stabilityNotify, (v) => set({ stabilityNotify: v }))),
       row('Administrator mode', S.info.isAdmin ? 'Running as administrator ✓ — changes apply directly, no prompts.' : 'Not running as administrator.', S.info.isAdmin ? h('span', { class: 'tag good' }, 'admin') : h('button', { class: 'btn small', onclick: async () => { const r = await call('relaunchAsAdmin'); if (r.demo) toast('Not available in demo mode'); } }, 'Restart as admin')))),
@@ -667,43 +668,16 @@ function updateCard(set) {
         : h('button', { class: 'btn small', disabled: u.state === 'disabled' || u.state === 'checking' || u.state === 'downloading', onclick: async (e) => { S.update = await busy(e.currentTarget, () => call('checkUpdate'), 'Checking…'); if (S.page === 'settings') go('settings'); } }, 'Check now'))));
 }
 
-PAGES.stability = async (main) => {
-  const body = h('div', {}, loading('Checking drivers and the event log…'));
-  const refresh = h('button', { class: 'btn', onclick: (e) => busy(e.currentTarget, () => load(true), 'Checking…') }, 'Check now');
-  main.append(pageHead('Drivers & stability', 'Finds devices with driver problems, blue screens, unexpected shutdowns, hardware errors and display driver crashes from the last 7 days. Runs in the background at low priority.', refresh,
-    h('button', { class: 'btn', onclick: (e) => busy(e.currentTarget, async () => { await call('scanDevices'); toast('Scanned for hardware changes'); await load(true); }) }, 'Scan for hardware changes', adminTag(true))), body);
-  const tool = (label, id) => h('button', { class: 'btn small', onclick: () => call('launchTool', { id }).catch(() => {}) }, label);
-  async function load(refreshNow) {
-    const r = await call('stability', { refresh: !!refreshNow });
-    const ok = (x) => h('div', { class: 'empty' }, x);
-    const toolIds = new Set((S.C.TOOLBOX || []).map(t => t.id));
-    body.replaceChildren(
-      h('div', { class: 'grid g3' },
-        h('div', { class: 'card stat' }, h('div', { class: 'sub' }, 'Devices with problems'), h('div', { class: 'big ' + (r.devices.length ? 'bad' : 'good') }, String(r.devices.length))),
-        h('div', { class: 'card stat' }, h('div', { class: 'sub' }, `Stability events (${r.days} days)`), h('div', { class: 'big ' + (r.events.length ? 'warn' : 'good') }, String(r.events.length))),
-        h('div', { class: 'card stat' }, h('div', { class: 'sub' }, 'Third-party drivers'), h('div', { class: 'big' }, String(r.thirdPartyDrivers)))),
-      h('div', { class: 'card' }, h('h3', {}, 'Devices with driver problems'), r.devices.length ? h('div', { class: 'list' }, r.devices.map(d => h('div', { class: 'item' }, h('span', { class: 'tag warn' }, `code ${d.code}`),
-        h('div', { class: 'body' }, h('div', { class: 'title' }, d.name), h('div', { class: 'desc' }, `${d.problem}${d.cls ? ' · ' + d.cls : ''}`))))) : ok('✓ All devices are working.'),
-        h('div', { class: 'row', style: { marginTop: '10px' } }, h('button', { class: 'btn small', onclick: () => call('openUri', { uri: 'ms-settings:windowsupdate-optionalupdates' }) }, 'Optional driver updates'), toolIds.has('devmgmt') ? tool('Device Manager', 'devmgmt') : null, toolIds.has('reliability') ? tool('Reliability Monitor', 'reliability') : null)),
-      h('div', { class: 'card' }, h('h3', {}, 'Crashes & hardware errors'), r.events.length ? h('div', { class: 'list' }, r.events.map(e => h('div', { class: 'item' }, h('span', { class: 'tag ' + (e.kind === 'Blue screen' || e.kind === 'Hardware error' ? 'bad' : 'warn') }, e.kind),
-        h('div', { class: 'body' }, h('div', { class: 'desc' }, e.message), h('div', { class: 'desc mono' }, `${new Date(e.when).toLocaleString()} · ${e.source} ${e.eventId}`))))) : ok('✓ No crashes or hardware errors.')),
-      r.oldDrivers.length || r.unsignedDrivers.length ? h('div', { class: 'card' }, h('h3', {}, 'Drivers worth updating'), h('div', { class: 'list' },
-        r.unsignedDrivers.map(d => h('div', { class: 'item' }, h('span', { class: 'tag bad' }, 'unsigned'), h('div', { class: 'body' }, h('div', { class: 'title' }, d.name), h('div', { class: 'desc' }, `${d.provider} · ${d.version}`)))),
-        r.oldDrivers.map(d => h('div', { class: 'item' }, h('span', { class: 'tag warn' }, d.date.slice(0, 4)), h('div', { class: 'body' }, h('div', { class: 'title' }, d.name), h('div', { class: 'desc' }, `${d.provider} · ${d.version} · over 5 years old — check the maker's website`)))))) : null,
-      h('div', { class: 'sub' }, `Last checked ${new Date(r.checkedAt).toLocaleString()}.`));
-  }
-  load(false).catch(e => body.replaceChildren(h('div', { class: 'banner' }, 'Could not check: ' + e.message)));
-};
-
 // ------------------------------------------------------------------ boot
-function applyTheme() { const t = S.settings.theme; if (t === 'system') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t); }
+function applyTheme() { document.querySelector('.app').classList.toggle('compact', !!S.settings.compactNav); const t = S.settings.theme; if (t === 'system') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t); }
 (async function boot() {
   [S.info, S.C, S.settings] = await Promise.all([window.api.call('info'), window.api.call('catalog'), window.api.call('getSettings')]);
   applyTheme();
   S.update = await window.api.call('updateStatus').catch(() => null);
   window.api.on((name, data) => {
-    if (name === 'go') go(data);
-    else if (name === 'update') { const was = S.update && S.update.state; S.update = data; if (data.state === 'ready' && was !== 'ready') go(S.page); else if (S.page === 'settings' && data.state !== 'downloading') go('settings'); }
+    if (name === 'go') return go(data);
+    (S.listeners[name] || []).forEach(fn => { try { fn(data); } catch (e) { console.error(e); } });
+    if (name === 'update') { const was = S.update && S.update.state; S.update = data; if (data.state === 'ready' && was !== 'ready') go(S.page); else if (S.page === 'settings' && data.state !== 'downloading') go('settings'); }
   });
   go('home');
 })();

@@ -165,4 +165,86 @@ module.exports = {
   },
   async scanDevices() { await wait(800); return { ok: true }; },
   async setAutoStart() { await wait(200); return { ok: true }; },
+
+  // ---------------- v0.3 features (sample data)
+  async reliability({ days = 30 } = {}) {
+    await wait(700);
+    const { summarize } = require('./win-reliability');
+    const recs = [];
+    const day = (k, h = 12) => new Date(Date.now() - k * 86400e3 - h * 3600e3).toISOString().slice(0, 19);
+    const add = (k, src, ev, product, msg) => recs.push({ id: String(recs.length), t: day(k, rnd(1, 20)), src, ev, product, msg });
+    [1, 3, 3, 9, 15, 15, 22].forEach(k => add(k, 'Application Error', 1000, 'Discord', 'Faulting application name: Discord.exe, version: 1.0.9170'));
+    [5, 12].forEach(k => add(k, 'Application Hang', 1002, 'Explorer', 'The program explorer.exe stopped interacting with Windows.'));
+    add(8, 'Microsoft-Windows-WER-SystemErrorReporting', 1001, '', 'The computer has rebooted from a bugcheck. The bugcheck was: 0x00000116 (nvlddmkm.sys)');
+    add(8, 'Microsoft-Windows-Kernel-Power', 41, '', 'The system has rebooted without cleanly shutting down first.');
+    add(2, 'Microsoft-Windows-WindowsUpdateClient', 20, '2026-11 Cumulative Update for Windows 11 (KB5046617)', 'Installation Failure: 0x800f0922');
+    for (let k = 0; k < days; k += 3) add(k, 'Microsoft-Windows-WindowsUpdateClient', 19, 'Security Intelligence Update for Microsoft Defender Antivirus', 'Installation Successful');
+    add(6, 'MsiInstaller', 11707, 'Steam', 'Product: Steam -- Installation completed successfully.');
+    const index = []; let v = 4.2;
+    for (let k = days - 1; k >= 0; k--) { const hit = recs.filter(r => r.t.startsWith(day(k).slice(0, 10)) && /Error|Hang|WER|Kernel/.test(r.src)).length; v = Math.max(1, Math.min(10, v + 0.35 - hit * 1.1)); index.push({ t: day(k, 0), v: Math.round(v * 100) / 100 }); }
+    return summarize({ index, records: recs }, days);
+  },
+  startProcessStream(onData) {
+    const tick = async () => { const procs = await this.processes(); onData({ t: new Date().toISOString(), procs: procs.map(p => ({ ...p, mem: p.memMB, io: rnd(0, p.name === 'chrome' ? 4e6 : 2e5), threads: rnd(8, 90), desc: p.name, sig: p.name === 'Notion' ? 'NotSigned' : 'Valid', pri: 'Normal', path: p.name === 'Notion' ? 'C:\\Users\\you\\AppData\\Local\\Temp\\notion\\Notion.exe' : p.path })) }); };
+    tick(); const t = setInterval(tick, 2000); return () => clearInterval(t);
+  },
+  async setPriority() { await wait(150); return { ok: true }; },
+  async oldDrivers() { await wait(900); return [{ inf: 'oem41.inf', name: 'nv_dispi.inf', provider: 'NVIDIA', cls: 'Display', version: '32.0.15.6094', date: '2024-08-14', size: 1.1 * GB, newest: '32.0.15.6614' }, { inf: 'oem12.inf', name: 'nv_dispi.inf', provider: 'NVIDIA', cls: 'Display', version: '31.0.15.5222', date: '2024-03-02', size: 1.05 * GB, newest: '32.0.15.6614' }, { inf: 'oem7.inf', name: 'rt640x64.inf', provider: 'Realtek', cls: 'Net', version: '10.68.0', date: '2023-10-01', size: 4 * MB, newest: '10.72.0' }]; },
+  async removeDrivers(infs) { await wait(1200); return infs.map((inf, i) => ({ inf, ok: i !== 1, msg: '' })); },
+  async windowsOldSize() { await wait(300); return { exists: true, size: 18.6 * GB }; },
+  async removeWindowsOld() { await wait(2000); return { ok: true }; },
+  async componentCleanup() { await wait(2500); return { ok: true }; },
+  oldInstallers() { return [['Win11_24H2_English_x64.iso', 5.4 * GB], ['DaVinci_Resolve_19_Windows.zip', 3.4 * GB], ['SteamSetup.exe', 2.3 * MB], ['ChromeSetup.exe', 1.4 * MB], ['vlc-3.0.21-win64.exe', 44 * MB]].map(([n, s], i) => ({ path: `C:\\Users\\you\\Downloads\\${n}`, name: n, size: s, modified: new Date(Date.now() - (60 + i * 30) * 86400e3).toISOString() })); },
+  emptyFolders() { return ['Documents\\New folder', 'Documents\\New folder (2)', 'Pictures\\Screenshots\\old', 'Desktop\\stuff'].map(p => `C:\\Users\\you\\${p}`); },
+  async compressPaths(paths) { await wait(800); return paths.map(p => ({ path: p, ok: true })); },
+  async setCleanSchedule() { await wait(200); return { ok: true }; },
+  async programs() {
+    await wait(800);
+    const d = [['Google Chrome', 'Google LLC', '131.0', 450, 0], ['Discord', 'Discord Inc.', '1.0.9170', 380, 1], ['Steam', 'Valve Corporation', '2.10', 900, 3], ['Spotify', 'Spotify AB', '1.2.50', 320, 2], ['Visual Studio Code', 'Microsoft Corporation', '1.95.3', 380, 0],
+      ['7-Zip 24.08 (x64)', 'Igor Pavlov', '24.08', 6, 40], ['NVIDIA Graphics Driver', 'NVIDIA Corporation', '566.14', 1300, null], ['McAfee LiveSafe', 'McAfee, LLC', '16.0', 820, 400], ['WinRAR 7.01', 'win.rar GmbH', '7.01', 9, 220], ['Adobe Acrobat (64-bit)', 'Adobe', '24.4', 1100, 95],
+      ['ExpressVPN', 'ExpressVPN', '12.88', 210, 260], ['Notion', 'Notion Labs, Inc', '4.2', 290, 5], ['OneLaunch', 'OneLaunch', '5.32', 160, 500], ['Driver Booster 11', 'IObit', '11.6', 95, 300]];
+    const desktop = d.map(([name, publisher, version, mb, used], i) => ({ id: 'w:' + i, kind: 'desktop', name, publisher, version, sizeKB: mb * 1024, installDate: `2025${String((i % 9) + 1).padStart(2, '0')}15`, uninstall: i % 3 ? `"C:\\Program Files\\${name}\\unins000.exe"` : `MsiExec.exe /X{${'0'.repeat(8)}-0000-0000-0000-${String(i).padStart(12, '0')}}`, location: `C:\\Program Files\\${name}`, regKey: `HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${name}`, lastUsed: used === null ? null : new Date(Date.now() - used * 86400e3).toISOString().slice(0, 19) }));
+    const store = C.BLOAT_APPS.filter(a => state.installed.has(a.pkg)).map(a => ({ id: 's:' + a.pkg, kind: 'store', pkg: a.pkg, name: a.name, publisher: 'Microsoft Corporation', version: '1.0.0.0', sizeKB: null, lastUsed: null }));
+    return desktop.filter(a => !(state.removed || new Set()).has(a.id)).concat(store);
+  },
+  silentCommand(a) { return a.kind === 'store' || /unins|MsiExec/i.test(a.uninstall || '') ? 'silent' : null; },
+  async runUninstall(a) { await wait(1500); (state.removed = state.removed || new Set()).add(a.id); if (a.kind === 'store') state.installed.delete(a.pkg); return { ok: true, gone: true }; },
+  async stillInstalled(a) { return !(state.removed || new Set()).has(a.id); },
+  async leftoverScan(a) {
+    await wait(1400);
+    const n = a.name.replace(/\s*\d.*$/, '');
+    const items = [
+      { type: 'dir', path: `C:\\Program Files\\${n}`, level: 'safe', detail: 'Install folder', size: 48 * MB },
+      { type: 'dir', path: `C:\\Users\\you\\AppData\\Roaming\\${n}`, level: 'safe', detail: 'Named after the app', size: 212 * MB },
+      { type: 'dir', path: `C:\\Users\\you\\AppData\\Local\\${n}`, level: 'safe', detail: 'Named after the app', size: 640 * MB },
+      { type: 'reg', path: `HKEY_CURRENT_USER\\Software\\${n}`, level: 'safe', detail: 'Settings key named after the app', size: 0 },
+      { type: 'run', path: `HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run|${n}`, level: 'safe', detail: `Starts with Windows: "C:\\Users\\you\\AppData\\Local\\${n}\\Update.exe" --processStart`, size: 0 },
+      { type: 'task', path: `\\${n}UpdateTaskMachine`, level: 'likely', detail: `Scheduled task: ${n}UpdateTaskMachine`, size: 0 },
+      { type: 'dir', path: `C:\\ProgramData\\${(a.publisher || n).split(/[ ,]/)[0]}`, level: 'careful', detail: 'Publisher folder — may be shared with other apps', size: 3 * MB },
+    ];
+    return items.map((x, i) => ({ ...x, id: `${x.type}:${i}:${x.path}` }));
+  },
+  async removeLeftovers(items) { await wait(900); return { backup: 'C:\\ProgramData\\OpenSweep\\backups\\demo', results: items.map(i => ({ id: i.id, ok: true })) }; },
+  async restoreBackup() { await wait(500); return { ok: true, restored: 2 }; },
+  BACKUP_ROOT: () => 'C:\\ProgramData\\OpenSweep\\backups',
+  async orphanScan() {
+    await wait(1800);
+    return [['C:\\Users\\you\\AppData\\Roaming\\Zoom', 412, 'Last changed 2024-02-11'], ['C:\\Program Files (x86)\\Origin', 1900, 'Last changed 2023-06-30'], ['C:\\Users\\you\\AppData\\Local\\Battle.net', 96, 'Last changed 2024-09-02'], ['C:\\ProgramData\\Epic', 64, 'Last changed 2025-01-12']]
+      .map(([p, mb, d], i) => ({ id: `orphan:${i}:${p}`, type: 'dir', path: p, size: mb * MB, level: 'careful', detail: d }));
+  },
+  async browserExtensions() {
+    await wait(500);
+    return [['Chrome', 'uBlock Origin', '1.61.2', ['storage', 'tabs', '<all_urls>'], false], ['Chrome', 'Google Docs Offline', '1.84', ['storage'], false], ['Edge', 'Coupon Finder Pro', '3.2', ['tabs', 'webRequest', '<all_urls>', 'history'], true], ['Firefox', 'Bitwarden', '2024.11', ['storage', 'clipboardWrite'], false]]
+      .map(([b, n, v, perm, forced], i) => ({ id: `${b}|Default|ext${i}`, browser: b, profile: 'Default', extId: `ext${i}`, name: n, version: v, desc: '', permissions: perm, forced, path: forced ? null : 'x' }));
+  },
+  async removeForcedExtension() { await wait(400); return { ok: true }; },
+  async optionalFeatures() { await wait(900); return Object.keys(C.FEATURE_NAMES).map((name, i) => ({ name, state: [0, 3, 6, 9].includes(i) ? 'Enabled' : 'Disabled' })); },
+  async setFeature({ enable }) { await wait(1500); return { ok: true, state: enable ? 'Enabled' : 'Disabled', restart: true }; },
+  async trackStart(label) { await wait(1200); state.track = { id: 'demo-track', label, started: new Date().toISOString() }; return state.track; },
+  async trackFinish() { await wait(1200); const t = { ...state.track, finished: new Date().toISOString(), diff: { dirs: ['C:\\Program Files\\CoolApp', 'C:\\Users\\you\\AppData\\Roaming\\CoolApp'], files: ['C:\\Users\\Public\\Desktop\\CoolApp.lnk'], reg: ['HKEY_CURRENT_USER\\Software\\CoolApp'], run: ['HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run|CoolAppHelper'], services: ['CoolAppUpdater'], tasks: [], firewall: [] } }; state.tracks = [t]; return t; },
+  tracks() { return state.tracks || []; },
+  trackItems(t) { return require('./win-uninstall').trackItems(t); },
+  async hunt() { await wait(1500); return { pid: 1037, name: 'Discord', path: 'C:\\Program Files\\Discord\\Discord.exe', title: 'Discord', company: 'Discord Inc.' }; },
+  async wingetUpgrades() { await wait(1200); return [{ name: 'Google Chrome', id: 'Google.Chrome', version: '130.0.6723.117', available: '131.0.6778.86' }, { name: '7-Zip', id: '7zip.7zip', version: '23.01', available: '24.08' }, { name: 'Discord', id: 'Discord.Discord', version: '1.0.9160', available: '1.0.9170' }]; },
+  async wingetUpgrade() { await wait(2500); return { ok: true }; },
 };

@@ -450,4 +450,21 @@ const DOWNLOAD_TYPES = {
 // Never allow ending these from the Processes page.
 const PROTECTED_PROCESSES = ['system', 'idle', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass', 'lsaiso', 'svchost', 'fontdrvhost', 'dwm', 'registry', 'memory compression', 'secure system', 'msmpeng', 'sgrmbroker'];
 
-module.exports = { TWEAK_CATEGORIES, TWEAKS, ANNOYANCE_FIXES, BLOAT_APPS, SERVICES, SCHEDULED_TASKS, CLEANUP, TOOLBOX, REPAIRS, DNS_PROVIDERS, DOWNLOAD_TYPES, PROTECTED_PROCESSES };
+// Programs worth a second look in the uninstaller (trialware, adware, "PC optimiser" scareware).
+const BAD_APPS = [
+  { match: '\\b(mcafee|norton|avast|avg)\\b.*(trial|livesafe|security|antivirus|internet)', level: 'trial', why: 'Pre-installed antivirus trial. Windows Security already protects you.' },
+  { match: 'wildtangent|candy crush|bubble witch|march of empires|hidden city|booking\\.com|amazon assistant|dropbox promotion|expressvpn.*trial', level: 'bloat', why: 'Pre-installed promotional app.' },
+  { match: 'onelaunch|wave browser|shift browser|webdiscover|pc app store|search ?protect|conduit|babylon|ask toolbar|segurazo|bytefence|reimage|restoro|pc accelerate|mypc ?utilities|driver ?support|pc cleaner|advanced pc cleaner|systweak|iobit|driver booster|advanced systemcare|pc optimizer pro', level: 'adware', why: 'Known adware, browser hijacker or scareware "PC optimiser".' },
+];
+// Friendly names for common Windows optional features.
+const FEATURE_NAMES = {
+  'Microsoft-Windows-Subsystem-Linux': 'Windows Subsystem for Linux (WSL)', VirtualMachinePlatform: 'Virtual Machine Platform', 'Microsoft-Hyper-V-All': 'Hyper-V',
+  'Containers-DisposableClientVM': 'Windows Sandbox', 'NetFx3': '.NET Framework 3.5', 'SMB1Protocol': 'SMB 1.0 file sharing (insecure)', 'TelnetClient': 'Telnet client',
+  'TFTP': 'TFTP client', 'MediaPlayback': 'Media features (Windows Media Player)', 'WindowsMediaPlayer': 'Windows Media Player (legacy)', 'Printing-PrintToPDFServices-Features': 'Microsoft Print to PDF',
+  'Printing-XPSServices-Features': 'Microsoft XPS Document Writer', 'WorkFolders-Client': 'Work Folders client', 'Internet-Explorer-Optional-amd64': 'Internet Explorer mode',
+  'MicrosoftWindowsPowerShellV2Root': 'Windows PowerShell 2.0 (old, insecure)', 'MicrosoftWindowsPowerShellV2': 'Windows PowerShell 2.0 engine', 'Recall': 'Recall (AI snapshots)',
+  'HypervisorPlatform': 'Windows Hypervisor Platform', 'IIS-WebServerRole': 'Internet Information Services (web server)', 'Microsoft-RemoteDesktopConnection': 'Remote Desktop Connection',
+  'SearchEngine-Client-Package': 'Windows Search', 'SmbDirect': 'SMB Direct', 'Windows-Defender-ApplicationGuard': 'Microsoft Defender Application Guard',
+};
+
+module.exports = { BAD_APPS, FEATURE_NAMES, TWEAK_CATEGORIES, TWEAKS, ANNOYANCE_FIXES, BLOAT_APPS, SERVICES, SCHEDULED_TASKS, CLEANUP, TOOLBOX, REPAIRS, DNS_PROVIDERS, DOWNLOAD_TYPES, PROTECTED_PROCESSES };
