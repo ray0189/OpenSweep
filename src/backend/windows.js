@@ -333,7 +333,8 @@ Clear-DnsClientCache; Out-Result @{ ok=$true }`, { index, servers });
 const toU32 = v => (typeof v === 'number' ? v >>> 0 : v);
 const toS32 = v => (typeof v === 'number' && v > 0x7fffffff ? v - 0x100000000 : v);
 
-async function tweakStates() {
+async function tweakStates(opts) {
+  const raw = {};
   const reads = [];
   C.TWEAKS.forEach(t => t.values.forEach(v => reads.push({ i: reads.length, key: v.key, name: v.name || '', kind: v.kind || 'value' })));
   const res = await ps(`
@@ -344,15 +345,17 @@ Out-Json @(foreach ($q in $a) { $p = 'Registry::' + $q.key
   const states = {};
   let i = 0;
   for (const t of C.TWEAKS) {
-    states[t.id] = t.values.every(v => {
+    raw[t.id] = [];
+    states[t.id] = t.values.map(v => {
       const r = byI.get(i++) || {};
+      raw[t.id].push(v.kind === 'key' || v.kind === 'absent' ? (r.e ? 'key exists' : 'no key') : r.v);
       if (v.kind === 'key') return !!r.e;
       if (v.kind === 'absent') return !r.e;
       if (r.v === null || r.v === undefined) return v.on === null;
       return String(toU32(r.v)) === String(toU32(v.on));
-    });
+    }).every(Boolean);
   }
-  return states;
+  return opts && opts.raw ? { states, raw } : states;
 }
 const TWEAK_SET = `
 $errs = @()
@@ -397,12 +400,12 @@ async function setTweaks(changes) {
   return verifyTweaks(changes, errors);
 }
 async function verifyTweaks(changes, errors = []) {
-  const states = await tweakStates();
+  const { states, raw } = await tweakStates({ raw: true });
   const failed = [];
   for (const { id, on } of changes) {
     if (!(id in states) || states[id] === !!on) continue;
     const e = errors.find(x => x.id === id);
-    failed.push({ id, title: (C.TWEAKS.find(t => t.id === id) || {}).title || id, error: e ? e.error : 'Value did not stick (Windows or a policy may be overriding it).' });
+    failed.push({ id, title: (C.TWEAKS.find(t => t.id === id) || {}).title || id, error: e ? e.error : `Windows still reports ${JSON.stringify(raw[id])} (a policy or Windows may be overriding it).` });
   }
   return { ok: !failed.length, applied: changes.length - failed.length, failed, states };
 }
