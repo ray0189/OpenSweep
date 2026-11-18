@@ -1,0 +1,44 @@
+{
+  "name": "opensweep",
+  "productName": "OpenSweep",
+  "version": "0.1.0",
+  "description": "Free, open-source PC care toolkit for Windows 10/11: cleanup, boost, startup, privacy, tweaks, repair and more.",
+  "main": "src/main.js",
+  "license": "MIT",
+  "author": "OpenSweep contributors",
+  "scripts": {
+    "start": "electron .",
+    "demo": "electron . --demo",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/backend/windows.js && node --check src/backend/mock.js && node --check src/backend/catalog.js && node --check src/renderer/app.js",
+    "dist:win": "electron-builder --win --x64",
+    "dist:win-arm64": "electron-builder --win --arm64"
+  },
+  "build": {
+    "appId": "org.opensweep.app",
+    "productName": "OpenSweep",
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "signAndEditExecutable": false,
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  },
+  "devDependencies": {
+    "electron": "^45.3.4",
+    "electron-builder": "^26.18.0"
+  }
+}

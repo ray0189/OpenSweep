@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self';">
+  <title>OpenSweep mini toolbar</title>
+  <link rel="stylesheet" href="widget.css">
+</head>
+<body>
+  <div class="w" id="drag">
+    <div class="m"><span>CPU</span><b id="cpu">–</b><div class="bar"><div id="cpub"></div></div></div>
+    <div class="m"><span>RAM</span><b id="ram">–</b><div class="bar"><div id="ramb"></div></div></div>
+    <button id="boost" title="Boost">⚡</button>
+    <button id="open" title="Open OpenSweep">↗</button>
+    <button id="close" title="Hide mini toolbar">✕</button>
+  </div>
+  <script src="widget.js"></script>
+</body>
+</html>
