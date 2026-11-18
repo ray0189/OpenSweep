@@ -160,3 +160,4 @@ dialog .row { justify-content: flex-end; }
 .banner .btn { margin-left: 8px; }
 .card.stat .sub { font-size: 12px; font-weight: 400; }
 .card.stat .big.good { color: var(--good); } .card.stat .big.bad { color: var(--bad); } .card.stat .big.warn { color: var(--warn); }
+.grid > .card + .card { margin-top: 0; }
