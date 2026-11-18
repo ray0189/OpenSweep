@@ -107,7 +107,7 @@ try { (Get-Process -Id $PID).PriorityClass = 'BelowNormal' } catch {}
 $items = New-Object System.Collections.ArrayList
 $seen = @{}
 function Add($type, $p, $level, $detail) { if (-not $p -or $seen.ContainsKey($type + $p)) { return }; $seen[$type + $p] = 1
-  $size = 0; if ($type -eq 'dir') { $size = [double](Get-ChildItem -LiteralPath $p -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum } elseif ($type -eq 'file') { $size = [double](Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue).Length }
+  $size = 0; if ($type -eq 'dir') { $size = Get-DirSize $p 3000 } elseif ($type -eq 'file') { $size = [double](Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue).Length }
   [void]$items.Add([pscustomobject]@{ type=$type; path=$p; level=$level; detail=$detail; size=$size }) }
 $names = @($a.keys | ForEach-Object { $_.ToLower() })
 $pub = $(if ($a.pub) { $a.pub.ToLower() } else { $null })
@@ -233,8 +233,10 @@ Out-Json @(foreach ($r in $roots) { foreach ($d in (Get-ChildItem -LiteralPath $
   if ($allow -contains $n -or $n.StartsWith('{') -or $n.StartsWith('.')) { continue }
   $hit = $false; foreach ($t in $tok) { if ($n.Contains($t) -or $t.Contains($n)) { $hit = $true; break } }
   if ($hit) { continue }
-  $files = Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Force -ErrorAction SilentlyContinue
-  $s = ($files | Measure-Object Length -Sum).Sum; $last = ($files | Measure-Object LastWriteTime -Maximum).Maximum
+  $last = $d.LastWriteTime
+  try { foreach ($c in (Get-ChildItem -LiteralPath $d.FullName -Force -ErrorAction SilentlyContinue | Select-Object -First 200)) { if ($c.LastWriteTime -gt $last) { $last = $c.LastWriteTime } } } catch {}
+  if (((Get-Date) - $last).TotalDays -lt 30) { continue }
+  $s = Get-DirSize $d.FullName 1500
   if ($s -lt 1MB) { continue }
   [pscustomobject]@{ type='dir'; path=$d.FullName; size=[double]$s; level='careful'; detail=$(if ($last) { 'Last changed ' + $last.ToString('yyyy-MM-dd') } else { 'Empty' }); modified=$(if ($last) { $last.ToString('s') } else { $null }) } } })`,
   { tokens: [...tokens].filter(t => t.length >= 3), allow: ORPHAN_ALLOW }, { timeout: 15 * 60 * 1000 });

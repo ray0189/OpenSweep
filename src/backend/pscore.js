@@ -10,6 +10,16 @@ const PS = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'Windo
 const PRELUDE = `$ProgressPreference='SilentlyContinue'
 [Console]::OutputEncoding=[Text.Encoding]::UTF8
 function Out-Json($x){ ConvertTo-Json -InputObject $x -Depth 6 -Compress }
+# Fast folder size (.NET, skips links, never throws). Stops after $budgetMs and returns what it counted.
+function Get-DirSize([string]$p, [int]$budgetMs = 4000) {
+  $sw = [Diagnostics.Stopwatch]::StartNew(); $total = [double]0; $stack = New-Object System.Collections.Stack; $stack.Push($p)
+  while ($stack.Count -gt 0 -and $sw.ElapsedMilliseconds -lt $budgetMs) {
+    $d = $stack.Pop()
+    try { foreach ($f in [IO.Directory]::EnumerateFiles($d)) { try { $total += (New-Object IO.FileInfo $f).Length } catch {} } } catch {}
+    try { foreach ($s in [IO.Directory]::EnumerateDirectories($d)) { try { if (-not ([IO.File]::GetAttributes($s) -band [IO.FileAttributes]::ReparsePoint)) { $stack.Push($s) } } catch {} } } catch {}
+  }
+  return $total
+}
 `;
 
 function tmpFile(ext) {

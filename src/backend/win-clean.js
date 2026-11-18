@@ -17,7 +17,7 @@ Out-Json @(foreach ($g in $groups) {
   $sorted = @($g.Group | Sort-Object @{ e={ $_.Date } ; Descending=$true }, @{ e={ $_.Version } ; Descending=$true })
   foreach ($d in ($sorted | Select-Object -Skip 1)) {
     $dir = Split-Path $d.OriginalFileName -Parent
-    $size = (Get-ChildItem -LiteralPath $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    $size = Get-DirSize $dir 2000
     [pscustomobject]@{ inf=$d.Driver; name=(Split-Path $d.OriginalFileName -Leaf); provider=$d.ProviderName; cls=$d.ClassName; version=$d.Version; date=$(if ($d.Date) { $d.Date.ToString('yyyy-MM-dd') } else { $null }); size=[double]$size; newest=$sorted[0].Version }
   }
 })`, undefined, { timeout: 5 * 60 * 1000 });
@@ -32,7 +32,7 @@ Out-Result $res`, infs, { timeout: 10 * 60 * 1000 });
 
 async function windowsOldSize() {
   const r = await ps(`$p = Join-Path $env:SystemDrive 'Windows.old'
-if (Test-Path -LiteralPath $p) { $s = (Get-ChildItem -LiteralPath $p -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum; Out-Json @{ exists=$true; size=[double]$s } } else { Out-Json @{ exists=$false; size=0 } }`, undefined, { timeout: 10 * 60 * 1000 });
+if (Test-Path -LiteralPath $p) { Out-Json @{ exists=$true; size=(Get-DirSize $p 20000) } } else { Out-Json @{ exists=$false; size=0 } }`, undefined, { timeout: 10 * 60 * 1000 });
   return r || { exists: false, size: 0 };
 }
 async function removeWindowsOld() {
