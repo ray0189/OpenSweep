@@ -84,3 +84,49 @@ Pureinfotech, Winaero, Neowin, Eleven Forum, Microsoft Q&A. Each complaint is ma
 
 Not fixable from an app: Edge being forced for links opened from Widgets/Search outside the EEA, and Microsoft's
 right to re-enable features in later updates. That's why the health check re-checks every setting each time it runs.
+
+## Round 3: uninstallers and disk analyzers (public sources only, 2026-11-18)
+
+Sources: the public product pages, feature lists, help pages and changelogs of Revo Uninstaller (Free/Pro),
+TreeSize (Free/Professional), WizTree, WinDirStat, Bulk Crap Uninstaller and IObit Uninstaller, plus reviews
+and forum threads (Reddit r/Windows, r/sysadmin, TenForums, MajorGeeks, PCWorld, How-To Geek).
+**No software was decompiled, disassembled or copied** — only advertised features and user complaints.
+
+### Uninstaller: what they advertise → what OpenSweep does
+
+| Feature | Revo / BCU / IObit | OpenSweep 0.3 |
+|---|---|---|
+| Run the app's own uninstaller, then scan leftovers | ✓ (3 scan modes) | ✓ files, folders, registry, startup entries, services, scheduled tasks, desktop/Start shortcuts and firewall rules, sorted into *definitely / very likely / check first* |
+| Backup before removing leftovers | Registry backup (Pro) | Files → Recycle Bin, registry/services/tasks → `.reg`/XML backup, one-click restore from History |
+| Forced uninstall of broken apps | ✓ (Pro) | ✓ by name or folder |
+| Batch uninstall | ✓ (Pro/BCU) | ✓ silent where the installer supports it (MSI, Inno Setup, NSIS, QuietUninstallString) |
+| Install monitoring / logs | ✓ (Pro, real-time driver) | ✓ snapshot before/after an install; remove exactly what it added |
+| Hunter mode (target a window) | ✓ | ✓ click any window → identify app → uninstall / end / startup |
+| Leftovers of apps removed earlier | ✓ (Pro) | ✓ old-leftover finder (unowned folders not changed for 30+ days) |
+| Browser extensions | ✓ (Pro) | ✓ Chrome, Edge, Brave, Vivaldi, Opera, Firefox, with risky-permission and **policy-forced extension** detection (common adware trick) |
+| Windows apps (Store) | ✓ | ✓ plus 39-app debloat list |
+| Last used / usage info | Partly | ✓ last run time from Windows Prefetch, "not used in 6 months" filter |
+| Bloat/adware warnings | IObit only | ✓ trialware, promo apps, adware and scareware "optimisers" flagged |
+| App updates | IObit (paid) | ✓ via winget, free |
+| Windows optional features | – | ✓ on/off with friendly names |
+| Price | Pro ≈ $25–40/yr | Free, MIT |
+
+Common complaints we avoid: aggressive "leftover" scans that delete shared folders (we never pre-tick
+publisher-level folders), no undo, nag screens/upsells, bundled offers, telemetry.
+
+### Disk analyzer: what they advertise → what OpenSweep does
+
+| Feature | TreeSize / WizTree / WinDirStat | OpenSweep 0.3 |
+|---|---|---|
+| Fast scan | WizTree/TreeSize Pro read the NTFS MFT | Parallel worker-thread scan (no UI freeze, live progress, cancel). MFT reading is a planned speed-up. |
+| Treemap | ✓ | ✓ squarified, two levels, coloured by file type, click to drill in |
+| Folder tree with size/%/files/date | ✓ | ✓ with lazy expand and right-click actions |
+| File types / extensions | ✓ | ✓ by category and extension |
+| File age | ✓ (Pro) | ✓ age buckets + "big files untouched for a year" |
+| Largest files / search & filters | ✓ (Pro) | ✓ name, size, age and type filters |
+| Duplicates | ✓ (Pro) | ✓ SHA-256 content match |
+| History / compare scans | ✓ (Pro) | ✓ snapshots per location, biggest growth since last scan |
+| Actions | Delete, move, compress (Pro) | Recycle Bin, move to another drive, NTFS compress, export CSV |
+| "What can I delete?" | – | ✓ Insights: caches, node_modules, temp, crash dumps, Windows.old, old installers, big videos, disk images, empty folders |
+| Owners / network drives | ✓ (Pro) | Not yet |
+| Price | Pro ≈ $60+ | Free, MIT |
