@@ -1,6 +1,7 @@
 'use strict';
 // Windows integration test for OpenSweepCore.exe: named-pipe protocol v1 (docs/core/ipc-protocol.md)
-// in --console mode, then the Windows service lifecycle. Needs Windows and an elevated shell
+// and the Phase 2–8 commands (docs/core/phases-2-8.md) in --console mode, then the Windows service
+// lifecycle with a 60 s engine soak and the admin commands. Needs Windows and an elevated shell
 // (GitHub's windows-latest runners are). Prints ✓/✗ per step, exits 1 on any failure.
 // Nothing is skipped silently: anything not tested is printed as "not tested: …".
 //
@@ -71,6 +72,219 @@ async function probeOnce() { const x = cc.createCoreClient({ timeout: 3000 }); t
 async function callOnce(cmd) { const x = cc.createCoreClient({ timeout: 3000 }); try { return await x.call(cmd); } finally { x.close(); } }
 const frameOf = (len, body = Buffer.alloc(0)) => { const h = Buffer.alloc(4); h.writeUInt32LE(len >>> 0); return Buffer.concat([h, body]); };
 
+// ---------------------------------------------------------------- Phases 2–8 (docs/core/phases-2-8.md)
+const MODES = ['monitor', 'balanced', 'advanced'];
+const RANGES = ['30m', '24h', '14d'];
+const DASH_METRICS = ['cpuPercent', 'memLoadPercent', 'commitTotal', 'diskReadLatencyMs', 'hardFaultsPerSec'];
+const isInt = (x) => Number.isInteger(x);
+const isStr = (x) => typeof x === 'string';
+const tsOf = (x) => Number(x && (x.tsMs ?? x.ts ?? x.openedAt ?? x.appliedAt)) || 0;
+const MB = 1048576;
+async function expectErr(name, p, code) {
+  try { const r = await p; return ok(name, false, `accepted: ${JSON.stringify(r).slice(0, 160)}`); }
+  catch (e) { return ok(name, Array.isArray(code) ? code.includes(e.code) : e.code === code, `code=${e.code} (${e.message})`); }
+}
+// Privacy (phases-2-8 safety rules): no window titles, command lines or document contents in results.
+function privacyKeys(obj) {
+  const bad = [];
+  const walk = (o, p) => { if (!o || typeof o !== 'object') return; for (const [k, v] of Object.entries(o)) { if (/^(commandline|cmdline|windowtitle|keystrokes?|documentpath)$/i.test(k) || (/^title$/i.test(k) && !/incident/i.test(p))) bad.push(p + k); walk(v, `${p}${k}.`); } };
+  walk(obj, '');
+  return bad;
+}
+async function callTimed(c, cmd, args) { const t = Date.now(); const r = await c.call(cmd, args); return { r, ms: Date.now() - t }; }
+
+// Read commands: result shapes per the contract. `label` = 'console' | 'service'.
+async function engineReadChecks(c, label, serverPid) {
+  section(`engine read commands (${label})`);
+  let st;
+  try { st = await c.call('status'); } catch (e) { ok('status answers', false, `${e.code} ${e.message}`); return false; }
+  const eng = st.engine || {}, counts = st.counts || {};
+  ok('status shape', MODES.includes(st.mode) && typeof st.simulation === 'boolean' && typeof eng.running === 'boolean' && isInt(eng.ticks) && num(eng.lastTickMs) && num(eng.tickCostUs)
+    && num(st.stabilityScore) && Array.isArray(st.scoreReasons) && st.scoreReasons.every(isStr) && ['incidentsOpen', 'policiesActive', 'recommendations'].every(k => isInt(counts[k]))
+    && st.heal && typeof st.heal.breakerOpen === 'boolean', JSON.stringify(st).slice(0, 400));
+  ok('status: default mode is monitor and decisions are simulated', st.mode === 'monitor' && st.simulation === true, `mode=${st.mode} simulation=${st.simulation}`);
+  ok('status: stabilityScore within 0–100', st.stabilityScore >= 0 && st.stabilityScore <= 100, String(st.stabilityScore));
+  ok('status: engine running', eng.running === true);
+  const t0 = eng.ticks;
+  await sleep(4500);
+  const st2 = await c.call('status');
+  ok('status: engine ticks advance (2 s interval)', st2.engine.ticks >= t0 + 1, `${t0} → ${st2.engine.ticks} in 4.5 s`);
+  ok('status: lastTickMs is recent', Math.abs(Date.now() - st2.engine.lastTickMs) < 10000, `${Date.now() - st2.engine.lastTickMs} ms ago`);
+  note(`engine tick cost ${(st2.engine.tickCostUs / 1000).toFixed(2)} ms, stability score ${st2.stabilityScore}, reasons: ${JSON.stringify(st2.scoreReasons).slice(0, 200)}`);
+
+  const { r: smp, ms: smpMs } = await callTimed(c, 'sample');
+  ok('sample shape', num(smp.tsMs) && num(smp.cpuPercent) && num(smp.memTotal) && num(smp.memAvail) && num(smp.memLoadPercent) && num(smp.commitTotal) && num(smp.commitLimit)
+    && num(smp.hardFaultsPerSec) && num(smp.diskReadLatencyMs) && num(smp.diskWriteLatencyMs) && isInt(smp.processes) && Array.isArray(smp.top), JSON.stringify({ ...smp, top: `[${(smp.top || []).length}]` }).slice(0, 400));
+  ok('sample: recent, cpu 0–100, memTotal ≈ os.totalmem()', Math.abs(Date.now() - smp.tsMs) < 10000 && smp.cpuPercent >= 0 && smp.cpuPercent <= 100 && Math.abs(smp.memTotal - os.totalmem()) <= os.totalmem() * 0.01, `age ${Date.now() - smp.tsMs} ms, ${smpMs} ms to answer`);
+  ok('sample: commitLimit >= commitTotal > 0', smp.commitTotal > 0 && smp.commitLimit >= smp.commitTotal);
+  ok('sample: top bounded (<= 40) with image names only', smp.top.length <= 40 && smp.top.every(p => isInt(p.pid) && isStr(p.name) && !/[\\/]/.test(p.name) && num(p.cpuPercent)), `${smp.top.length} processes`);
+  const pk = privacyKeys(smp);
+  ok('sample: no window titles / command lines', pk.length === 0, pk.join(', '));
+  if (serverPid) ok('sample: the service itself appears with a plausible name or not at all', smp.top.every(p => p.pid !== serverPid || /opensweepcore/i.test(p.name)));
+
+  for (const range of RANGES) {
+    const res = await Promise.allSettled(DASH_METRICS.map(metric => c.call('history', { metric, range })));
+    const bad = [];
+    res.forEach((x, i) => {
+      if (x.status === 'rejected') { bad.push(`${DASH_METRICS[i]}: ${x.reason.code}`); return; }
+      const h = x.value, pts = h.points;
+      const span = { '30m': 30 * 60e3, '24h': 24 * 3600e3, '14d': 14 * 86400e3 }[range];
+      const shape = h.metric === DASH_METRICS[i] && isStr(h.unit) && Array.isArray(pts) && pts.length <= 900 && pts.every(p => Array.isArray(p) && p.length === 2 && num(p[0]) && num(p[1]));
+      const sorted = pts.every((p, j) => j === 0 || p[0] >= pts[j - 1][0]);
+      const inWindow = pts.every(p => p[0] >= Date.now() - span - 30 * 60e3 && p[0] <= Date.now() + 10000);
+      if (!shape || !sorted || !inWindow) bad.push(`${DASH_METRICS[i]}: shape=${shape} sorted=${sorted} inWindow=${inWindow}`);
+    });
+    const n30 = res[0].status === 'fulfilled' ? res[0].value.points.length : 0;
+    ok(`history ${range}: shape for ${DASH_METRICS.length} metrics (≤ 900 points, ascending, in range)`, bad.length === 0, bad.join('; ') || `cpuPercent: ${n30} points`);
+    if (range === '30m') ok('history 30m has points after a few seconds', n30 >= 1, `${n30} points`);
+  }
+  await expectErr('history: unknown metric -> bad_args', c.call('history', { metric: 'not_a_metric', range: '30m' }), 'bad_args');
+  await expectErr('history: bad range -> bad_args', c.call('history', { metric: 'cpuPercent', range: '7d' }), 'bad_args');
+  await expectErr('history: missing args -> bad_args', c.call('history'), 'bad_args');
+
+  const bl = await c.call('baselines');
+  const blv = Object.entries(bl.metrics || {});
+  ok('baselines shape', bl.metrics && typeof bl.metrics === 'object' && blv.every(([, b]) => num(b.median) && num(b.mad) && b.mad >= 0 && num(b.ewma) && isInt(b.samples) && b.samples >= 0 && typeof b.ready === 'boolean'), `${blv.length} metrics: ${blv.slice(0, 3).map(([k, b]) => `${k} n=${b.samples} ready=${b.ready}`).join(', ')}`);
+
+  const inc = await c.call('incidents', { limit: 50 });
+  ok('incidents shape', Array.isArray(inc.incidents) && inc.incidents.length <= 50 && inc.incidents.every(x => x.id !== undefined && Array.isArray(x.symptoms) && Array.isArray(x.evidence) && num(x.confidence) && x.confidence >= 0 && x.confidence <= 1 && isStr(x.risk) && typeof x.autoRecoveryAllowed === 'boolean'), `${inc.incidents && inc.incidents.length} incident(s)`);
+  ok('incidents newest first', inc.incidents.every((x, i) => i === 0 || tsOf(x) <= tsOf(inc.incidents[i - 1])));
+  ok('incidents limit 1 respected', (await c.call('incidents', { limit: 1 })).incidents.length <= 1);
+  await expectErr('incidents: limit as string -> bad_args', c.call('incidents', { limit: 'x' }), 'bad_args');
+
+  const ev = await c.call('events', { limit: 100 });
+  ok('events shape', Array.isArray(ev.events) && ev.events.length <= 100 && ev.events.every(e => num(e.tsMs) && isStr(e.kind) && isStr(e.provider) && isInt(e.eventId) && isInt(e.level) && e.level >= 1 && e.level <= 4 && isStr(e.message) && e.message.length <= 200), `${ev.events && ev.events.length} event(s)`);
+  ok('events newest first', ev.events.every((x, i) => i === 0 || x.tsMs <= ev.events[i - 1].tsMs));
+  ok('events: no window titles / command lines', privacyKeys(ev).length === 0, privacyKeys(ev).join(', '));
+
+  const rec = await c.call('recommendations');
+  ok('recommendations shape', Array.isArray(rec.items) && rec.items.every(x => x.id !== undefined && ['memory', 'cpu'].includes(x.area) && x.target !== undefined && isStr(x.action) && isStr(x.reason) && isStr(x.risk) && typeof x.wouldApply === 'boolean'), `${rec.items && rec.items.length} item(s)`);
+  note(`recommendations: ${(rec.items || []).map(x => `${x.action}→${(x.target && x.target.name) || x.target} wouldApply=${x.wouldApply}${x.blockedBy ? ` (${x.blockedBy})` : ''}`).join('; ') || 'none'}`);
+
+  const pol = await c.call('policies');
+  ok('policies shape', Array.isArray(pol.active) && pol.active.every(p => p.txId !== undefined && isStr(p.kind) && p.target !== undefined && isStr(p.state)), `${pol.active && pol.active.length} active`);
+  ok('policies: none active in monitor mode', st2.mode !== 'monitor' || pol.active.length === 0, JSON.stringify(pol.active).slice(0, 200));
+
+  const jr = await c.call('journal', { limit: 100 });
+  ok('journal shape', Array.isArray(jr.entries) && jr.entries.length <= 100 && jr.entries.every(t => t.txId !== undefined && isStr(t.state)), `${jr.entries && jr.entries.length} entr(ies)`);
+  ok('journal newest first', jr.entries.every((x, i) => i === 0 || tsOf(x) <= tsOf(jr.entries[i - 1])));
+
+  const heal = await c.call('heal');
+  ok('heal shape', heal.breaker && typeof heal.breaker.open === 'boolean' && isInt(heal.breaker.failures) && Array.isArray(heal.pending) && Array.isArray(heal.history), JSON.stringify(heal.breaker));
+
+  const topo = await c.call('topology');
+  const sets = topo.cpuSets;
+  ok('topology.cpuSets shape', Array.isArray(sets) && sets.length > 0 && sets.every(x => ['id', 'group', 'core', 'efficiencyClass', 'numa'].every(k => isInt(x[k]))), `${sets && sets.length} CPU sets`);
+  ok('topology.cpuSets: one per logical processor, unique ids', Array.isArray(sets) && sets.length === topo.logicalProcessors && new Set(sets.map(x => x.id)).size === sets.length, `${sets && sets.length} vs ${topo.logicalProcessors}`);
+  ok('topology.cpuSets: efficiency classes consistent with hybrid flag', Array.isArray(sets) && (topo.hybrid ? new Set(sets.map(x => x.efficiencyClass)).size > 1 : new Set(sets.map(x => x.efficiencyClass)).size === 1));
+
+  // Foreground hint: own pid accepted, bogus pids rejected.
+  try { const r = await c.call('reportForeground', { pid: process.pid }); ok(`reportForeground with own pid accepted (${label})`, r && typeof r === 'object', JSON.stringify(r)); }
+  catch (e) { ok(`reportForeground with own pid accepted (${label})`, false, `${e.code} ${e.message}`); }
+  await expectErr('reportForeground with a pid that does not exist -> bad_args', c.call('reportForeground', { pid: 0x7ffffff0 }), 'bad_args');
+  await expectErr('reportForeground with pid 0 -> bad_args', c.call('reportForeground', { pid: 0 }), 'bad_args');
+  await expectErr('reportForeground with pid as string -> bad_args', c.call('reportForeground', { pid: String(process.pid) }), 'bad_args');
+  await expectErr('reportForeground without pid -> bad_args', c.call('reportForeground', {}), 'bad_args');
+  if (label === 'console') console.log('  not tested: reportForeground with a pid from another session (needs a second interactive session)');
+  return true;
+}
+
+// Admin commands from a NON-elevated client must be refused with `forbidden`. The runner is elevated,
+// so a de-elevated child is started with `runas /trustlevel:0x20000` (SAFER "Basic User": the
+// Administrators group becomes deny-only). If that is not possible here, it is reported, not skipped.
+async function nonAdminChecks() {
+  section('admin commands from a non-elevated client');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'osc-nonadmin-'));
+  const child = path.join(dir, 'client.js'), out = path.join(dir, 'out.json');
+  fs.writeFileSync(child, `'use strict';
+const cc = require(${JSON.stringify(path.join(__dirname, '..', 'src', 'core-client.js'))});
+const { spawnSync } = require('child_process');
+(async () => {
+  const res = { elevated: spawnSync('net.exe', ['session'], { windowsHide: true }).status === 0, calls: {} };
+  const c = cc.createCoreClient({ timeout: 5000 });
+  for (const [cmd, args] of [['status'], ['setMode', { mode: 'balanced' }], ['rollbackAll'], ['approve', { id: 'test-approval' }], ['disablePolicy', { txId: 1 }], ['exportDiagnostics']]) {
+    try { const r = await c.call(cmd, args); res.calls[cmd] = { ok: true, result: cmd === 'status' ? { mode: r.mode } : r }; }
+    catch (e) { res.calls[cmd] = { ok: false, code: e.code, message: e.message }; }
+  }
+  c.close();
+  require('fs').writeFileSync(${JSON.stringify(out)}, JSON.stringify(res));
+})().catch(e => require('fs').writeFileSync(${JSON.stringify(out)}, JSON.stringify({ error: String(e && e.stack || e) })));
+`);
+  const cmdline = `"\\"${process.execPath}\\" \\"${child}\\""`;
+  const r = spawnSync('runas.exe', ['/trustlevel:0x20000', cmdline], { encoding: 'utf8', timeout: 15000, windowsHide: true, windowsVerbatimArguments: true });
+  const got = await until(() => fs.existsSync(out), 30000, 250);
+  let res = null;
+  if (got) { await sleep(200); try { res = JSON.parse(fs.readFileSync(out, 'utf8')); } catch (e) { res = { error: e.message }; } }
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  if (!res) { console.log(`  not tested: non-admin rejection (could not start a de-elevated client with runas /trustlevel: exit ${r.status} ${String(r.stdout || '').trim()} ${String(r.stderr || '').trim()} ${r.error ? r.error.message : ''})`); return; }
+  if (res.error) { console.log(`  not tested: non-admin rejection (de-elevated client failed: ${res.error.slice(0, 300)})`); return; }
+  if (res.elevated) { console.log('  not tested: non-admin rejection (runner is elevated and the runas /trustlevel client was still elevated)'); return; }
+  note('de-elevated client started (net session refused => not elevated)');
+  ok('non-admin client can still read (status)', res.calls.status && res.calls.status.ok === true, JSON.stringify(res.calls.status));
+  for (const cmd of ['setMode', 'rollbackAll', 'approve', 'disablePolicy', 'exportDiagnostics']) ok(`non-admin ${cmd} -> forbidden`, res.calls[cmd] && res.calls[cmd].ok === false && res.calls[cmd].code === 'forbidden', JSON.stringify(res.calls[cmd]));
+}
+
+// 60 s soak in Monitor mode: service working set and tick cost, and no applied policy.
+async function soak(c, label) {
+  section(`60 s engine soak in Monitor mode (${label})`);
+  const st0 = await c.call('status');
+  if (!ok('soak starts in monitor mode', st0.mode === 'monitor', st0.mode)) return;
+  const start = Date.now(), ws = [], cost = [], polCounts = [];
+  while (Date.now() - start < 60000) {
+    const [h, s, p] = await Promise.all([c.call('health'), c.call('status'), c.call('policies')]);
+    ws.push(h.workingSetBytes); cost.push(s.engine.tickCostUs); polCounts.push(p.active.length);
+    await sleep(2000);
+  }
+  const sorted = (a) => [...a].sort((x, y) => x - y), med = (a) => sorted(a)[Math.floor(a.length / 2)];
+  const head = med(ws.slice(0, 5)), tail = med(ws.slice(-5)), growth = (tail - head) / head;
+  console.log(`  working set: min ${(Math.min(...ws) / MB).toFixed(1)} MB · median ${(med(ws) / MB).toFixed(1)} MB · max ${(Math.max(...ws) / MB).toFixed(1)} MB · first-5 median ${(head / MB).toFixed(1)} MB → last-5 median ${(tail / MB).toFixed(1)} MB (${(growth * 100).toFixed(1)} %) · ${ws.length} samples`);
+  console.log(`  tick cost: min ${(Math.min(...cost) / 1000).toFixed(2)} ms · median ${(med(cost) / 1000).toFixed(2)} ms · max ${(Math.max(...cost) / 1000).toFixed(2)} ms`);
+  ok('soak: working set < 64 MB throughout', Math.max(...ws) < 64 * MB, `max ${(Math.max(...ws) / MB).toFixed(1)} MB`);
+  ok('soak: working set growth <= 20 %', growth <= 0.2, `${(growth * 100).toFixed(1)} %`);
+  ok('soak: no active policy at any sample (monitor)', polCounts.every(n => n === 0), polCounts.join(','));
+  const jr = await c.call('journal', { limit: 500 });
+  const isModeOrRecovery = (t) => /mode|recover/i.test(String(t.kind)) || /mode/i.test(String(t.action || ''));
+  const applied = jr.entries.filter(t => tsOf(t) >= start - 2000 && ['applied', 'verified', 'verifying'].includes(t.state) && !isModeOrRecovery(t));
+  ok('soak: monitor mode applied zero policies (journal)', applied.length === 0, applied.length ? JSON.stringify(applied.slice(0, 3)) : `${jr.entries.filter(t => tsOf(t) >= start - 2000).length} journal entries in the window, none applied`);
+}
+
+// Admin commands from this (elevated) runner.
+async function adminChecks(c) {
+  section('admin commands (elevated runner)');
+  await expectErr('setMode with an unknown mode -> bad_args', c.call('setMode', { mode: 'turbo' }), 'bad_args');
+  await expectErr('setMode without args -> bad_args', c.call('setMode'), 'bad_args');
+  for (const mode of ['balanced', 'monitor']) {
+    try {
+      const r = await c.call('setMode', { mode });
+      const s = await c.call('status');
+      ok(`setMode ${mode}`, r.mode === mode && s.mode === mode && s.simulation === (mode === 'monitor'), `result=${JSON.stringify(r)} status.mode=${s.mode} simulation=${s.simulation}`);
+      const h = await c.call('hello');
+      ok(`hello.mode follows setMode (${mode})`, h.mode === mode, h.mode);
+    } catch (e) { ok(`setMode ${mode}`, false, `${e.code} ${e.message}`); }
+  }
+  const pol = await c.call('policies');
+  ok('policies empty after monitor → balanced → monitor', pol.active.length === 0, JSON.stringify(pol.active).slice(0, 200));
+  const jr = await c.call('journal', { limit: 50 });
+  ok('mode changes are journaled (>= 2 entries mentioning the mode)', jr.entries.filter(t => /mode/i.test(JSON.stringify(t))).length >= 2, `${jr.entries.length} entries`);
+  try { const r = await c.call('rollbackAll'); ok('rollbackAll (nothing active) -> { restored: 0, failed: 0 }', r.restored === 0 && r.failed === 0, JSON.stringify(r)); }
+  catch (e) { ok('rollbackAll', false, `${e.code} ${e.message}`); }
+  try { const r = await c.call('disablePolicy', { txId: 999999999 }); ok('disablePolicy of an unknown txId restores nothing', r.restored === false, JSON.stringify(r)); }
+  catch (e) { ok('disablePolicy of an unknown txId is refused', e.code === 'bad_args', `${e.code} ${e.message}`); }
+  await expectErr('approve of an unknown id is refused', c.call('approve', { id: 'no-such-approval' }), 'bad_args');
+  await expectErr('disablePolicy without txId -> bad_args', c.call('disablePolicy', {}), 'bad_args');
+  try {
+    const r = await c.call('exportDiagnostics', undefined, { timeout: 15000 });
+    const p = r && r.path;
+    const pd = (process.env.ProgramData || 'C:\\ProgramData').toLowerCase();
+    ok('exportDiagnostics returns a path under %ProgramData%\\OpenSweep', isStr(p) && p.toLowerCase().startsWith(path.join(pd, 'OpenSweep').toLowerCase()), p);
+    let j = null; try { j = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { /* checked below */ }
+    ok('exportDiagnostics wrote valid JSON', !!j, p && fs.existsSync(p) ? `${fs.statSync(p).size} bytes` : 'missing');
+    if (j) ok('diagnostics bundle has no window titles / command lines', privacyKeys(j).length === 0, privacyKeys(j).slice(0, 5).join(', '));
+  } catch (e) { ok('exportDiagnostics', false, `${e.code} ${e.message}`); }
+  const s = await c.call('status');
+  ok('ends in monitor mode', s.mode === 'monitor', s.mode);
+}
+
 let child = null, childOut = '';
 async function cleanup() {
   if (child && child.exitCode === null) { try { child.kill(); } catch { /* gone */ } }
@@ -131,6 +345,9 @@ async function consoleTests() {
     ok('topology: logicalProcessors == os.cpus().length', t.logicalProcessors === os.cpus().length, `${t.logicalProcessors} vs ${os.cpus().length}`);
     ok('topology: 1 <= cores <= logicalProcessors, packages/numaNodes/groups >= 1', t.cores >= 1 && t.cores <= t.logicalProcessors && t.packages >= 1 && t.numaNodes >= 1 && t.groups >= 1);
     ok('topology: hybrid implies >1 efficiency class', !t.hybrid || t.efficiencyClasses.length > 1, JSON.stringify(t.efficiencyClasses));
+
+    await engineReadChecks(c, 'console', child.pid);
+    await nonAdminChecks();
 
     // ---------------- protocol errors (raw frames)
     section('protocol errors');
@@ -342,6 +559,10 @@ async function serviceTests() {
       ok('hello.pid is the service process', hello.pid === st.pid, `hello.pid=${hello.pid} service pid=${st.pid}`);
       const m = await c.call('metrics');
       ok('metrics from the service', m.memory && m.memory.totalPhys > 0);
+      if (await engineReadChecks(c, 'service', st.pid)) {
+        await soak(c, 'service');
+        await adminChecks(c);
+      } else console.log('  not tested: soak and admin commands (engine read commands failed)');
     } catch (e) { ok('service answers over the pipe', false, `${e.code} ${e.message}`); }
     finally { c.close(); }
 

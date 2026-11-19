@@ -29,6 +29,214 @@ const state = {
 
 const PROC_NAMES = [['chrome', 'Google LLC'], ['chrome', 'Google LLC'], ['chrome', 'Google LLC'], ['msedge', 'Microsoft Corporation'], ['Discord', 'Discord Inc.'], ['Spotify', 'Spotify AB'], ['explorer', 'Microsoft Corporation'], ['svchost', 'Microsoft Corporation'], ['svchost', 'Microsoft Corporation'], ['MsMpEng', 'Microsoft Corporation'], ['OneDrive', 'Microsoft Corporation'], ['Code', 'Microsoft Corporation'], ['steam', 'Valve'], ['SearchHost', 'Microsoft Corporation'], ['Widgets', 'Microsoft Corporation'], ['PhoneExperienceHost', 'Microsoft Corporation'], ['dwm', 'Microsoft Corporation'], ['Teams', 'Microsoft Corporation'], ['RuntimeBroker', 'Microsoft Corporation'], ['Copilot', 'Microsoft Corporation'], ['Notion', 'Notion Labs'], ['audiodg', 'Microsoft Corporation']];
 
+// ---------------------------------------------------------------- OpenSweep Core Phase 2–8 simulation
+// Everything below is SIMULATED (demo mode only): synthetic time series with noise, one synthetic
+// memory-leak incident, one synthetic crash-loop incident, recommendations that would not apply in
+// Monitor mode, and a short journal. Every result carries `simulated: true`.
+// Shapes follow docs/core/phases-2-8.md; fields the contract leaves open (Incident, Transaction,
+// Approval) use the names the dashboard reads (src/renderer/core-page.js).
+const coreSim = (() => {
+  const T0 = Date.now();
+  const sim = { mode: 'monitor', txSeq: 1046, policies: [], ticks0: T0 - 3 * 3600e3 - 17 * 60e3 };
+  const LEAK_START = T0 - 3 * 3600e3, LEAK_PID = 7712, CRASH_SVC = 'ExampleSyncSvc';
+  // Deterministic noise per (metric, time bucket) so repeated history calls agree with each other.
+  const hash = (str, n) => { let x = 2166136261 ^ n; for (let i = 0; i < str.length; i++) x = Math.imul(x ^ str.charCodeAt(i), 16777619); x ^= x >>> 13; x = Math.imul(x, 0x5bd1e995); x ^= x >>> 15; return ((x >>> 0) % 100000) / 100000; };
+  const noise = (m, t, step) => hash(m, Math.floor(t / step)) * 2 - 1;
+  const leak = (t) => Math.max(0, Math.min(1, (t - LEAK_START) / (3 * 3600e3))); // 0 → 1 over 3 h
+  const day = (t) => Math.sin(((t / 3600e3) % 24) / 24 * 2 * Math.PI - Math.PI / 2) * 0.5 + 0.5; // daily rhythm
+  const METRICS = {
+    cpuPercent: { unit: '%', v: (t, s) => Math.max(0.5, Math.min(100, 6 + 10 * day(t) + 5 * noise('cpu', t, s) + (hash('cpuspk', Math.floor(t / 60e3)) > 0.97 ? 35 : 0))) },
+    memLoadPercent: { unit: '%', v: (t, s) => 41 + 3 * day(t) + 1.2 * noise('mem', t, s) + 8 * leak(t) },
+    commitTotal: { unit: 'bytes', v: (t, s) => (14.2 + 0.8 * day(t) + 0.25 * noise('com', t, s) + 2.6 * leak(t)) * GB },
+    commitLimit: { unit: 'bytes', v: () => 37.9 * GB },
+    diskReadLatencyMs: { unit: 'ms', v: (t, s) => Math.max(0.1, 0.7 + 0.35 * noise('drl', t, s) + (hash('drs', Math.floor(t / 120e3)) > 0.95 ? 9 : 0)) },
+    diskWriteLatencyMs: { unit: 'ms', v: (t, s) => Math.max(0.1, 1.1 + 0.5 * noise('dwl', t, s)) },
+    hardFaultsPerSec: { unit: '/s', v: (t, s) => Math.max(0, 18 + 14 * noise('hf', t, s) + 40 * leak(t) * (hash('hfl', Math.floor(t / 30e3)) > 0.8 ? 1 : 0)) },
+    pageFaultsPerSec: { unit: '/s', v: (t, s) => 2400 + 900 * noise('pf', t, s) },
+    cpuQueueLength: { unit: '', v: (t, s) => Math.max(0, 0.8 + 0.7 * noise('q', t, s)) },
+    contextSwitchesPerSec: { unit: '/s', v: (t, s) => 21000 + 6000 * noise('cs', t, s) + 9000 * day(t) },
+    dpcPercent: { unit: '%', v: (t, s) => Math.max(0, 0.25 + 0.15 * noise('dpc', t, s)) },
+    interruptPercent: { unit: '%', v: (t, s) => Math.max(0, 0.18 + 0.1 * noise('isr', t, s)) },
+    diskQueueLength: { unit: '', v: (t, s) => Math.max(0, 0.05 + 0.05 * noise('dq', t, s)) },
+    diskBytesPerSec: { unit: 'bytes/s', v: (t, s) => Math.max(0, (1.5 + 1.4 * noise('db', t, s)) * MB) },
+    cpuFreqPercent: { unit: '%', v: (t, s) => 96 + 4 * noise('fq', t, s) },
+  };
+  const RANGE = { '30m': [30 * 60e3, 2e3], '24h': [24 * 3600e3, 120e3], '14d': [14 * 86400e3, 1800e3] }; // ≤ 900 points each
+  const valueAt = (m, t, step = 2e3) => { const d = METRICS[m]; return d ? d.v(t, step) : 0; };
+  const leakBytes = (t) => Math.round((380 + 2500 * leak(t)) * MB);
+  const BASE = { cpuPercent: [11.4, 3.2], memLoadPercent: [42.6, 1.4], commitTotal: [14.6 * GB, 0.45 * GB], diskReadLatencyMs: [0.68, 0.22], hardFaultsPerSec: [17, 9], cpuQueueLength: [0.8, 0.4], diskWriteLatencyMs: [1.1, 0.3] };
+  const ago = (ms) => T0 - ms;
+
+  const incidents = () => [
+    { id: 'inc-0007', kind: 'memory_leak', title: 'Steadily growing memory use: LeakyHelper.exe', state: 'open', openedAt: LEAK_START + 40 * 60e3, updatedAt: Date.now(),
+      subject: { name: 'LeakyHelper.exe', pid: LEAK_PID },
+      symptoms: ['Commit charge rose from 14.6 GB to ' + (commitAt(Date.now()) / GB).toFixed(1) + ' GB over ~3 hours', 'Physical memory load is above its usual range', 'Hard page faults are rising in bursts'],
+      evidence: [
+        { metric: 'commitTotal', observed: commitAt(Date.now()), baseline: 14.6 * GB, mad: 0.45 * GB, unit: 'bytes', window: '3 h', note: 'outside baseline band' },
+        { metric: 'memLoadPercent', observed: 41 + 8 * leak(Date.now()), baseline: 42.6, mad: 1.4, unit: '%', window: '30 min' },
+        { metric: 'LeakyHelper.exe private bytes', observed: leakBytes(Date.now()), baseline: 380 * MB, unit: 'bytes', window: '3 h', note: 'monotonic growth, slope ≈ 830 MB/h' },
+      ],
+      contributors: [{ name: 'LeakyHelper.exe', kind: 'process', confidence: 0.82, detail: 'Private bytes grew in 94% of 1-minute intervals; growth tracks the commit increase (r = 0.97)' }, { name: 'chrome.exe', kind: 'process', confidence: 0.12, detail: 'Stable over the window; included for comparison' }],
+      possibleCauses: ['A memory leak in LeakyHelper.exe', 'A legitimate cache that has no upper bound'],
+      confidence: 0.78, confidenceLabel: 'medium', risk: 'medium',
+      recommendedActions: ['Restart LeakyHelper.exe when convenient (save work first)', 'Check for an update of the app that installed it', 'If it keeps growing, report it to its developer'],
+      autoRecoveryAllowed: false, autoRecoveryReason: 'Not an OpenSweep-owned component — OpenSweep never restarts or kills third-party apps automatically', simulated: true },
+    { id: 'inc-0006', kind: 'crash_loop', title: `Service crash loop: ${CRASH_SVC}`, state: 'open', openedAt: ago(52 * 60e3), updatedAt: ago(9 * 60e3),
+      subject: { name: CRASH_SVC },
+      symptoms: ['The service stopped unexpectedly 6 times in 20 minutes', 'Windows restarted it each time (recovery actions)'],
+      evidence: [{ metric: 'Service Control Manager 7031', observed: 6, baseline: 0, unit: 'events', window: '20 min' }, { metric: 'Application Error 1000 (ExampleSync.exe)', observed: 6, baseline: 0, unit: 'events', window: '20 min', note: 'faulting module: examplesync_core.dll' }],
+      contributors: [{ name: CRASH_SVC, kind: 'service', confidence: 0.93, detail: 'Every failure event names this service' }, { name: 'Windows Update (KB5048685, installed 1 h before)', kind: 'update', confidence: 0.31, detail: 'Correlated in time only; no direct evidence' }],
+      possibleCauses: ['A bug in the service triggered by recent data or configuration', 'An incompatibility with a recent update'],
+      confidence: 0.88, confidenceLabel: 'high', risk: 'low',
+      recommendedActions: ['Approve one controlled restart with back-off (pending in Recovery)', 'Update or reinstall the app that owns the service', 'Disable the service if you do not use it'],
+      autoRecoveryAllowed: false, autoRecoveryReason: 'Third-party service: needs your approval', simulated: true },
+    { id: 'inc-0005', kind: 'storage_latency', title: 'Short storage latency spikes', state: 'resolved', openedAt: ago(26 * 3600e3), resolvedAt: ago(25.6 * 3600e3), updatedAt: ago(25.6 * 3600e3),
+      subject: { name: 'Disk 0' },
+      symptoms: ['Read latency reached 41 ms (usual 0.7 ms) for about 90 seconds'],
+      evidence: [{ metric: 'diskReadLatencyMs', observed: 41, baseline: 0.68, mad: 0.22, unit: 'ms', window: '90 s' }],
+      contributors: [{ name: 'MsMpEng.exe (scheduled scan)', kind: 'process', confidence: 0.46, detail: 'Highest disk reader during the spike' }],
+      possibleCauses: ['A scheduled antivirus scan', 'Background indexing'], confidence: 0.46, confidenceLabel: 'low', risk: 'low',
+      recommendedActions: ['No action needed — it recovered on its own'], autoRecoveryAllowed: false, autoRecoveryReason: 'Nothing to recover', simulated: true },
+  ];
+  function commitAt(t) { return valueAt('commitTotal', t, 60e3); }
+
+  const recommendations = () => {
+    const monitor = sim.mode === 'monitor';
+    const active = new Set(sim.policies.map(p => p.target.name));
+    return [
+      { id: 'rec-onedrive-ecoqos', area: 'cpu', target: { pid: 9120, name: 'OneDrive.exe' }, workload: 'background', action: 'ecoqos', value: 1,
+        reason: 'Background sync used 14–19% CPU for 12 minutes while the foreground app was waiting for CPU (queue length 4.1, usual 0.8).',
+        evidence: [{ metric: 'OneDrive.exe CPU', observed: 16.8, unit: '%', window: '12 min' }, { metric: 'cpuQueueLength', observed: 4.1, baseline: 0.8, unit: '', window: '12 min' }],
+        expectedEffect: 'Less CPU contention for the foreground app. Kept only if the 60 s verification window shows lower queue length; otherwise rolled back.',
+        risk: 'low', cost: 0.1, wouldApply: !monitor && !active.has('OneDrive.exe'), blockedBy: monitor ? 'Monitor mode — simulation only' : active.has('OneDrive.exe') ? 'Already applied' : undefined, simulated: true },
+      { id: 'rec-leaky-mempri', area: 'memory', target: { pid: LEAK_PID, name: 'LeakyHelper.exe' }, workload: 'background', action: 'memoryPriority', value: 2,
+        reason: 'Growing background process while memory load is above baseline; lower memory priority makes Windows trim it before foreground apps.',
+        evidence: [{ metric: 'LeakyHelper.exe private bytes', observed: leakBytes(Date.now()), baseline: 380 * MB, unit: 'bytes', window: '3 h' }],
+        expectedEffect: 'Fewer hard faults in foreground apps under pressure. Does not fix the leak.',
+        risk: 'low', cost: 0.2, wouldApply: false, blockedBy: monitor ? 'Monitor mode — simulation only' : 'Memory pressure not sustained long enough (hysteresis: 10 min above threshold, now 6 min)', simulated: true },
+      { id: 'rec-teams-cpusets', area: 'cpu', target: { pid: 6408, name: 'Teams.exe' }, workload: 'interactive', action: 'cpuSets', value: 0,
+        reason: 'Considered moving background work to efficiency cores.',
+        evidence: [], expectedEffect: '—', risk: 'medium', cost: 0.5, wouldApply: false, blockedBy: 'CPU is not hybrid (no efficiency cores); also interactive workloads are never moved', simulated: true },
+    ];
+  };
+
+  const journal = [
+    { txId: 1046, ts: ago(9 * 60e3), kind: 'recovery', action: 'restartEtwSession', target: { name: 'OpenSweepCore kernel trace session' }, state: 'verified', reason: 'The service\'s own ETW session stopped (events lost); restarted once.', outcome: 'Events flowing again after 2 s', simulated: true },
+    { txId: 1045, ts: ago(34 * 60e3), kind: 'policy', action: 'ecoqos', target: { pid: 9120, name: 'OneDrive.exe' }, value: 1, original: -1, state: 'simulated', reason: 'Would have applied: sustained background CPU while the foreground app waited (Monitor mode — nothing changed).', simulated: true },
+    { txId: 1044, ts: ago(2.9 * 3600e3), kind: 'policy', action: 'memoryPriority', target: { pid: 5520, name: 'SearchIndexer.exe' }, value: 2, original: 5, state: 'simulated', reason: 'Considered, then rejected: system component on the protection list.', blocked: 'protected process', simulated: true },
+    { txId: 1043, ts: ago(3.2 * 3600e3), kind: 'recovery', action: 'reloadConfig', target: { name: 'config.json' }, state: 'verified', reason: 'One corrupt journal line skipped on start-up (checksum mismatch); configuration validated.', simulated: true },
+    { txId: 1042, ts: ago(3.3 * 3600e3), kind: 'mode', action: 'setMode', value: 'monitor', state: 'applied', reason: 'Default mode on first start.', simulated: true },
+  ];
+  const approvals = [{ id: 'apr-0006', ts: ago(9 * 60e3), action: 'restartService', target: { name: CRASH_SVC }, incident: 'inc-0006', reason: 'Crash loop (6 failures in 20 min). One restart with 5 min back-off; the circuit breaker stops after 2 failed attempts.', risk: 'low', expiresAt: Date.now() + 50 * 60e3, simulated: true }];
+  const breaker = { open: false, failures: 1, openedAt: null };
+
+  const events = () => [
+    ...[0, 1, 2, 3, 4, 5].map(i => ({ tsMs: ago((9 + i * 3.4) * 60e3), kind: 'ServiceFailure', provider: 'Service Control Manager', eventId: 7031, level: 2, subject: CRASH_SVC, message: `The ${CRASH_SVC} service terminated unexpectedly. It has done this ${6 - i} time(s).`, value: 0 })),
+    ...[0, 1, 2].map(i => ({ tsMs: ago((10 + i * 6.8) * 60e3), kind: 'AppCrash', provider: 'Application Error', eventId: 1000, level: 2, subject: 'ExampleSync.exe', message: 'Faulting application ExampleSync.exe, faulting module examplesync_core.dll', value: 0 })),
+    { tsMs: ago(70 * 60e3), kind: 'WindowsUpdate', provider: 'Microsoft-Windows-WindowsUpdateClient', eventId: 19, level: 4, subject: 'KB5048685', message: 'Installation successful: KB5048685', value: 0 },
+    { tsMs: ago(3.3 * 3600e3), kind: 'OpenSweepConfig', provider: 'OpenSweepCore', eventId: 0, level: 4, subject: 'mode', message: 'Mode set to monitor (default)', value: 0 },
+    { tsMs: ago(3.35 * 3600e3), kind: 'BootPerformance', provider: 'Microsoft-Windows-Diagnostics-Performance', eventId: 100, level: 4, subject: '', message: 'Windows started in 24.1 s', value: 24100 },
+    { tsMs: ago(26 * 3600e3), kind: 'AppHang', provider: 'Application Hang', eventId: 1002, level: 2, subject: 'explorer.exe', message: 'explorer.exe stopped responding for 6 s', value: 0 },
+  ].map(e => ({ ...e, simulated: true }));
+
+  function sample() {
+    const t = Date.now();
+    const v = (m) => valueAt(m, t);
+    return {
+      simulated: true, tsMs: t, cpuPercent: v('cpuPercent'), cpuQueueLength: v('cpuQueueLength'), contextSwitchesPerSec: v('contextSwitchesPerSec'), dpcPercent: v('dpcPercent'), interruptPercent: v('interruptPercent'),
+      memTotal: 32 * GB, memAvail: Math.round(32 * GB * (1 - v('memLoadPercent') / 100)), memLoadPercent: Math.round(v('memLoadPercent')), commitTotal: Math.round(v('commitTotal')), commitLimit: 37.9 * GB,
+      systemCache: 6.2 * GB, kernelPaged: 610 * MB, kernelNonpaged: 280 * MB, compressedBytes: 820 * MB, hardFaultsPerSec: v('hardFaultsPerSec'), pageFaultsPerSec: v('pageFaultsPerSec'),
+      diskReadLatencyMs: v('diskReadLatencyMs'), diskWriteLatencyMs: v('diskWriteLatencyMs'), diskQueueLength: v('diskQueueLength'), diskBytesPerSec: v('diskBytesPerSec'), cpuFreqPercent: v('cpuFreqPercent'),
+      processes: rnd(238, 251), threads: rnd(3300, 3500), handles: rnd(118000, 124000), foregroundPid: 11840,
+      top: [
+        { pid: 11840, parentPid: 4012, name: 'Code.exe', cpuPercent: 4.2, privateBytes: 690 * MB, workingSet: 540 * MB, hardFaultsPerSec: 0, handles: 1830, threads: 61, sessionId: 1, priorityClass: 32, foreground: true, isSystemCritical: false, isSecuritySoftware: false, isService: false, hasAudio: false, signedByMicrosoft: true },
+        { pid: 9120, parentPid: 4012, name: 'OneDrive.exe', cpuPercent: 3.1, privateBytes: 210 * MB, workingSet: 180 * MB, hardFaultsPerSec: 0, handles: 1620, threads: 44, sessionId: 1, priorityClass: 32, foreground: false, isSystemCritical: false, isSecuritySoftware: false, isService: false, hasAudio: false, signedByMicrosoft: true },
+        { pid: LEAK_PID, parentPid: 4012, name: 'LeakyHelper.exe', cpuPercent: 0.4, privateBytes: leakBytes(t), workingSet: Math.round(leakBytes(t) * 0.6), hardFaultsPerSec: 3, handles: 410, threads: 12, sessionId: 1, priorityClass: 32, foreground: false, isSystemCritical: false, isSecuritySoftware: false, isService: false, hasAudio: false, signedByMicrosoft: false },
+        { pid: 3324, parentPid: 812, name: 'MsMpEng.exe', cpuPercent: 0.9, privateBytes: 260 * MB, workingSet: 230 * MB, hardFaultsPerSec: 0, handles: 980, threads: 38, sessionId: 0, priorityClass: 32, foreground: false, isSystemCritical: true, isSecuritySoftware: true, isService: true, hasAudio: false, signedByMicrosoft: true },
+      ],
+    };
+  }
+
+  function status() {
+    const open = incidents().filter(i => i.state === 'open').length;
+    const ticks = Math.floor((Date.now() - sim.ticks0) / 2000);
+    return { simulated: true, mode: sim.mode, simulation: sim.mode === 'monitor', engine: { running: true, ticks, lastTickMs: Date.now() - (Date.now() % 2000), tickCostUs: rnd(700, 1400) },
+      stabilityScore: 74, scoreReasons: ['Service crash loop: ExampleSyncSvc (−14)', 'Steadily growing memory use: LeakyHelper.exe (−9)', 'No unexpected shutdowns, bugchecks or WHEA errors in 14 days (+0)', 'Storage latency within baseline (+0)'],
+      counts: { incidentsOpen: open, policiesActive: sim.policies.length, recommendations: recommendations().length }, heal: { breakerOpen: breaker.open } };
+  }
+
+  function nextTx() { return ++sim.txSeq; }
+  function command(cmd, args = {}) {
+    if (!state.core || !state.core.running) { const e = new Error('Simulated OpenSweep Core is stopped'); e.code = 'unavailable'; throw e; }
+    const badArgs = (m) => { const e = new Error(m); e.code = 'bad_args'; return e; };
+    if (args && args.limit !== undefined && !(Number.isInteger(args.limit) && args.limit > 0)) throw badArgs('limit must be a positive integer');
+    const lim = (a) => Math.min(Number(args && args.limit) || 100, a.length);
+    switch (cmd) {
+      case 'status': return status();
+      case 'sample': return sample();
+      case 'history': {
+        const d = METRICS[args.metric], r = RANGE[args.range];
+        if (!d || !r) { const e = new Error('bad metric or range'); e.code = 'bad_args'; throw e; }
+        const [span, step] = r, end = Math.floor(Date.now() / step) * step, points = [];
+        for (let t = end - span + step; t <= end; t += step) points.push([t, Math.round(d.v(t, step) * 1000) / 1000]);
+        return { simulated: true, metric: args.metric, unit: d.unit, points };
+      }
+      case 'baselines': {
+        const metrics = {};
+        for (const [m, [median, mad]] of Object.entries(BASE)) metrics[m] = { median, mad, ewma: median + mad * 0.3, samples: 6170, ready: true };
+        metrics.hardFaultsPerSec = { median: 17, mad: 9, ewma: 19, samples: 87, ready: false }; // still learning (needs 120 samples)
+        return { simulated: true, metrics };
+      }
+      case 'incidents': { const a = incidents().sort((x, y) => y.openedAt - x.openedAt); return { simulated: true, incidents: a.slice(0, lim(a)) }; }
+      case 'events': { const a = events().sort((x, y) => y.tsMs - x.tsMs); return { simulated: true, events: a.slice(0, lim(a)) }; }
+      case 'recommendations': return { simulated: true, items: recommendations() };
+      case 'policies': return { simulated: true, active: sim.policies.map(p => ({ ...p })) };
+      case 'journal': { const a = [...journal].sort((x, y) => y.ts - x.ts); return { simulated: true, entries: a.slice(0, lim(a)) }; }
+      case 'heal': return { simulated: true, breaker: { ...breaker }, pending: approvals.map(a => ({ ...a })), history: journal.filter(j => j.kind === 'recovery').sort((x, y) => y.ts - x.ts) };
+      case 'topology': return { simulated: true, logicalProcessors: 16, cores: 8, packages: 1, numaNodes: 1, groups: 1, hybrid: false, efficiencyClasses: [8], l3Caches: 1,
+        cpuSets: [...Array(16)].map((_, i) => ({ id: 256 + i, group: 0, core: i >> 1, efficiencyClass: 0, numa: 0 })) };
+      case 'reportForeground': return {};
+      case 'setMode': {
+        if (!['monitor', 'balanced', 'advanced'].includes(args.mode)) throw badArgs('mode must be monitor, balanced or advanced');
+        const prev = sim.mode; sim.mode = args.mode;
+        journal.push({ txId: nextTx(), ts: Date.now(), kind: 'mode', action: 'setMode', value: args.mode, original: prev, state: 'applied', reason: 'Changed by an administrator from the OpenSweep app.', simulated: true });
+        if (args.mode === 'monitor') command('rollbackAll');
+        else if (!sim.policies.length) {
+          // Simulate the engine applying the one low-risk recommendation, then verifying it.
+          const txId = nextTx(), now = Date.now();
+          sim.policies.push({ txId, kind: 'ecoqos', target: { pid: 9120, name: 'OneDrive.exe' }, value: 1, original: -1, appliedAt: now, verifyUntil: now + 60e3, state: 'verifying', simulated: true });
+          journal.push({ txId, ts: now, kind: 'policy', action: 'ecoqos', target: { pid: 9120, name: 'OneDrive.exe' }, value: 1, original: -1, state: 'applied', reason: 'Sustained background CPU while the foreground app waited. Verification window 60 s.', simulated: true });
+        }
+        return { simulated: true, mode: sim.mode };
+      }
+      case 'rollbackAll': {
+        const n = sim.policies.length;
+        for (const p of sim.policies) journal.push({ txId: p.txId, ts: Date.now(), kind: 'policy', action: p.kind, target: p.target, value: p.original, original: p.value, state: 'rolled_back', reason: 'Rolled back by an administrator (Roll back everything).', simulated: true });
+        sim.policies = [];
+        return { simulated: true, restored: n, failed: 0 };
+      }
+      case 'disablePolicy': {
+        if (args.txId === undefined) throw badArgs('txId is required');
+        const i = sim.policies.findIndex(p => p.txId === args.txId);
+        if (i < 0) return { simulated: true, restored: false };
+        const [p] = sim.policies.splice(i, 1);
+        journal.push({ txId: p.txId, ts: Date.now(), kind: 'policy', action: p.kind, target: p.target, value: p.original, original: p.value, state: 'rolled_back', reason: 'Disabled by an administrator.', simulated: true });
+        return { simulated: true, restored: true };
+      }
+      case 'approve': {
+        const i = approvals.findIndex(a => a.id === args.id);
+        if (i < 0) { const e = new Error('No such pending approval'); e.code = 'bad_args'; throw e; }
+        const [a] = approvals.splice(i, 1), txId = nextTx();
+        journal.push({ txId, ts: Date.now(), kind: 'recovery', action: a.action, target: a.target, state: 'applied', reason: `Approved by an administrator: ${a.reason}`, outcome: 'Simulated — nothing was restarted', simulated: true });
+        return { simulated: true, txId };
+      }
+      case 'exportDiagnostics': return { simulated: true, path: `C:\\ProgramData\\OpenSweep\\core\\diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json` };
+      default: { const e = new Error(`unknown command ${cmd}`); e.code = 'unknown_cmd'; throw e; }
+    }
+  }
+  return { command, status, get mode() { return sim.mode; } };
+})();
+
 module.exports = {
   demo: true,
 
@@ -257,8 +465,9 @@ module.exports = {
     return {
       available: false, demo: true, simulated: true, exePresent: true, installed: c.installed, running: c.running,
       serviceState: !c.installed ? 'not_installed' : c.running ? 'running' : 'stopped',
-      hello: c.running ? { service: 'OpenSweepCore', version: '0.1.0', protocol: 1, pid: 4312, mode: 'monitor', startedAt: new Date(c.startedAt).toISOString(), uptimeSec: up } : null,
-      health: c.running ? { status: 'running', mode: 'monitor', uptimeSec: up, workingSetBytes: 6.8 * MB, privateBytes: 3.1 * MB, cpuTimeMs: c.cpuMs, clients: 1, requests: c.requests, errors: 0 } : null,
+      hello: c.running ? { service: 'OpenSweepCore', version: '0.1.0', protocol: 1, pid: 4312, mode: coreSim.mode, startedAt: new Date(c.startedAt).toISOString(), uptimeSec: up } : null,
+      health: c.running ? { status: 'running', mode: coreSim.mode, uptimeSec: up, workingSetBytes: 9.4 * MB, privateBytes: 5.2 * MB, cpuTimeMs: c.cpuMs, clients: 1, requests: c.requests, errors: 0 } : null,
+      status: c.running ? coreSim.status() : null,
     };
   },
   async coreMetrics() {
@@ -270,8 +479,9 @@ module.exports = {
   },
   async coreTopology() {
     await wait(100);
-    return { simulated: true, logicalProcessors: 16, cores: 8, packages: 1, numaNodes: 1, groups: 1, hybrid: false, efficiencyClasses: [8], l3Caches: 1 };
+    return coreSim.command('topology'); // Phase 1 shape + cpuSets
   },
+  async coreCommand(cmd, args) { await wait(80); return coreSim.command(cmd, args || {}); },
   async coreAction(action) {
     await wait(900);
     const c = state.core || (state.core = { installed: true, running: true, startedAt: Date.now(), requests: 0, cpuMs: 0 });

@@ -1,14 +1,19 @@
 name: OpenSweep Core
 
 # Builds and tests the native OpenSweep Core service.
-#  - portable-linux: the platform-independent parts (cmake + ctest) and the Node pipe client unit test.
-#  - windows: the real service build, unit tests, and the named-pipe / service lifecycle integration test.
+#  - portable-linux: the platform-independent parts (cmake + ctest), the Node pipe client, IPC argument
+#    validation and benchmark statistics unit tests.
+#  - windows: the same plus the real service build, a parse check of the benchmark harness, and the
+#    named-pipe / Phase 2–8 commands / service lifecycle integration test.
 on:
   push:
     branches: ['**']
     paths:
       - 'core/**'
       - 'src/core-client.js'
+      - 'src/core-validate.js'
+      - 'bench/**'
+      - 'test/bench-*.js'
       - 'test/core-*.js'
       - '.github/workflows/core.yml'
   workflow_dispatch:
@@ -30,6 +35,10 @@ jobs:
           node-version: 22
       - name: Pipe client unit test (mock server)
         run: node test/core-client.js
+      - name: Core IPC argument validation unit test
+        run: node test/core-validate.js
+      - name: Benchmark statistics unit test
+        run: node test/bench-analyze.js
 
   windows:
     runs-on: windows-latest
@@ -42,10 +51,25 @@ jobs:
         run: cmake --build core/build --config Release
       - name: Unit tests
         run: ctest --test-dir core/build -C Release --output-on-failure
+      # core_win_tests already ran under ctest above; run it again directly so its measurements
+      # (collect() cost, PDH counter availability, event backfill sample) appear in the log.
+      - name: Windows collectors / events / actuator tests (verbose)
+        run: core/build/Release/core_win_tests.exe
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Pipe client unit test (mock server)
         run: node test/core-client.js
+      - name: Core IPC argument validation unit test
+        run: node test/core-validate.js
+      - name: Benchmark statistics unit test
+        run: node test/bench-analyze.js
+      - name: Benchmark harness parses (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'bench/run.ps1'), [ref]$null, [ref]$errs)
+          if ($errs) { $errs | ForEach-Object { Write-Error $_.ToString() }; exit 1 }
+          'bench/run.ps1 parses'
       - name: IPC + service lifecycle integration test
         run: node test/core-ipc.js core/build/Release/OpenSweepCore.exe

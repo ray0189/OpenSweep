@@ -41,6 +41,15 @@ add_library(opensweep_portable STATIC
   src/portable/stats.cpp
   src/portable/commands.cpp
   src/portable/telemetry.cpp
+  src/portable/trace.cpp
+  src/portable/baseline.cpp
+  src/portable/incident.cpp
+  src/portable/guard.cpp
+  src/portable/scheduler_policy.cpp
+  src/portable/memory_policy.cpp
+  src/portable/journal.cpp
+  src/portable/control.cpp
+  src/portable/heal.cpp
 )
 target_include_directories(opensweep_portable PUBLIC src/portable)
 opensweep_set_warnings(opensweep_portable)
@@ -56,6 +65,11 @@ add_executable(core_tests
   tests/test_ringbuffer.cpp
   tests/test_stats.cpp
   tests/test_commands.cpp
+  tests/test_scheduler_policy.cpp
+  tests/test_memory_policy.cpp
+  tests/test_journal.cpp
+  tests/test_control.cpp
+  tests/test_heal.cpp
 )
 target_link_libraries(core_tests PRIVATE opensweep_portable)
 opensweep_set_warnings(core_tests)
@@ -72,7 +86,12 @@ if(WIN32)
     src/win/metrics.cpp
     src/win/topology.cpp
     src/win/log.cpp
+    src/win/collectors.cpp
+    src/win/events.cpp
+    src/win/actuator.cpp
+    src/win/process_info.cpp
   )
+  target_link_libraries(OpenSweepCore PRIVATE pdh wevtapi)  # collectors (PDH) + events (wevtapi)
   target_include_directories(OpenSweepCore PRIVATE src/win)
   target_link_libraries(OpenSweepCore PRIVATE opensweep_portable advapi32 kernel32 psapi shell32 ole32 uuid)
   opensweep_set_warnings(OpenSweepCore)
@@ -80,4 +99,24 @@ if(WIN32)
     # Console subsystem: --console/--install/--version print to the console; the SCM ignores it.
     target_link_options(OpenSweepCore PRIVATE /SUBSYSTEM:CONSOLE)
   endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Windows-only tests: collectors, event log, actuator (touch the real system; run in the
+# `windows` job of .github/workflows/core.yml via ctest).
+if(WIN32)
+  add_executable(core_win_tests
+    tests/test_main.cpp
+    tests/win/test_win_collectors.cpp
+    src/win/collectors.cpp
+    src/win/events.cpp
+    src/win/actuator.cpp
+    src/win/process_info.cpp
+    src/win/log.cpp
+  )
+  target_include_directories(core_win_tests PRIVATE src/win tests)
+  target_link_libraries(core_win_tests PRIVATE opensweep_portable pdh wevtapi psapi advapi32 kernel32 shell32 ole32 uuid)
+  opensweep_set_warnings(core_win_tests)
+  add_test(NAME core_win_tests COMMAND core_win_tests)
+  set_tests_properties(core_win_tests PROPERTIES TIMEOUT 180)
 endif()

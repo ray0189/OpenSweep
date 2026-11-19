@@ -327,12 +327,91 @@ function coreServiceState() {
 async function coreStatus() {
   if (DEMO) return backend.coreStatus();
   const [serviceState, hello] = await Promise.all([coreServiceState(), core().call('hello', undefined, { timeout: 1500 }).catch(e => ({ _err: e }))]);
-  let health = null, error = null;
+  let health = null, engine = null, error = null;
   if (hello._err) error = { code: hello._err.code || 'internal', message: hello._err.message };
-  else health = await core().call('health').catch(() => null);
+  else {
+    // `status` exists from Phase 2 on; an older service answers unknown_cmd and the UI shows Phase 1 data only.
+    [health, engine] = await Promise.all([core().call('health').catch(() => null), core().call('status').catch(e => ({ _unsupported: e.code === 'unknown_cmd', _code: e.code || 'internal' }))]);
+    if (engine && engine._code) engine = { unavailable: true, unsupported: engine._unsupported, code: engine._code };
+    startForegroundHint();
+  }
   const ok = !hello._err;
   return { available: ok, running: ok || serviceState === 'running', installed: serviceState === 'unknown' ? null : serviceState !== 'not_installed', serviceState,
-    hello: ok ? hello : null, health, exePresent: fs.existsSync(coreExe()), error };
+    hello: ok ? hello : null, health, status: engine, exePresent: fs.existsSync(coreExe()), error };
+}
+
+// Phase 2–8 commands. The renderer names a method from core-validate's fixed table; args are rebuilt
+// there. Admin commands are confirmed here with a native dialog that states exactly what will happen.
+const coreValidate = require('./core-validate');
+const coreRead = (cmd, args) => (DEMO ? backend.coreCommand(cmd, args) : core().call(cmd, args, { timeout: 5000 }));
+async function coreAdmin(method, input) {
+  const { cmd, args } = coreValidate.prepare(method, input);
+  // Look up what is being acted on so the dialog can describe it (and unknown ids fail before anything is sent).
+  const ctx = {};
+  if (method === 'coreSetMode') ctx.current = await coreRead('status').then(s => s && s.mode).catch(() => null);
+  if (method === 'coreRollbackAll' || method === 'coreDisablePolicy') {
+    const active = (await coreRead('policies')).active || [];
+    ctx.count = active.length;
+    if (method === 'coreDisablePolicy') { ctx.policy = active.find(p => p.txId === args.txId); if (!ctx.policy) throw new Error('That policy is no longer active — refresh the page.'); }
+  }
+  if (method === 'coreApprove') { ctx.approval = ((await coreRead('heal')).pending || []).find(a => a.id === args.id); if (!ctx.approval) throw new Error('That approval request is no longer pending — refresh the page.'); }
+  const d = coreValidate.describeAdmin(method, args, ctx);
+  const opts = { type: 'warning', title: d.title, message: d.message, detail: d.detail + (DEMO ? '\n\n(Demo mode: simulated, nothing on this PC changes.)' : ''), buttons: ['Cancel', d.ok], defaultId: 0, cancelId: 0, noLink: true };
+  if (d.consent) opts.checkboxLabel = d.consent;
+  const r = win && !win.isDestroyed() ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
+  if (r.response !== 1) return { cancelled: true };
+  if (d.consent && !r.checkboxChecked) throw new Error('Advanced mode needs your explicit consent (tick the box in the confirmation).');
+  let res;
+  try { res = await (DEMO ? backend.coreCommand(cmd, args) : core().call(cmd, args, { timeout: 15000 })); }
+  catch (e) { if (e.code === 'forbidden') throw new Error('OpenSweep Core refused: this change needs OpenSweep to run as administrator.'); throw e; }
+  logHistory({ kind: 'core', summary: `OpenSweep Core: ${d.title}${cmd === 'setMode' ? ` → ${args.mode}` : ''}${DEMO ? ' (simulated)' : ''}` });
+  return res;
+}
+
+// Foreground hint (phases-2-8 `reportForeground`): the service runs in session 0 and cannot see the
+// foreground window, so the logged-on app reports its process id every 2 s while Core is connected.
+// One persistent PowerShell process; P/Invoke is defined in memory (Reflection.Emit), so no compiled
+// DLL is written to disk. Not used in demo mode. Stops when Core does not support the command.
+const FG_SCRIPT = `$ErrorActionPreference = 'Stop'
+$asm = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object Reflection.AssemblyName 'OpenSweepFg'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+$tb = $asm.DefineDynamicModule('OpenSweepFg').DefineType('OpenSweepFg.U', 'Public, Class')
+$attr = [Reflection.MethodAttributes]'Public, Static, PinvokeImpl'
+$m1 = $tb.DefinePInvokeMethod('GetForegroundWindow', 'user32.dll', $attr, [Reflection.CallingConventions]::Standard, [IntPtr], [Type[]]@(), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
+$m1.SetImplementationFlags('PreserveSig')
+$m2 = $tb.DefinePInvokeMethod('GetWindowThreadProcessId', 'user32.dll', $attr, [Reflection.CallingConventions]::Standard, [UInt32], [Type[]]@([IntPtr], [UInt32].MakeByRefType()), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
+$m2.SetImplementationFlags('PreserveSig')
+$u = $tb.CreateType()
+while ($true) {
+  $p = [UInt32]0; $h = $u::GetForegroundWindow()
+  if ($h -ne [IntPtr]::Zero) { [void]$u::GetWindowThreadProcessId($h, [ref]$p) }
+  [Console]::Out.WriteLine('{"pid":' + $p + '}'); [Console]::Out.Flush()
+  Start-Sleep -Milliseconds 2000
+}`;
+const fg = { stop: null, unsupportedUntil: 0, lastErr: null };
+function startForegroundHint() {
+  if (DEMO || fg.stop || Date.now() < fg.unsupportedUntil) return;
+  try {
+    fg.stop = require('./backend/pscore').stream(FG_SCRIPT, undefined, (d) => {
+      const pid = d && d.pid;
+      if (!coreClient || !coreClient.connected || !Number.isSafeInteger(pid) || pid <= 4) return; // only while connected
+      coreClient.call('reportForeground', { pid }, { timeout: 1500 }).then(() => { fg.lastErr = null; }).catch(e => {
+        fg.lastErr = e.code;
+        if (e.code === 'unknown_cmd') { fg.unsupportedUntil = Date.now() + 10 * 60e3; stopForegroundHint(); }
+      });
+    }, () => { fg.stop = null; });
+  } catch { fg.stop = null; }
+}
+function stopForegroundHint() { const s = fg.stop; fg.stop = null; if (s) s(); }
+// Supervisor: (re)start the hint when Core answers, stop it when Core is gone. Cheap: one hello every 30 s.
+function scheduleForegroundHint() {
+  if (DEMO) return;
+  let misses = 0;
+  setInterval(async () => {
+    const p = await core().probe({ timeout: 1500 });
+    if (p.available) { misses = 0; startForegroundHint(); }
+    else if (++misses >= 2) stopForegroundHint();
+  }, 30e3);
+  setTimeout(() => core().probe({ timeout: 1500 }).then(p => { if (p.available) startForegroundHint(); }), 15e3);
 }
 async function coreAction(action) {
   if (DEMO) { await backend.coreAction(action); logHistory({ kind: 'core', summary: `OpenSweep Core: ${action} (simulated)` }); return backend.coreStatus(); }
@@ -356,7 +435,7 @@ async function coreAction(action) {
   for (let i = 0; want && st !== want && i < 30; i++) { await new Promise(res => setTimeout(res, 500)); st = await coreServiceState(); }
   if (want && st !== want) throw new Error(`OpenSweep Core ${action}: the service is "${st}" instead of "${want}".`);
   if (action === 'install' && st === 'not_installed') throw new Error('OpenSweep Core install: the service was not registered.');
-  if (action === 'stop' || action === 'uninstall') { try { coreClient && coreClient.close(); } catch { /* ignore */ } }
+  if (action === 'stop' || action === 'uninstall') { stopForegroundHint(); try { coreClient && coreClient.close(); } catch { /* ignore */ } }
   logHistory({ kind: 'core', summary: `OpenSweep Core: ${{ install: 'installed', uninstall: 'uninstalled', start: 'started', stop: 'stopped' }[action]}` });
   return coreStatus();
 }
@@ -593,7 +672,8 @@ const api = {
   installUpdate: () => installUpdate(),
   closeWidget: () => { settings.showWidget = false; saveSettings(); applySettings(); return { ok: true }; },
 
-  // OpenSweep Core: no renderer input is used, only the method name.
+  // OpenSweep Core: Phase 1 methods use no renderer input; the Phase 2–8 methods are added below
+  // from core-validate's fixed table (strict argument checks, admin methods confirmed natively).
   coreStatus: () => coreStatus(),
   coreMetrics: () => (DEMO ? backend.coreMetrics() : core().call('metrics')),
   coreTopology: () => (DEMO ? backend.coreTopology() : core().call('topology')),
@@ -608,6 +688,9 @@ Object.assign(api, extra, {
   guardStatus: () => ({ enabled: !!settings.settingsGuard, count: (settings.guardTweaks || []).length }),
   guardRun: () => runGuard({ manual: true }),
 });
+for (const [method, spec] of Object.entries(coreValidate.CORE_METHODS)) {
+  api[method] = spec.cap === 'admin' ? (args) => coreAdmin(method, args) : (args) => { const p = coreValidate.prepare(method, args); return coreRead(p.cmd, p.args); };
+}
 
 const UNDO_FNS = new Set(['setTweaks', 'setStartup', 'setTasks', 'setFeature', 'restoreBackup', 'organizeUndo']);
 const INTERNAL_ONLY = new Set(['organizeUndo', 'restoreBackup', '_stopAll']); // only reachable through History & undo
@@ -686,9 +769,10 @@ else {
     applySettings();
     setupUpdater();
     scheduleStability();
+    scheduleForegroundHint();
     if (!DEMO) setTimeout(() => runGuard().catch(() => {}), 120e3);
   });
-  app.on('before-quit', () => { quitting = true; try { extra._stopAll(); } catch { /* ignore */ } try { if (coreClient) coreClient.close(); } catch { /* ignore */ } });
+  app.on('before-quit', () => { quitting = true; try { extra._stopAll(); } catch { /* ignore */ } try { stopForegroundHint(); } catch { /* ignore */ } try { if (coreClient) coreClient.close(); } catch { /* ignore */ } });
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
   app.on('activate', showMain);
 }

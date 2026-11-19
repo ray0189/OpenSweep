@@ -32,6 +32,11 @@ struct ProcessSample {
     bool is_service = false;
     bool has_audio = false;             // currently rendering audio (0 = unknown/false)
     bool signed_by_microsoft = false;
+    // Added by win-collect (appended; existing fields unchanged):
+    std::int64_t start_ms = 0;          // process creation time, Unix epoch ms; feeds PolicyTarget::process_start_ms
+    double page_faults_per_sec = 0.0;   // all page faults (soft + hard) from PageFaultCount deltas;
+                                        // per-process *hard* faults are not exposed by a documented
+                                        // non-ETW API, so hard_faults_per_sec stays 0
 };
 
 // One system-wide sample, taken every `kSampleIntervalMs`.

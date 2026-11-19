@@ -16,7 +16,11 @@
     "dist:win": "node scripts/prepare-core.js && electron-builder --win --x64",
     "dist:win-arm64": "node scripts/prepare-core.js && electron-builder --win --arm64",
     "test:windows": "node test/windows-smoke.js",
-    "test:core": "node test/core-ipc.js"
+    "test:core": "node test/core-ipc.js",
+    "test:validate": "node test/core-validate.js",
+    "test:bench": "node test/bench-analyze.js",
+    "test:unit": "node test/core-client.js && node test/core-validate.js && node test/bench-analyze.js",
+    "bench:analyze": "node bench/analyze.js"
   },
   "build": {
     "appId": "org.opensweep.app",
