@@ -22,7 +22,7 @@ Nothing is marked done yet.
 
 | Phase | Scope (Part 17) | Status |
 |---|---|---|
-| 1 — Foundation | Audit, architecture, native service, secure IPC, service health in Electron, tests | **In progress.** Audit documents and IPC spec written. Service, Node client and UI integration are being added on `feature/opensweep-core`; not yet verified on Windows. |
+| 1 — Foundation | Audit, architecture, native service, secure IPC, service health in Electron, tests | **Built; awaiting real-PC check.** On the GitHub `windows-latest` runner (core.yml): MSVC build, 46 unit tests, and `test/core-ipc.js` pass — all commands, every error path, 64 KiB limit, 8-client limit + queueing, 1000 concurrent requests, 5 s stall cut-off, pipe ACL matches spec, and service install/start/stop/uninstall as LocalSystem. Not tested: 60 s idle timeout; the Electron Core page against the real service; a real (non-CI) Windows 10/11 PC; arm64. |
 | 2 — Observability | Telemetry collectors, SweepTrace, baselines, live dashboard | Not started |
 | 3 — Stability intelligence | SweepGuard, incident reports, anomaly detection, simulation mode | Not started |
 | 4 — Resource intelligence | SweepMemory, SweepScheduler, topology, recommendations | Not started |
@@ -33,8 +33,8 @@ Nothing is marked done yet.
 
 ## Key open items from the audits
 
-- High-severity findings in `security-audit.md` (S1–S6) are not fixed yet; Stage A of `migration-plan.md` lists the fixes
-  that do not need Core.
+- S2, S3 and S4 from `security-audit.md` are fixed on `feature/opensweep-core` (Windows smoke test passes). S1 (whole app
+  runs as admin), S5 (elevated scheduled tasks) and S6 (unsigned builds + silent auto-update) are still open.
 - The current Boost feature trims all working sets (`EmptyWorkingSet`) and must be replaced (Part 1 rule 11).
 - Builds are unsigned; code signing is a prerequisite for installing a service.
 - Release builds are x64 only; arm64 needs native builds of both the app and the service.
