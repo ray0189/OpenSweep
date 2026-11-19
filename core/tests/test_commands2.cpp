@@ -131,16 +131,16 @@ TEST(cmd2_status_shape_and_hello_mode) {
     CHECK(s.find("heal") && s.find("heal")->find("breakerOpen")->is_bool());
     CHECK(Env::code(e.call("status", "{\"x\":1}")) == "bad_args");
 
-    CHECK_EQ(Env::res(e.call("hello")).find("mode")->as_string(), std::string("monitor"));
+    CHECK_EQ(std::string(Env::res(e.call("hello")).find("mode")->as_string()), std::string("monitor"));
     const auto sm = e.call("setMode", "{\"mode\":\"balanced\"}", true);
     CHECK(Env::ok(sm));
     CHECK_EQ(Env::res(sm).find("mode")->as_string(), std::string("balanced"));
     CHECK(!Env::res(sm).find("simulation")->as_bool());
-    CHECK_EQ(Env::res(e.call("hello")).find("mode")->as_string(), std::string("balanced"));
-    CHECK_EQ(Env::res(e.call("health")).find("mode")->as_string(), std::string("balanced"));
+    CHECK_EQ(std::string(Env::res(e.call("hello")).find("mode")->as_string()), std::string("balanced"));
+    CHECK_EQ(std::string(Env::res(e.call("health")).find("mode")->as_string()), std::string("balanced"));
     CHECK(!Env::res(e.call("status")).find("simulation")->as_bool());
     CHECK(Env::ok(e.call("setMode", "{\"mode\":\"monitor\"}", true)));
-    CHECK_EQ(Env::res(e.call("hello")).find("mode")->as_string(), std::string("monitor"));
+    CHECK_EQ(std::string(Env::res(e.call("hello")).find("mode")->as_string()), std::string("monitor"));
     // Mode changes are journaled.
     const auto j = Env::res(e.call("journal", "{\"limit\":50}"));
     int mode_entries = 0;
