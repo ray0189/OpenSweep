@@ -337,12 +337,16 @@ void Engine::tick(const Sample& s, std::span<const EventRecord> events) {
 
     // OBSERVE -> bounded storage
     trace_.append(s);
-    trace_.add_events(events);
+    // Only genuinely new events go further: after a restart the event-log backfill re-delivers
+    // events that were already persisted, and counting them twice would fake crash loops.
+    std::vector<EventRecord> fresh;
+    for (const EventRecord& e : events)
+        if (trace_.add_event(e)) fresh.push_back(e);
     // ESTABLISH BASELINE
     baselines_.update(s);
-    baselines_.observe_events(events);
+    baselines_.observe_events(fresh);
     // DETECT (incidents with evidence + confidence)
-    guard_.evaluate(s, events, baselines_, incidents_);
+    guard_.evaluate(s, fresh, baselines_, incidents_);
     capture_incidents_locked(t);
     propose_recoveries_locked(t);
 

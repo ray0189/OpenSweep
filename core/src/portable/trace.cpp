@@ -447,9 +447,18 @@ void Trace::append(const Sample& s) {
     has_latest_ = true;
 }
 
-void Trace::add_event(const EventRecord& e) {
+bool Trace::add_event(const EventRecord& e) {
+    // After a restart the event-log backfill re-reads events that were already persisted:
+    // skip exact duplicates (events arrive rarely, so a scan of the bounded ring is cheap).
+    for (std::size_t i = 0; i < events_.size(); ++i) {
+        const EventRecord& x = events_[i];
+        if (x.ts_ms == e.ts_ms && x.event_id == e.event_id && x.kind == e.kind && x.provider == e.provider &&
+            x.subject == e.subject)
+            return false;
+    }
     events_.push(e);
     events_unpersisted_ = std::min(events_unpersisted_ + 1, events_.size());
+    return true;
 }
 
 void Trace::add_events(std::span<const EventRecord> events) {
@@ -522,10 +531,14 @@ std::vector<HiResRow> Trace::window(std::int64_t from_ms, std::int64_t to_ms) co
 }
 
 std::vector<EventRecord> Trace::events(std::size_t limit) const {
-    const std::size_t n = limit == 0 ? events_.size() : std::min(limit, events_.size());
+    // Insertion order is not time order (a backfill after restart can add older events after
+    // newer persisted ones), so sort newest first by timestamp; ties keep newest-inserted first.
     std::vector<EventRecord> out;
-    out.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) out.push_back(events_[events_.size() - 1 - i]);
+    out.reserve(events_.size());
+    for (std::size_t i = 0; i < events_.size(); ++i) out.push_back(events_[events_.size() - 1 - i]);
+    std::stable_sort(out.begin(), out.end(),
+                     [](const EventRecord& a, const EventRecord& b) { return a.ts_ms > b.ts_ms; });
+    if (limit != 0 && out.size() > limit) out.resize(limit);
     return out;
 }
 

@@ -451,3 +451,27 @@ TEST(trace_std_file_io) {
     std::error_code ec;
     fs::remove_all(dir, ec);
 }
+
+TEST(trace_events_dedupe_and_newest_first_after_backfill) {
+    using opensweep::telemetry::EventRecord;
+    using opensweep::telemetry::EventKind;
+    opensweep::trace::Trace t;
+    auto ev = [](std::int64_t ts, std::uint32_t id) {
+        EventRecord e;
+        e.ts_ms = ts; e.event_id = id; e.kind = EventKind::ServiceFailure; e.provider = "SCM"; e.subject = "svc";
+        e.message = "m";
+        return e;
+    };
+    t.add_event(ev(3000, 1));
+    t.add_event(ev(5000, 2));
+    // Restart: backfill delivers older events again, plus one new older event.
+    t.add_event(ev(3000, 1));
+    t.add_event(ev(1000, 3));
+    t.add_event(ev(5000, 2));
+    const auto out = t.events(0);
+    CHECK_EQ(out.size(), std::size_t{3});
+    CHECK_EQ(out[0].ts_ms, std::int64_t{5000});
+    CHECK_EQ(out[1].ts_ms, std::int64_t{3000});
+    CHECK_EQ(out[2].ts_ms, std::int64_t{1000});
+    CHECK_EQ(t.events(1).size(), std::size_t{1});
+}

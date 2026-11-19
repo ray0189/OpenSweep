@@ -166,7 +166,8 @@ public:
 
     // Appends a sample to tier 0, folds it into the open aggregation buckets and keeps it as latest.
     void append(const Sample& s);
-    void add_event(const EventRecord& e);
+    // Returns false (and stores nothing) when the event is an exact duplicate of a stored one.
+    bool add_event(const EventRecord& e);
     void add_events(std::span<const EventRecord> events);
 
     const Sample* latest() const noexcept { return has_latest_ ? &latest_ : nullptr; }
