@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -88,14 +89,19 @@ std::string format_iso8601_utc(std::int64_t unix_ms);
 // Current wall clock as Unix epoch milliseconds.
 std::int64_t now_unix_ms();
 
-json::Value build_hello(const ServiceInfo& info, std::uint32_t pid);
-json::Value build_health(const ServiceInfo& info, const SelfProcessInfo& self, const ServerCounters& counters);
+// `mode` is the engine's current operating mode ("monitor" | "balanced" | "advanced").
+json::Value build_hello(const ServiceInfo& info, std::uint32_t pid, const char* mode = kMode);
+json::Value build_health(const ServiceInfo& info, const SelfProcessInfo& self, const ServerCounters& counters,
+                         const char* mode = kMode);
 json::Value build_metrics(const MetricsSnapshot& m);
 json::Value build_topology(const TopologyInfo& t);
 
+// Returns the current mode string (static storage). Empty function = always kMode.
+using ModeProvider = std::function<const char*()>;
+
 // Registers hello/health/metrics/topology (all require Capability::Read). The referenced
-// objects must outlive the dispatcher.
+// objects must outlive the dispatcher. `mode` feeds hello.mode / health.mode.
 void register_phase1(protocol::Dispatcher& dispatcher, SystemProvider& provider, const ServiceInfo& info,
-                     const ServerCounters& counters);
+                     const ServerCounters& counters, ModeProvider mode = {});
 
 }  // namespace opensweep::commands

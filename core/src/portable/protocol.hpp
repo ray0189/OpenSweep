@@ -62,8 +62,14 @@ enum class Capability : std::uint32_t {
 
 constexpr std::uint32_t cap_bit(Capability c) noexcept { return static_cast<std::uint32_t>(c); }
 
+// Session of a client whose token could not be queried (handlers that need the session refuse).
+inline constexpr std::uint32_t kUnknownSession = 0xFFFFFFFFu;
+
 struct ClientContext {
     std::uint32_t pid = 0;
+    // Terminal Services session of the client, taken from the client's *token* by the server
+    // (TokenSessionId while impersonating), never from request data.
+    std::uint32_t session_id = kUnknownSession;
     std::uint32_t capabilities = cap_bit(Capability::Read);
     bool has(Capability c) const noexcept { return (capabilities & cap_bit(c)) == cap_bit(c); }
 };

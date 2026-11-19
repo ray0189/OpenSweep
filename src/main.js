@@ -390,15 +390,21 @@ while ($true) {
 const fg = { stop: null, unsupportedUntil: 0, lastErr: null };
 function startForegroundHint() {
   if (DEMO || fg.stop || Date.now() < fg.unsupportedUntil) return;
+  const startedAt = Date.now();
+  let mine = null;
   try {
-    fg.stop = require('./backend/pscore').stream(FG_SCRIPT, undefined, (d) => {
+    mine = fg.stop = require('./backend/pscore').stream(FG_SCRIPT, undefined, (d) => {
       const pid = d && d.pid;
       if (!coreClient || !coreClient.connected || !Number.isSafeInteger(pid) || pid <= 4) return; // only while connected
       coreClient.call('reportForeground', { pid }, { timeout: 1500 }).then(() => { fg.lastErr = null; }).catch(e => {
         fg.lastErr = e.code;
         if (e.code === 'unknown_cmd') { fg.unsupportedUntil = Date.now() + 10 * 60e3; stopForegroundHint(); }
       });
-    }, () => { fg.stop = null; });
+    }, () => {
+      if (fg.stop !== mine) return; // stopped on purpose, or already replaced by a newer helper
+      fg.stop = null;
+      if (Date.now() - startedAt < 10e3) fg.unsupportedUntil = Date.now() + 10 * 60e3; // died at start: back off
+    });
   } catch { fg.stop = null; }
 }
 function stopForegroundHint() { const s = fg.stop; fg.stop = null; if (s) s(); }

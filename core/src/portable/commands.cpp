@@ -64,22 +64,23 @@ std::int64_t now_unix_ms() {
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
-json::Value build_hello(const ServiceInfo& info, std::uint32_t pid) {
+json::Value build_hello(const ServiceInfo& info, std::uint32_t pid, const char* mode) {
     json::Value r = json::Value::object();
     r.set("service", kServiceName);
     r.set("version", kVersion);
     r.set("protocol", protocol::kProtocolVersion);
     r.set("pid", pid);
-    r.set("mode", kMode);
+    r.set("mode", mode ? mode : kMode);
     r.set("startedAt", format_iso8601_utc(info.started_at_ms));
     r.set("uptimeSec", uptime_sec(info));
     return r;
 }
 
-json::Value build_health(const ServiceInfo& info, const SelfProcessInfo& self, const ServerCounters& counters) {
+json::Value build_health(const ServiceInfo& info, const SelfProcessInfo& self, const ServerCounters& counters,
+                         const char* mode) {
     json::Value r = json::Value::object();
     r.set("status", "running");
-    r.set("mode", kMode);
+    r.set("mode", mode ? mode : kMode);
     r.set("uptimeSec", uptime_sec(info));
     r.set("workingSetBytes", self.working_set);
     r.set("privateBytes", self.private_bytes);
@@ -140,21 +141,23 @@ json::Value build_topology(const TopologyInfo& t) {
 }
 
 void register_phase1(protocol::Dispatcher& dispatcher, SystemProvider& provider, const ServiceInfo& info,
-                     const ServerCounters& counters) {
+                     const ServerCounters& counters, ModeProvider mode) {
     using protocol::Capability;
     using protocol::ClientContext;
     using protocol::CommandError;
     using protocol::ErrorCode;
     using protocol::Request;
 
-    dispatcher.add("hello", Capability::Read, [&provider, &info](const Request&, const ClientContext&) {
-        return build_hello(info, provider.pid());
+    dispatcher.add("hello", Capability::Read, [&provider, &info, mode](const Request&, const ClientContext&) {
+        return build_hello(info, provider.pid(), mode ? mode() : kMode);
     });
-    dispatcher.add("health", Capability::Read, [&provider, &info, &counters](const Request&, const ClientContext&) {
-        SelfProcessInfo self;
-        if (!provider.self_process(self)) throw CommandError(ErrorCode::Internal, "process information unavailable");
-        return build_health(info, self, counters);
-    });
+    dispatcher.add("health", Capability::Read,
+                   [&provider, &info, &counters, mode](const Request&, const ClientContext&) {
+                       SelfProcessInfo self;
+                       if (!provider.self_process(self))
+                           throw CommandError(ErrorCode::Internal, "process information unavailable");
+                       return build_health(info, self, counters, mode ? mode() : kMode);
+                   });
     dispatcher.add("metrics", Capability::Read, [&provider](const Request&, const ClientContext&) {
         MetricsSnapshot m;
         if (!provider.metrics(m)) throw CommandError(ErrorCode::Internal, "metrics unavailable");
