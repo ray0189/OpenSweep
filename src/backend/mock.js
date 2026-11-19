@@ -33,8 +33,9 @@ const PROC_NAMES = [['chrome', 'Google LLC'], ['chrome', 'Google LLC'], ['chrome
 // Everything below is SIMULATED (demo mode only): synthetic time series with noise, one synthetic
 // memory-leak incident, one synthetic crash-loop incident, recommendations that would not apply in
 // Monitor mode, and a short journal. Every result carries `simulated: true`.
-// Shapes follow docs/core/phases-2-8.md; fields the contract leaves open (Incident, Transaction,
-// Approval) use the names the dashboard reads (src/renderer/core-page.js).
+// Shapes follow docs/core/phases-2-8.md; Incident and Transaction use the field names of the engine's
+// to_json (core/src/portable/incident.cpp, journal.cpp). Approval JSON is not fixed by the contract yet:
+// { id, action, target, trigger, evidence[], risk, createdMs, expiresMs } is what the dashboard reads.
 const coreSim = (() => {
   const T0 = Date.now();
   const sim = { mode: 'monitor', txSeq: 1046, policies: [], ticks0: T0 - 3 * 3600e3 - 17 * 60e3 };
@@ -67,76 +68,81 @@ const coreSim = (() => {
   const BASE = { cpuPercent: [11.4, 3.2], memLoadPercent: [42.6, 1.4], commitTotal: [14.6 * GB, 0.45 * GB], diskReadLatencyMs: [0.68, 0.22], hardFaultsPerSec: [17, 9], cpuQueueLength: [0.8, 0.4], diskWriteLatencyMs: [1.1, 0.3] };
   const ago = (ms) => T0 - ms;
 
+  // Field names follow core/src/portable/incident.cpp to_json (Incident) and journal.cpp to_json (Transaction).
+  const W = (from, to) => ({ windowFrom: from, windowTo: to });
   const incidents = () => [
-    { id: 'inc-0007', kind: 'memory_leak', title: 'Steadily growing memory use: LeakyHelper.exe', state: 'open', openedAt: LEAK_START + 40 * 60e3, updatedAt: Date.now(),
-      subject: { name: 'LeakyHelper.exe', pid: LEAK_PID },
+    { id: 'inc-0007', key: 'memory_leak:LeakyHelper.exe', detector: 'memory_leak', title: 'Steadily growing memory use: LeakyHelper.exe', state: 'open', severity: 'warning',
+      summary: 'LeakyHelper.exe has grown almost every minute for about 3 hours while commit charge rose with it.',
+      firstSeen: LEAK_START + 40 * 60e3, lastSeen: Date.now(), resolvedAt: 0, occurrences: 1,
       symptoms: ['Commit charge rose from 14.6 GB to ' + (commitAt(Date.now()) / GB).toFixed(1) + ' GB over ~3 hours', 'Physical memory load is above its usual range', 'Hard page faults are rising in bursts'],
       evidence: [
-        { metric: 'commitTotal', observed: commitAt(Date.now()), baseline: 14.6 * GB, mad: 0.45 * GB, unit: 'bytes', window: '3 h', note: 'outside baseline band' },
-        { metric: 'memLoadPercent', observed: 41 + 8 * leak(Date.now()), baseline: 42.6, mad: 1.4, unit: '%', window: '30 min' },
-        { metric: 'LeakyHelper.exe private bytes', observed: leakBytes(Date.now()), baseline: 380 * MB, unit: 'bytes', window: '3 h', note: 'monotonic growth, slope ≈ 830 MB/h' },
+        { metric: 'commitTotal', unit: 'bytes', observed: commitAt(Date.now()), baseline: 14.6 * GB, robustZ: (commitAt(Date.now()) - 14.6 * GB) / (0.45 * GB * 1.4826), ...W(LEAK_START, Date.now()), note: 'outside the usual range' },
+        { metric: 'memLoadPercent', unit: '%', observed: 41 + 8 * leak(Date.now()), baseline: 42.6, robustZ: (41 + 8 * leak(Date.now()) - 42.6) / (1.4 * 1.4826), ...W(Date.now() - 30 * 60e3, Date.now()) },
+        { metric: 'LeakyHelper.exe private bytes', unit: 'bytes', observed: leakBytes(Date.now()), baseline: 380 * MB, robustZ: null, ...W(LEAK_START, Date.now()), note: 'monotonic growth, slope ≈ 830 MB/h' },
       ],
-      contributors: [{ name: 'LeakyHelper.exe', kind: 'process', confidence: 0.82, detail: 'Private bytes grew in 94% of 1-minute intervals; growth tracks the commit increase (r = 0.97)' }, { name: 'chrome.exe', kind: 'process', confidence: 0.12, detail: 'Stable over the window; included for comparison' }],
-      possibleCauses: ['A memory leak in LeakyHelper.exe', 'A legitimate cache that has no upper bound'],
-      confidence: 0.78, confidenceLabel: 'medium', risk: 'medium',
+      contributors: [{ name: 'LeakyHelper.exe', kind: 'process', pid: LEAK_PID, correlation: 0.97 }, { name: 'chrome.exe', kind: 'process', pid: 4410, correlation: 0.12 }],
+      confidence: 0.78, confidenceLevel: 'medium', risk: 'medium',
       recommendedActions: ['Restart LeakyHelper.exe when convenient (save work first)', 'Check for an update of the app that installed it', 'If it keeps growing, report it to its developer'],
-      autoRecoveryAllowed: false, autoRecoveryReason: 'Not an OpenSweep-owned component — OpenSweep never restarts or kills third-party apps automatically', simulated: true },
-    { id: 'inc-0006', kind: 'crash_loop', title: `Service crash loop: ${CRASH_SVC}`, state: 'open', openedAt: ago(52 * 60e3), updatedAt: ago(9 * 60e3),
-      subject: { name: CRASH_SVC },
-      symptoms: ['The service stopped unexpectedly 6 times in 20 minutes', 'Windows restarted it each time (recovery actions)'],
-      evidence: [{ metric: 'Service Control Manager 7031', observed: 6, baseline: 0, unit: 'events', window: '20 min' }, { metric: 'Application Error 1000 (ExampleSync.exe)', observed: 6, baseline: 0, unit: 'events', window: '20 min', note: 'faulting module: examplesync_core.dll' }],
-      contributors: [{ name: CRASH_SVC, kind: 'service', confidence: 0.93, detail: 'Every failure event names this service' }, { name: 'Windows Update (KB5048685, installed 1 h before)', kind: 'update', confidence: 0.31, detail: 'Correlated in time only; no direct evidence' }],
-      possibleCauses: ['A bug in the service triggered by recent data or configuration', 'An incompatibility with a recent update'],
-      confidence: 0.88, confidenceLabel: 'high', risk: 'low',
-      recommendedActions: ['Approve one controlled restart with back-off (pending in Recovery)', 'Update or reinstall the app that owns the service', 'Disable the service if you do not use it'],
-      autoRecoveryAllowed: false, autoRecoveryReason: 'Third-party service: needs your approval', simulated: true },
-    { id: 'inc-0005', kind: 'storage_latency', title: 'Short storage latency spikes', state: 'resolved', openedAt: ago(26 * 3600e3), resolvedAt: ago(25.6 * 3600e3), updatedAt: ago(25.6 * 3600e3),
-      subject: { name: 'Disk 0' },
+      autoRecoveryAllowed: false, simulated: true },
+    { id: 'inc-0006', key: `crash_loop:${CRASH_SVC}`, detector: 'crash_loop', title: `Service crash loop: ${CRASH_SVC}`, state: 'open', severity: 'error',
+      summary: 'The service stopped unexpectedly 6 times in 20 minutes; Windows restarted it each time.',
+      firstSeen: ago(52 * 60e3), lastSeen: ago(9 * 60e3), resolvedAt: 0, occurrences: 6,
+      symptoms: ['The service stopped unexpectedly 6 times in 20 minutes', 'Windows restarted it each time (service recovery actions)'],
+      evidence: [{ metric: 'Service Control Manager 7031', unit: 'events', observed: 6, baseline: 0, robustZ: null, ...W(ago(29 * 60e3), ago(9 * 60e3)) }, { metric: 'Application Error 1000 (ExampleSync.exe)', unit: 'events', observed: 6, baseline: 0, robustZ: null, ...W(ago(29 * 60e3), ago(9 * 60e3)), note: 'faulting module: examplesync_core.dll' }],
+      contributors: [{ name: CRASH_SVC, kind: 'service', pid: 0, correlation: 0.93 }, { name: 'KB5048685 (installed 1 h before)', kind: 'update', pid: 0, correlation: 0.31 }],
+      confidence: 0.88, confidenceLevel: 'high', risk: 'low',
+      recommendedActions: ['Approve one controlled restart with back-off (waiting in Recovery)', 'Update or reinstall the app that owns the service', 'Disable the service if you do not use it'],
+      autoRecoveryAllowed: false, simulated: true },
+    { id: 'inc-0005', key: 'storage_latency:disk0', detector: 'storage_latency', title: 'Short storage latency spike', state: 'resolved', severity: 'warning',
+      summary: 'Read latency was far above its usual range for about 90 seconds, then recovered on its own.',
+      firstSeen: ago(26 * 3600e3), lastSeen: ago(25.97 * 3600e3), resolvedAt: ago(25.6 * 3600e3), occurrences: 1,
       symptoms: ['Read latency reached 41 ms (usual 0.7 ms) for about 90 seconds'],
-      evidence: [{ metric: 'diskReadLatencyMs', observed: 41, baseline: 0.68, mad: 0.22, unit: 'ms', window: '90 s' }],
-      contributors: [{ name: 'MsMpEng.exe (scheduled scan)', kind: 'process', confidence: 0.46, detail: 'Highest disk reader during the spike' }],
-      possibleCauses: ['A scheduled antivirus scan', 'Background indexing'], confidence: 0.46, confidenceLabel: 'low', risk: 'low',
-      recommendedActions: ['No action needed — it recovered on its own'], autoRecoveryAllowed: false, autoRecoveryReason: 'Nothing to recover', simulated: true },
+      evidence: [{ metric: 'diskReadLatencyMs', unit: 'ms', observed: 41, baseline: 0.68, robustZ: 124.7, ...W(ago(26 * 3600e3), ago(26 * 3600e3) + 90e3) }],
+      contributors: [{ name: 'MsMpEng.exe', kind: 'process', pid: 3324, correlation: 0.46 }],
+      confidence: 0.46, confidenceLevel: 'low', risk: 'low',
+      recommendedActions: ['No action needed — it recovered on its own'], autoRecoveryAllowed: false, simulated: true },
   ];
   function commitAt(t) { return valueAt('commitTotal', t, 60e3); }
 
+  // Contract shape (phases-2-8 "recommendations"); risk is the engine's 1 (lowest) .. 5, evidence strings.
   const recommendations = () => {
     const monitor = sim.mode === 'monitor';
     const active = new Set(sim.policies.map(p => p.target.name));
     return [
-      { id: 'rec-onedrive-ecoqos', area: 'cpu', target: { pid: 9120, name: 'OneDrive.exe' }, workload: 'background', action: 'ecoqos', value: 1,
-        reason: 'Background sync used 14–19% CPU for 12 minutes while the foreground app was waiting for CPU (queue length 4.1, usual 0.8).',
-        evidence: [{ metric: 'OneDrive.exe CPU', observed: 16.8, unit: '%', window: '12 min' }, { metric: 'cpuQueueLength', observed: 4.1, baseline: 0.8, unit: '', window: '12 min' }],
+      { id: 'cpu:ecoqos:9120', area: 'cpu', target: { pid: 9120, name: 'OneDrive.exe' }, workload: 'Background', action: 'ecoqos', value: 1,
+        reason: 'Background sync used 14–19% CPU for 12 minutes while the foreground app was waiting for CPU (queue length 4.1 per CPU, usual 0.8).',
+        evidence: ['OneDrive.exe CPU 16.8 % over 12 min', 'cpuQueueLength 4.1 (baseline 0.8)'],
         expectedEffect: 'Less CPU contention for the foreground app. Kept only if the 60 s verification window shows lower queue length; otherwise rolled back.',
-        risk: 'low', cost: 0.1, wouldApply: !monitor && !active.has('OneDrive.exe'), blockedBy: monitor ? 'Monitor mode — simulation only' : active.has('OneDrive.exe') ? 'Already applied' : undefined, simulated: true },
-      { id: 'rec-leaky-mempri', area: 'memory', target: { pid: LEAK_PID, name: 'LeakyHelper.exe' }, workload: 'background', action: 'memoryPriority', value: 2,
+        risk: 1, cost: 0.1, wouldApply: !monitor && !active.has('OneDrive.exe'), blockedBy: monitor ? 'Monitor mode — simulation only' : active.has('OneDrive.exe') ? 'Already applied' : undefined, simulated: true },
+      { id: 'memory:memory_priority:7712', area: 'memory', target: { pid: LEAK_PID, name: 'LeakyHelper.exe' }, workload: 'Background', action: 'memory_priority', value: 2,
         reason: 'Growing background process while memory load is above baseline; lower memory priority makes Windows trim it before foreground apps.',
-        evidence: [{ metric: 'LeakyHelper.exe private bytes', observed: leakBytes(Date.now()), baseline: 380 * MB, unit: 'bytes', window: '3 h' }],
+        evidence: ['LeakyHelper.exe private bytes +2.4 GB in 3 h'],
         expectedEffect: 'Fewer hard faults in foreground apps under pressure. Does not fix the leak.',
-        risk: 'low', cost: 0.2, wouldApply: false, blockedBy: monitor ? 'Monitor mode — simulation only' : 'Memory pressure not sustained long enough (hysteresis: 10 min above threshold, now 6 min)', simulated: true },
-      { id: 'rec-teams-cpusets', area: 'cpu', target: { pid: 6408, name: 'Teams.exe' }, workload: 'interactive', action: 'cpuSets', value: 0,
-        reason: 'Considered moving background work to efficiency cores.',
-        evidence: [], expectedEffect: '—', risk: 'medium', cost: 0.5, wouldApply: false, blockedBy: 'CPU is not hybrid (no efficiency cores); also interactive workloads are never moved', simulated: true },
+        risk: 2, cost: 0.2, wouldApply: false, blockedBy: monitor ? 'Monitor mode — simulation only' : 'Memory pressure not sustained long enough (hysteresis: 10 min above threshold, now 6 min)', simulated: true },
+      { id: 'cpu:cpu_sets:6408', area: 'cpu', target: { pid: 6408, name: 'Teams.exe' }, workload: 'Interactive', action: 'cpu_sets', value: 0,
+        reason: 'Considered moving work to efficiency cores.', evidence: [], expectedEffect: '—', risk: 3, cost: 0.5, wouldApply: false,
+        blockedBy: 'CPU is not hybrid (no efficiency cores); interactive workloads are never moved', simulated: true },
     ];
   };
 
+  const tx = (o) => ({ evidence: [], preconditions: [], requiredAuth: 'none', verification: '', verificationResult: '', rollback: '', cooldownUntil: 0, attempt: 1, maxAttempts: 1, audit: [], updatedMs: o.createdMs, simulated: true, ...o });
   const journal = [
-    { txId: 1046, ts: ago(9 * 60e3), kind: 'recovery', action: 'restartEtwSession', target: { name: 'OpenSweepCore kernel trace session' }, state: 'verified', reason: 'The service\'s own ETW session stopped (events lost); restarted once.', outcome: 'Events flowing again after 2 s', simulated: true },
-    { txId: 1045, ts: ago(34 * 60e3), kind: 'policy', action: 'ecoqos', target: { pid: 9120, name: 'OneDrive.exe' }, value: 1, original: -1, state: 'simulated', reason: 'Would have applied: sustained background CPU while the foreground app waited (Monitor mode — nothing changed).', simulated: true },
-    { txId: 1044, ts: ago(2.9 * 3600e3), kind: 'policy', action: 'memoryPriority', target: { pid: 5520, name: 'SearchIndexer.exe' }, value: 2, original: 5, state: 'simulated', reason: 'Considered, then rejected: system component on the protection list.', blocked: 'protected process', simulated: true },
-    { txId: 1043, ts: ago(3.2 * 3600e3), kind: 'recovery', action: 'reloadConfig', target: { name: 'config.json' }, state: 'verified', reason: 'One corrupt journal line skipped on start-up (checksum mismatch); configuration validated.', simulated: true },
-    { txId: 1042, ts: ago(3.3 * 3600e3), kind: 'mode', action: 'setMode', value: 'monitor', state: 'applied', reason: 'Default mode on first start.', simulated: true },
+    tx({ txId: 'tx-1046', createdMs: ago(9 * 60e3), kind: 'recovery', action: 'restart_collector', target: { pid: 0, name: 'kernel trace session', startMs: 0 }, value: 0, original: null, state: 'retained', trigger: 'The service\'s own ETW session stopped (events lost); restarted once.', verificationResult: 'Events flowing again after 2 s' }),
+    tx({ txId: 'tx-1045', createdMs: ago(34 * 60e3), kind: 'policy', action: 'ecoqos', target: { pid: 9120, name: 'OneDrive.exe', startMs: 0 }, value: 1, original: -1, state: 'simulated', trigger: 'Would have applied: sustained background CPU while the foreground app waited (Monitor mode — nothing changed).' }),
+    tx({ txId: 'tx-1044', createdMs: ago(2.9 * 3600e3), kind: 'policy', action: 'memory_priority', target: { pid: 5520, name: 'SearchIndexer.exe', startMs: 0 }, value: 2, original: 5, state: 'simulated', trigger: 'Considered, then rejected: system component on the protection list.' }),
+    tx({ txId: 'tx-1043', createdMs: ago(3.2 * 3600e3), kind: 'recovery', action: 'reconnect_event_subscription', target: { pid: 0, name: 'System event log', startMs: 0 }, value: 0, original: null, state: 'retained', trigger: 'Event log subscription returned an error after resume from sleep; reconnected.', verificationResult: 'New events received' }),
+    tx({ txId: 'tx-1042', createdMs: ago(3.3 * 3600e3), kind: 'config', action: 'set_mode', target: { pid: 0, name: 'mode', startMs: 0 }, value: 'monitor', original: null, state: 'applied', trigger: 'Default mode on first start.' }),
   ];
-  const approvals = [{ id: 'apr-0006', ts: ago(9 * 60e3), action: 'restartService', target: { name: CRASH_SVC }, incident: 'inc-0006', reason: 'Crash loop (6 failures in 20 min). One restart with 5 min back-off; the circuit breaker stops after 2 failed attempts.', risk: 'low', expiresAt: Date.now() + 50 * 60e3, simulated: true }];
+  const approvals = [{ id: 'ap-1795000000000-1', action: 'restart_service', target: CRASH_SVC, trigger: 'Crash loop (6 failures in 20 min). One restart with 5 min back-off; the circuit breaker stops after 2 failed attempts.', evidence: ['Service Control Manager 7031 × 6 in 20 min', 'Application Error 1000 × 6 (examplesync_core.dll)'], risk: 'medium', auth: 'admin', createdMs: ago(9 * 60e3), expiresMs: Date.now() + 50 * 60e3, simulated: true }];
   const breaker = { open: false, failures: 1, openedAt: null };
 
   const events = () => [
-    ...[0, 1, 2, 3, 4, 5].map(i => ({ tsMs: ago((9 + i * 3.4) * 60e3), kind: 'ServiceFailure', provider: 'Service Control Manager', eventId: 7031, level: 2, subject: CRASH_SVC, message: `The ${CRASH_SVC} service terminated unexpectedly. It has done this ${6 - i} time(s).`, value: 0 })),
-    ...[0, 1, 2].map(i => ({ tsMs: ago((10 + i * 6.8) * 60e3), kind: 'AppCrash', provider: 'Application Error', eventId: 1000, level: 2, subject: 'ExampleSync.exe', message: 'Faulting application ExampleSync.exe, faulting module examplesync_core.dll', value: 0 })),
-    { tsMs: ago(70 * 60e3), kind: 'WindowsUpdate', provider: 'Microsoft-Windows-WindowsUpdateClient', eventId: 19, level: 4, subject: 'KB5048685', message: 'Installation successful: KB5048685', value: 0 },
-    { tsMs: ago(3.3 * 3600e3), kind: 'OpenSweepConfig', provider: 'OpenSweepCore', eventId: 0, level: 4, subject: 'mode', message: 'Mode set to monitor (default)', value: 0 },
-    { tsMs: ago(3.35 * 3600e3), kind: 'BootPerformance', provider: 'Microsoft-Windows-Diagnostics-Performance', eventId: 100, level: 4, subject: '', message: 'Windows started in 24.1 s', value: 24100 },
-    { tsMs: ago(26 * 3600e3), kind: 'AppHang', provider: 'Application Hang', eventId: 1002, level: 2, subject: 'explorer.exe', message: 'explorer.exe stopped responding for 6 s', value: 0 },
+    ...[0, 1, 2, 3, 4, 5].map(i => ({ tsMs: ago((9 + i * 3.4) * 60e3), kind: 'service_failure', provider: 'Service Control Manager', eventId: 7031, level: 2, subject: CRASH_SVC, message: `The ${CRASH_SVC} service terminated unexpectedly. It has done this ${6 - i} time(s).`, value: 0 })),
+    ...[0, 1, 2].map(i => ({ tsMs: ago((10 + i * 6.8) * 60e3), kind: 'app_crash', provider: 'Application Error', eventId: 1000, level: 2, subject: 'ExampleSync.exe', message: 'Faulting application ExampleSync.exe, faulting module examplesync_core.dll', value: 0 })),
+    { tsMs: ago(70 * 60e3), kind: 'windows_update', provider: 'Microsoft-Windows-WindowsUpdateClient', eventId: 19, level: 4, subject: 'KB5048685', message: 'Installation successful: KB5048685', value: 0 },
+    { tsMs: ago(3.3 * 3600e3), kind: 'opensweep_config', provider: 'OpenSweepCore', eventId: 0, level: 4, subject: 'mode', message: 'Mode set to monitor (default)', value: 0 },
+    { tsMs: ago(3.35 * 3600e3), kind: 'boot_performance', provider: 'Microsoft-Windows-Diagnostics-Performance', eventId: 100, level: 4, subject: '', message: 'Windows started in 24.1 s', value: 24100 },
+    { tsMs: ago(26 * 3600e3), kind: 'app_hang', provider: 'Application Hang', eventId: 1002, level: 2, subject: 'explorer.exe', message: 'explorer.exe stopped responding for 6 s', value: 0 },
   ].map(e => ({ ...e, simulated: true }));
 
   function sample() {
@@ -165,7 +171,7 @@ const coreSim = (() => {
       counts: { incidentsOpen: open, policiesActive: sim.policies.length, recommendations: recommendations().length }, heal: { breakerOpen: breaker.open } };
   }
 
-  function nextTx() { return ++sim.txSeq; }
+  function nextTx() { return `tx-${++sim.txSeq}`; }
   function command(cmd, args = {}) {
     if (!state.core || !state.core.running) { const e = new Error('Simulated OpenSweep Core is stopped'); e.code = 'unavailable'; throw e; }
     const badArgs = (m) => { const e = new Error(m); e.code = 'bad_args'; return e; };
@@ -187,31 +193,31 @@ const coreSim = (() => {
         metrics.hardFaultsPerSec = { median: 17, mad: 9, ewma: 19, samples: 87, ready: false }; // still learning (needs 120 samples)
         return { simulated: true, metrics };
       }
-      case 'incidents': { const a = incidents().sort((x, y) => y.openedAt - x.openedAt); return { simulated: true, incidents: a.slice(0, lim(a)) }; }
+      case 'incidents': { const a = incidents().sort((x, y) => y.firstSeen - x.firstSeen); return { simulated: true, incidents: a.slice(0, lim(a)) }; }
       case 'events': { const a = events().sort((x, y) => y.tsMs - x.tsMs); return { simulated: true, events: a.slice(0, lim(a)) }; }
       case 'recommendations': return { simulated: true, items: recommendations() };
       case 'policies': return { simulated: true, active: sim.policies.map(p => ({ ...p })) };
-      case 'journal': { const a = [...journal].sort((x, y) => y.ts - x.ts); return { simulated: true, entries: a.slice(0, lim(a)) }; }
-      case 'heal': return { simulated: true, breaker: { ...breaker }, pending: approvals.map(a => ({ ...a })), history: journal.filter(j => j.kind === 'recovery').sort((x, y) => y.ts - x.ts) };
+      case 'journal': { const a = [...journal].sort((x, y) => y.createdMs - x.createdMs); return { simulated: true, entries: a.slice(0, lim(a)) }; }
+      case 'heal': return { simulated: true, breaker: { ...breaker }, pending: approvals.map(a => ({ ...a })), history: journal.filter(j => j.kind === 'recovery').sort((x, y) => y.createdMs - x.createdMs) };
       case 'topology': return { simulated: true, logicalProcessors: 16, cores: 8, packages: 1, numaNodes: 1, groups: 1, hybrid: false, efficiencyClasses: [8], l3Caches: 1,
         cpuSets: [...Array(16)].map((_, i) => ({ id: 256 + i, group: 0, core: i >> 1, efficiencyClass: 0, numa: 0 })) };
       case 'reportForeground': return {};
       case 'setMode': {
         if (!['monitor', 'balanced', 'advanced'].includes(args.mode)) throw badArgs('mode must be monitor, balanced or advanced');
         const prev = sim.mode; sim.mode = args.mode;
-        journal.push({ txId: nextTx(), ts: Date.now(), kind: 'mode', action: 'setMode', value: args.mode, original: prev, state: 'applied', reason: 'Changed by an administrator from the OpenSweep app.', simulated: true });
+        journal.push(tx({ txId: nextTx(), createdMs: Date.now(), kind: 'config', action: 'set_mode', target: { pid: 0, name: 'mode', startMs: 0 }, value: args.mode, original: prev, requiredAuth: 'admin', state: 'applied', trigger: 'Changed by an administrator from the OpenSweep app.' }));
         if (args.mode === 'monitor') command('rollbackAll');
         else if (!sim.policies.length) {
           // Simulate the engine applying the one low-risk recommendation, then verifying it.
           const txId = nextTx(), now = Date.now();
           sim.policies.push({ txId, kind: 'ecoqos', target: { pid: 9120, name: 'OneDrive.exe' }, value: 1, original: -1, appliedAt: now, verifyUntil: now + 60e3, state: 'verifying', simulated: true });
-          journal.push({ txId, ts: now, kind: 'policy', action: 'ecoqos', target: { pid: 9120, name: 'OneDrive.exe' }, value: 1, original: -1, state: 'applied', reason: 'Sustained background CPU while the foreground app waited. Verification window 60 s.', simulated: true });
+          journal.push(tx({ txId, createdMs: now, kind: 'policy', action: 'ecoqos', target: { pid: 9120, name: 'OneDrive.exe', startMs: 0 }, value: 1, original: -1, requiredAuth: 'user', state: 'verifying', trigger: 'Sustained background CPU while the foreground app waited. Verification window 60 s.', verification: 'cpu_queue must drop; rolled back otherwise' }));
         }
         return { simulated: true, mode: sim.mode };
       }
       case 'rollbackAll': {
         const n = sim.policies.length;
-        for (const p of sim.policies) journal.push({ txId: p.txId, ts: Date.now(), kind: 'policy', action: p.kind, target: p.target, value: p.original, original: p.value, state: 'rolled_back', reason: 'Rolled back by an administrator (Roll back everything).', simulated: true });
+        for (const p of sim.policies) { const j = journal.find(t => t.txId === p.txId); if (j) Object.assign(j, { state: 'rolled_back', updatedMs: Date.now(), rollback: 'Rolled back by an administrator (Roll back everything).', verificationResult: 'Original value restored' }); }
         sim.policies = [];
         return { simulated: true, restored: n, failed: 0 };
       }
@@ -220,14 +226,14 @@ const coreSim = (() => {
         const i = sim.policies.findIndex(p => p.txId === args.txId);
         if (i < 0) return { simulated: true, restored: false };
         const [p] = sim.policies.splice(i, 1);
-        journal.push({ txId: p.txId, ts: Date.now(), kind: 'policy', action: p.kind, target: p.target, value: p.original, original: p.value, state: 'rolled_back', reason: 'Disabled by an administrator.', simulated: true });
+        const j = journal.find(t => t.txId === p.txId); if (j) Object.assign(j, { state: 'rolled_back', updatedMs: Date.now(), rollback: 'Disabled by an administrator.', verificationResult: 'Original value restored' });
         return { simulated: true, restored: true };
       }
       case 'approve': {
         const i = approvals.findIndex(a => a.id === args.id);
         if (i < 0) { const e = new Error('No such pending approval'); e.code = 'bad_args'; throw e; }
         const [a] = approvals.splice(i, 1), txId = nextTx();
-        journal.push({ txId, ts: Date.now(), kind: 'recovery', action: a.action, target: a.target, state: 'applied', reason: `Approved by an administrator: ${a.reason}`, outcome: 'Simulated — nothing was restarted', simulated: true });
+        journal.push(tx({ txId, createdMs: Date.now(), kind: 'recovery', action: a.action, target: { pid: 0, name: a.target, startMs: 0 }, value: 0, original: null, requiredAuth: 'admin', state: 'applied', trigger: `Approved by an administrator: ${a.trigger}`, verificationResult: 'Simulated — nothing was restarted' }));
         return { simulated: true, txId };
       }
       case 'exportDiagnostics': return { simulated: true, path: `C:\\ProgramData\\OpenSweep\\core\\diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json` };

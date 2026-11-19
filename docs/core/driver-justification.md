@@ -1,7 +1,8 @@
 # Kernel driver justification (Part 12)
 
-**Decision: no kernel-mode driver is justified now.** None is implemented, planned for Phases 1–7, or proposed. This
-document records why, so the question can be revisited in Phase 8 with evidence.
+**Decision (unchanged in Phase 8): no kernel-mode driver is justified.** None is implemented, planned or proposed, and
+no project approval has been requested. Sections 1–4 are the original analysis; section 5 is the Phase 8 re-evaluation
+with the evidence available after Phases 2–7; section 6 maps every Part 12 requirement to where it is answered.
 
 Part 12 requires, for any future driver: the exact capability, why ETW is insufficient, the documented kernel API,
 security implications, signing, HVCI, Secure Boot, Driver Verifier, fault injection, fuzzing, rollback/uninstall and
@@ -69,3 +70,72 @@ Revisit only if, in Phase 8, all of the following are true:
 3. The project has user-mode code signing in place and a plan (and funding) for EV certificate, attestation/WHQL submission,
    HVCI validation and per-release testing.
 4. Explicit project approval is recorded.
+
+## 5. Phase 8 re-evaluation (feasibility only — no implementation)
+
+### 5.1 What changed since the first version
+
+Phases 2–7 added a user-mode engine (collectors, SweepTrace, baselines, SweepGuard incidents, SweepMemory /
+SweepScheduler recommendations, controlled policies with journal and rollback, SweepHeal). Everything it needs is
+obtained from documented user-mode sources: PDH counters, `GetPerformanceInfo` / `GlobalMemoryStatusEx`, process
+enumeration and `GetProcessMemoryInfo`, the Event Log, `GetSystemCpuSetInformation`, and the documented policy APIs
+(`SetProcessInformation` for EcoQoS and memory priority, `SetPriorityClass`, `SetProcessDefaultCpuSets`).
+
+**Evidence status.** The Phase 2–7 Windows code has been built and run only on GitHub's `windows-latest` CI runners
+(a VM). There are **no** WPR/WPA traces from real user machines, and no benchmark results (`bench/` is a framework;
+see `bench/README.md`). Therefore no measurement exists that shows a user-mode gap. Criterion 1 of section 4 is not met.
+
+### 5.2 Per-capability assessment
+
+| Exact capability | Why user mode / ETW might be insufficient | Documented kernel API that would provide it | Security implication if implemented | Evidence today | Verdict |
+|---|---|---|---|---|---|
+| Per-process storage latency including cached and lazy-writer I/O (Part 9 storage incidents) | ETW Kernel-Disk charges cache-manager write-back to `System`; per-file attribution needs Kernel-File + correlation; PDH is per device only | File-system minifilter: `FltRegisterFilter`, pre/post-operation callbacks, `FltGetRequestorProcessId` | Minifilter sits on every file I/O path: a bug is a bugcheck or data corruption; altitude allocation from Microsoft; must not expose file contents or names to unprivileged clients | None: no trace shows that incidents are wrong because of this attribution limit | Not justified; incidents state "attribution approximate for cached I/O" |
+| Synchronous process-creation notification (to classify a workload before it runs) | ETW Kernel-Process is asynchronous (typically sub-second delay) | `PsSetCreateProcessNotifyRoutineEx` | Can block process creation → must never be used to block; registered callbacks are a common EDR/anti-cheat surface and a compatibility risk | Policies act after ≥ 10 min of sustained contention (hysteresis), so sub-second delay is irrelevant | Not justified |
+| DPC/ISR attribution beyond ETW | ETW DPC/ISR events already give routine address and duration | None documented that adds data | — | — | Not needed (ETW sufficient) |
+| Thermal / package power / MSR-based frequency | Firmware-dependent PDH/ACPI data | None generic; MSR access is undocumented-by-design for this purpose | Generic MSR drivers are a known vulnerability class and are blocklisted | — | Rejected (Part 12 forbids this class) |
+| Per-tag kernel pool usage | Only via an undocumented `NtQuerySystemInformation` class in user mode | None documented for drivers either | — | — | Rejected; totals suffice |
+| Protecting OpenSweep's own service from tampering | Service DACL, protected `%ProgramData%\OpenSweep` ACL, signed binaries | `ObRegisterCallbacks` | Only meaningful against administrators, who can unload drivers anyway | — | Not justified |
+
+### 5.3 Decision and conditions to revisit
+
+No driver. The conditions of section 4 still apply unchanged, and all four must hold before a proposal is written:
+
+1. Real-machine WPR/WPA traces (named builds and hardware, as in `research/rea/README.md`) show a specific Part 4–9
+   detection that is impossible or materially wrong with user-mode data, **and** that the error changes a user-visible
+   decision (an incident, a recommendation or a policy).
+2. A **documented** kernel API provides the missing data (no undocumented structures or offsets, Part 11).
+3. Signing is solved first for the user-mode binaries (security review S6), then EV certificate + attestation/WHQL
+   submission is funded and planned, with HVCI validation and per-release testing.
+4. Explicit project approval is recorded in this document.
+
+### 5.4 Non-negotiable constraints for any future driver
+
+- No IOCTL that reads or writes arbitrary kernel or physical memory, MSRs, I/O ports, or returns kernel addresses.
+- No IOCTL that opens handles to other processes/threads on behalf of the caller, changes protection levels, or
+  performs any privileged operation on a caller-chosen target. Only fixed, typed, read-only telemetry queries.
+- Device object created with `IoCreateDeviceSecure` and a restrictive SDDL (SYSTEM + the OpenSweep service SID only),
+  `FILE_DEVICE_SECURE_OPEN`; the user-mode service remains the only client and keeps all policy decisions.
+- Every input buffer validated for size and type (METHOD_BUFFERED only); no user-mode pointers dereferenced.
+- HVCI-compatible (NX pool, no RWX, no dynamic code), Driver Verifier clean (standard + IRQL, pool, deadlock, DDI
+  compliance, low-resources simulation), fuzzed per IOCTL, Static Driver Verifier / CodeQL clean.
+- Uninstall path tested (stop, unload, delete service key, `pnputil /delete-driver`), including pending-reboot states;
+  OpenSweep must keep working without the driver (feature detection, never a hard dependency).
+
+## 6. Part 12 checklist
+
+| Part 12 requirement | Where answered |
+|---|---|
+| Exact required capability | §1 table (candidates), §5.2 "Exact capability" column |
+| Why ETW is insufficient | §2, §5.2 second column |
+| Relevant documented kernel API | §1 "What a driver would add", §5.2 third column (`FltRegisterFilter`, `PsSetCreateProcessNotifyRoutineEx`, `ObRegisterCallbacks`, `IoCreateDeviceSecure`) |
+| Security implications | §3 (bugs = bugchecks, blocklist), §5.2 fourth column, §5.4 constraints |
+| Driver signing requirements | §3 "Signing" (Hardware Dev Center, EV certificate, attestation vs WHQL/HLK) |
+| HVCI compatibility | §3 "HVCI / Memory integrity", §5.4 |
+| Secure Boot compatibility | §3 "Secure Boot" |
+| Driver Verifier testing | §3 "Driver Verifier", §5.4 |
+| Fault injection | §3 "Fault injection" (low-resource simulation, IRP cancellation, unload during I/O, sleep/resume) |
+| Fuzz testing | §3 "Fuzz testing", §5.4 |
+| Rollback and uninstall | §3 "Rollback and uninstall", §5.4 |
+| Maintenance cost | §3 "Maintenance", "ARM64", "Project fit" |
+| Propose only with evidence + explicit approval | §4, §5.3 (not met: no real-machine evidence, no approval requested) |
+| No arbitrary kernel memory access / unrestricted privileged operations | §5.4 |

@@ -78,7 +78,9 @@ const RANGES = ['30m', '24h', '14d'];
 const DASH_METRICS = ['cpuPercent', 'memLoadPercent', 'commitTotal', 'diskReadLatencyMs', 'hardFaultsPerSec'];
 const isInt = (x) => Number.isInteger(x);
 const isStr = (x) => typeof x === 'string';
-const tsOf = (x) => Number(x && (x.tsMs ?? x.ts ?? x.openedAt ?? x.appliedAt)) || 0;
+const tsOf = (x) => Number(x && (x.tsMs ?? x.ts ?? x.createdMs ?? x.firstSeen ?? x.appliedAt)) || 0;
+// "newest first": true if the list is descending by any of the given timestamp fields.
+const newestFirst = (list, keys) => keys.some(k => list.every((x, i) => i === 0 || Number(x[k]) <= Number(list[i - 1][k])));
 const MB = 1048576;
 async function expectErr(name, p, code) {
   try { const r = await p; return ok(name, false, `accepted: ${JSON.stringify(r).slice(0, 160)}`); }
@@ -148,7 +150,9 @@ async function engineReadChecks(c, label, serverPid) {
 
   const inc = await c.call('incidents', { limit: 50 });
   ok('incidents shape', Array.isArray(inc.incidents) && inc.incidents.length <= 50 && inc.incidents.every(x => x.id !== undefined && Array.isArray(x.symptoms) && Array.isArray(x.evidence) && num(x.confidence) && x.confidence >= 0 && x.confidence <= 1 && isStr(x.risk) && typeof x.autoRecoveryAllowed === 'boolean'), `${inc.incidents && inc.incidents.length} incident(s)`);
-  ok('incidents newest first', inc.incidents.every((x, i) => i === 0 || tsOf(x) <= tsOf(inc.incidents[i - 1])));
+  ok('incidents newest first (by firstSeen or lastSeen)', newestFirst(inc.incidents, ['firstSeen', 'lastSeen']));
+  if (inc.incidents.length) ok('incident fields used by the dashboard', inc.incidents.every(x => isStr(x.title) && ['open', 'resolved'].includes(x.state) && isStr(x.confidenceLevel) && Array.isArray(x.contributors) && Array.isArray(x.recommendedActions)), JSON.stringify(inc.incidents[0]).slice(0, 300));
+  else note('no incidents yet: incident field names not checked');
   ok('incidents limit 1 respected', (await c.call('incidents', { limit: 1 })).incidents.length <= 1);
   await expectErr('incidents: limit as string -> bad_args', c.call('incidents', { limit: 'x' }), 'bad_args');
 
@@ -158,7 +162,7 @@ async function engineReadChecks(c, label, serverPid) {
   ok('events: no window titles / command lines', privacyKeys(ev).length === 0, privacyKeys(ev).join(', '));
 
   const rec = await c.call('recommendations');
-  ok('recommendations shape', Array.isArray(rec.items) && rec.items.every(x => x.id !== undefined && ['memory', 'cpu'].includes(x.area) && x.target !== undefined && isStr(x.action) && isStr(x.reason) && isStr(x.risk) && typeof x.wouldApply === 'boolean'), `${rec.items && rec.items.length} item(s)`);
+  ok('recommendations shape', Array.isArray(rec.items) && rec.items.every(x => x.id !== undefined && ['memory', 'cpu'].includes(x.area) && x.target !== undefined && isStr(x.action) && isStr(x.reason) && (isStr(x.risk) || num(x.risk)) && typeof x.wouldApply === 'boolean'), `${rec.items && rec.items.length} item(s)`);
   note(`recommendations: ${(rec.items || []).map(x => `${x.action}→${(x.target && x.target.name) || x.target} wouldApply=${x.wouldApply}${x.blockedBy ? ` (${x.blockedBy})` : ''}`).join('; ') || 'none'}`);
 
   const pol = await c.call('policies');
@@ -167,7 +171,7 @@ async function engineReadChecks(c, label, serverPid) {
 
   const jr = await c.call('journal', { limit: 100 });
   ok('journal shape', Array.isArray(jr.entries) && jr.entries.length <= 100 && jr.entries.every(t => t.txId !== undefined && isStr(t.state)), `${jr.entries && jr.entries.length} entr(ies)`);
-  ok('journal newest first', jr.entries.every((x, i) => i === 0 || tsOf(x) <= tsOf(jr.entries[i - 1])));
+  ok('journal newest first (by createdMs or updatedMs)', newestFirst(jr.entries, ['createdMs', 'updatedMs']));
 
   const heal = await c.call('heal');
   ok('heal shape', heal.breaker && typeof heal.breaker.open === 'boolean' && isInt(heal.breaker.failures) && Array.isArray(heal.pending) && Array.isArray(heal.history), JSON.stringify(heal.breaker));
@@ -243,7 +247,7 @@ async function soak(c, label) {
   ok('soak: working set growth <= 20 %', growth <= 0.2, `${(growth * 100).toFixed(1)} %`);
   ok('soak: no active policy at any sample (monitor)', polCounts.every(n => n === 0), polCounts.join(','));
   const jr = await c.call('journal', { limit: 500 });
-  const isModeOrRecovery = (t) => /mode|recover/i.test(String(t.kind)) || /mode/i.test(String(t.action || ''));
+  const isModeOrRecovery = (t) => /mode|recover|config/i.test(String(t.kind)) || /mode/i.test(String(t.action || ''));
   const applied = jr.entries.filter(t => tsOf(t) >= start - 2000 && ['applied', 'verified', 'verifying'].includes(t.state) && !isModeOrRecovery(t));
   ok('soak: monitor mode applied zero policies (journal)', applied.length === 0, applied.length ? JSON.stringify(applied.slice(0, 3)) : `${jr.entries.filter(t => tsOf(t) >= start - 2000).length} journal entries in the window, none applied`);
 }

@@ -2,3 +2,4 @@ node_modules/
 dist/
 build-resources/
 core/build/
+bench/results/

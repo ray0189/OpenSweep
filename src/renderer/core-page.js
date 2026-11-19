@@ -5,7 +5,8 @@
 
 const fmtDur = (s) => { if (s === null || s === undefined || isNaN(s)) return '—'; s = Math.max(0, Math.floor(s)); const d = Math.floor(s / 86400), hh = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${hh}h ${m}m` : hh ? `${hh}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`; };
 const coreErr = (e) => String((e && e.message) || e).replace(/^Error invoking remote method 'api': (Error: )?/, '');
-const tsOf = (x) => Number(x && (x.tsMs ?? x.ts ?? x.openedAt ?? x.appliedAt)) || (x && x.at ? Date.parse(x.at) : 0);
+// Timestamps: EventRecord.tsMs, Transaction.createdMs, Incident.firstSeen, policies appliedAt.
+const tsOf = (x) => Number(x && (x.tsMs ?? x.ts ?? x.createdMs ?? x.firstSeen ?? x.openedAt ?? x.appliedAt)) || 0;
 const fmtTime = (ms) => { if (!ms) return '—'; const d = new Date(ms); return Date.now() - ms < 20 * 3600e3 ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); };
 const fmtNum = (v, d = 1) => (v === null || v === undefined || isNaN(v) ? '—' : Number(v).toLocaleString(undefined, { maximumFractionDigits: d }));
 function fmtUnit(v, unit) {
@@ -17,12 +18,18 @@ function fmtUnit(v, unit) {
   return `${fmtNum(v, v < 10 ? 2 : 0)}${unit ? ' ' + unit : ''}`;
 }
 const human = (s) => String(s || '').replace(/_/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').replace(/^\w/, c => c.toUpperCase());
+const metricName = (m) => (/^[a-z]+(?:[A-Z][a-z]*)+$/.test(String(m || '')) ? human(m) : String(m || '')); // only humanize camelCase metric ids
 const targetName = (t) => (!t ? '—' : typeof t === 'string' ? t : t.name || (t.pid ? `PID ${t.pid}` : '—'));
-const ACTION_LABEL = { ecoqos: 'Efficiency mode (EcoQoS)', EcoQoS: 'Efficiency mode (EcoQoS)', memoryPriority: 'Lower memory priority', MemoryPriority: 'Lower memory priority', priorityClass: 'Below-normal priority', PriorityClass: 'Below-normal priority', cpuSets: 'Efficiency cores (CPU sets)', CpuSets: 'Efficiency cores (CPU sets)', setMode: 'Mode change', restartService: 'Restart service', restartEtwSession: 'Restart trace session', reloadConfig: 'Reload configuration' };
+// Policy kinds are telemetry::to_string(PolicyKind) (ecoqos, memory_priority, priority_class, cpu_sets); heal actions are snake_case.
+const ACTION_LABEL = { ecoqos: 'Efficiency mode (EcoQoS)', memory_priority: 'Lower memory priority', priority_class: 'Below-normal priority', cpu_sets: 'Efficiency cores (CPU sets)', set_mode: 'Mode change', setMode: 'Mode change', restart_collector: 'Restart a Core collector', reconnect_event_subscription: 'Reconnect event log subscription', restore_owned_policies: 'Restore OpenSweep policies' };
 const actionLabel = (a) => ACTION_LABEL[a] || human(a);
-const TX_STATE = { verified: ['verified', 'good'], applied: ['applied', 'info'], verifying: ['verifying', 'info'], intent: ['pending', ''], rolled_back: ['rolled back', 'warn'], failed: ['failed', 'bad'], simulated: ['simulated', 'warn'], blocked: ['blocked', ''] };
+const TX_STATE = { verified: ['verified', 'good'], retained: ['kept (verified)', 'good'], applied: ['applied', 'info'], verifying: ['measuring', 'info'], intent: ['pending', ''], rolled_back: ['rolled back', 'warn'], failed: ['failed', 'bad'], expired: ['expired', ''], simulated: ['simulated', 'warn'], blocked: ['blocked', ''] };
 const txTag = (s) => { const [l, c] = TX_STATE[s] || [human(s || 'unknown'), '']; return h('span', { class: `tag ${c}`, style: { marginLeft: 0 } }, l); };
-const riskTag = (r) => (r ? h('span', { class: `tag ${r === 'high' ? 'bad' : r === 'medium' ? 'warn' : 'good'}` }, `${r} risk`) : null);
+// Risk: 'low' | 'medium' | 'high', or the engine's numeric 1 (lowest) .. 5.
+const riskWord = (r) => (typeof r === 'number' ? (r <= 2 ? 'low' : r === 3 ? 'medium' : 'high') : r);
+const riskTag = (r) => { const w = riskWord(r); return w ? h('span', { class: `tag ${w === 'high' ? 'bad' : w === 'medium' ? 'warn' : 'good'}`, title: typeof r === 'number' ? `risk ${r} of 5` : null }, `${w} risk`) : null; };
+const confLabel = (x) => x.confidenceLevel || x.confidenceLabel || '—';
+const fmtWindow = (e) => (e.window ? e.window : e.windowFrom && e.windowTo ? fmtDur((e.windowTo - e.windowFrom) / 1000) : '—');
 const SIM_TIP = 'Simulated: not measured on this PC, or a decision the engine only simulated (nothing was changed).';
 const simTag = (on = true, label = 'Simulated') => (on ? h('span', { class: 'tag warn', title: SIM_TIP }, label) : null);
 
@@ -242,9 +249,9 @@ PAGES.core = async (main) => {
   // ---- Incidents
   function incidentList(list) {
     return h('div', { class: 'list' }, list.map(x => h('div', { class: 'item clickable', role: 'button', tabindex: '0', onclick: () => incidentDrawer(x), onkeydown: (e) => { if (e.key === 'Enter') incidentDrawer(x); } },
-      h('span', { class: 'sev ' + (x.state === 'resolved' ? 'low' : x.risk === 'high' ? 'high' : 'medium') }),
+      h('span', { class: 'sev ' + (x.state === 'resolved' ? 'low' : riskWord(x.risk) === 'high' || /error|critical/.test(x.severity || '') ? 'high' : 'medium') }),
       h('div', { class: 'body' }, h('div', { class: 'title' }, x.title || human(x.kind), x.state === 'resolved' ? h('span', { class: 'tag good' }, 'resolved') : h('span', { class: 'tag warn' }, 'open'), simTag(isSim(x))),
-        h('div', { class: 'desc' }, `${human(x.kind)} · ${fmtTime(tsOf(x))} · confidence ${x.confidenceLabel || '—'}${Number.isFinite(x.confidence) ? ` (${Math.round(x.confidence * 100)} %)` : ''}`)),
+        h('div', { class: 'desc' }, `${human(x.detector || x.kind)} · ${fmtTime(tsOf(x))}${x.occurrences > 1 ? ` · seen ${x.occurrences}×` : ''} · confidence ${confLabel(x)}${Number.isFinite(x.confidence) ? ` (${Math.round(x.confidence * 100)} %)` : ''}`)),
       icon('chevron'))));
   }
   function incidentDrawer(x) {
@@ -256,19 +263,25 @@ PAGES.core = async (main) => {
     d.append(
       h('div', { class: 'dh' }, h('div', { class: 'stretch' }, h('h3', {}, x.title || human(x.kind)),
         h('div', { class: 'row' }, x.state === 'resolved' ? h('span', { class: 'tag good', style: { marginLeft: 0 } }, 'resolved') : h('span', { class: 'tag warn', style: { marginLeft: 0 } }, 'open'), riskTag(x.risk),
-          h('span', { class: 'tag' }, `confidence ${x.confidenceLabel || '—'}${Number.isFinite(x.confidence) ? ` · ${Math.round(x.confidence * 100)} %` : ''}`), simTag(isSim(x)))),
+          h('span', { class: 'tag' }, `confidence ${confLabel(x)}${Number.isFinite(x.confidence) ? ` · ${Math.round(x.confidence * 100)} %` : ''}`), x.severity ? h('span', { class: 'tag' }, x.severity) : null, simTag(isSim(x)))),
         h('button', { class: 'btn ghost icon-only', title: 'Close', onclick: close }, icon('x'))),
       h('div', { class: 'db' },
-        h('div', { class: 'desc' }, `${human(x.kind)} · opened ${fmtTime(tsOf(x))}${x.resolvedAt ? ` · resolved ${fmtTime(x.resolvedAt)}` : ''}${x.subject ? ` · ${targetName(x.subject)}` : ''}`),
+        h('div', { class: 'desc' }, `${human(x.detector || x.kind)} · first seen ${fmtTime(tsOf(x))}${x.lastSeen ? ` · last seen ${fmtTime(x.lastSeen)}` : ''}${x.resolvedAt ? ` · resolved ${fmtTime(x.resolvedAt)}` : ''}${x.subject ? ` · ${targetName(x.subject)}` : ''}`),
+        x.summary ? h('p', { class: 'drawer-summary' }, x.summary) : null,
         h('div', { class: 'banner info' }, icon('info'), 'OpenSweep Core reports what happened at the same time (correlation). It does not prove what caused it.'),
         sec('Symptoms', (x.symptoms || []).length ? h('ul', {}, x.symptoms.map(s => h('li', {}, s))) : h('div', { class: 'desc' }, 'None recorded.')),
         sec('Evidence', (x.evidence || []).length ? h('div', { class: 'table-wrap' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Measurement'), h('th', { class: 'num' }, 'Observed'), h('th', { class: 'num' }, 'Usual'), h('th', {}, 'Window'))),
-          h('tbody', {}, x.evidence.map(e => h('tr', {}, h('td', {}, human(e.metric), e.note ? h('div', { class: 'desc' }, e.note) : null), h('td', { class: 'num' }, fmtUnit(e.observed, unit(e))),
-            h('td', { class: 'num' }, e.baseline === undefined ? '—' : `${fmtUnit(e.baseline, unit(e))}${Number.isFinite(e.mad) ? ` ± ${fmtUnit(e.mad, unit(e))}` : ''}`), h('td', {}, e.window || '—')))))) : h('div', { class: 'desc' }, 'None recorded.')),
-        sec('Correlated with', (x.contributors || []).length ? h('div', { class: 'bars' }, x.contributors.map(c => h('div', { class: 'contrib' },
-          h('div', { class: 'row nowrap' }, h('b', { class: 'trunc' }, c.name), c.kind ? h('span', { class: 'tag' }, c.kind) : null, h('div', { class: 'spacer' }), h('span', { class: 'meta num' }, `${Math.round((c.confidence || 0) * 100)} %`)),
-          h('div', { class: 'meter thin' }, h('div', { style: { width: `${Math.round(Math.max(0, Math.min(1, c.confidence || 0)) * 100)}%` } })),
-          c.detail ? h('div', { class: 'desc' }, c.detail) : null))) : h('div', { class: 'desc' }, 'No contributor identified.')),
+          h('tbody', {}, x.evidence.map(e => h('tr', {}, h('td', {}, metricName(e.metric), e.note ? h('div', { class: 'desc' }, e.note) : null), h('td', { class: 'num' }, fmtUnit(e.observed, unit(e)), Number.isFinite(e.robustZ) ? h('div', { class: 'desc', title: 'Robust z-score: distance from the median in MAD units' }, `z ${e.robustZ.toFixed(1)}`) : null),
+            h('td', { class: 'num' }, e.baseline === undefined || e.baseline === null ? '—' : `${fmtUnit(e.baseline, unit(e))}${Number.isFinite(e.mad) ? ` ± ${fmtUnit(e.mad, unit(e))}` : ''}`), h('td', {}, fmtWindow(e))))))) : h('div', { class: 'desc' }, 'None recorded.')),
+        sec('Correlated with', (x.contributors || []).length ? h('div', { class: 'bars' }, x.contributors.map(c => {
+          // Engine reports a correlation coefficient (−1..1); older/mock data a 0..1 confidence.
+          const hasR = Number.isFinite(c.correlation), v = Math.max(0, Math.min(1, Math.abs(hasR ? c.correlation : c.confidence || 0)));
+          return h('div', { class: 'contrib' },
+            h('div', { class: 'row nowrap' }, h('b', { class: 'trunc' }, c.name || (c.pid ? `PID ${c.pid}` : '—')), c.kind ? h('span', { class: 'tag' }, c.kind) : null, h('div', { class: 'spacer' }),
+              h('span', { class: 'meta num', title: hasR ? 'Correlation coefficient with the symptom (not proof of cause)' : 'Confidence' }, hasR ? `r = ${c.correlation.toFixed(2)}` : `${Math.round(v * 100)} %`)),
+            h('div', { class: 'meter thin' }, h('div', { style: { width: `${Math.round(v * 100)}%` } })),
+            c.detail ? h('div', { class: 'desc' }, c.detail) : null);
+        })) : h('div', { class: 'desc' }, 'No contributor identified.')),
         (x.possibleCauses || []).length ? sec('Possible causes', h('ul', {}, x.possibleCauses.map(s => h('li', {}, s)))) : null,
         sec('Recommended actions', (x.recommendedActions || []).length ? h('ul', {}, x.recommendedActions.map(s => h('li', {}, s))) : h('div', { class: 'desc' }, 'None.')),
         sec('Automatic recovery', h('div', { class: 'row nowrap' }, stateDot(x.autoRecoveryAllowed ? 'on' : 'off', x.autoRecoveryAllowed ? 'Allowed' : 'Not allowed'),
@@ -323,7 +336,8 @@ PAGES.core = async (main) => {
     if (!list.length) return emptyState(empty);
     return h('div', { class: 'table-wrap' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Time'), h('th', {}, 'Change'), h('th', {}, 'Target'), h('th', {}, 'State'), h('th', {}, 'Why / outcome'))),
       h('tbody', {}, list.map(t => h('tr', {}, h('td', { class: 'nowrap' }, fmtTime(tsOf(t))), h('td', {}, actionLabel(t.action || t.kind), t.value !== undefined && t.kind !== 'recovery' ? h('div', { class: 'desc mono' }, `${t.original !== undefined ? `${t.original} → ` : ''}${t.value}`) : null),
-        h('td', {}, targetName(t.target)), h('td', {}, txTag(t.state), simTag(isSim(t) && t.state !== 'simulated')), h('td', {}, h('div', { class: 'desc' }, t.reason || ''), t.outcome ? h('div', { class: 'desc' }, h('b', {}, 'Measured: '), t.outcome) : null))))));
+        h('td', {}, targetName(t.target)), h('td', {}, txTag(t.state), simTag(isSim(t) && t.state !== 'simulated')),
+        h('td', {}, h('div', { class: 'desc' }, t.reason || t.trigger || ''), (t.outcome || t.verificationResult) ? h('div', { class: 'desc' }, h('b', {}, 'Measured: '), t.outcome || t.verificationResult) : null))))));
   }
 
   // ---- Recovery (SweepHeal)
@@ -338,8 +352,9 @@ PAGES.core = async (main) => {
           h('div', { class: 'sub' }, b.open ? `Opened ${fmtTime(b.openedAt)} after ${b.failures ?? '?'} failed attempts. It closes again after a quiet period.` : `OpenSweep Core recovers only its own components on its own (${b.failures ?? 0} recent failure${b.failures === 1 ? '' : 's'}). Anything else needs your approval.`)))),
       h('div', { class: 'section-title' }, 'Waiting for your approval'),
       h('div', { class: 'card' }, pending.length ? h('div', { class: 'list' }, pending.map(a => h('div', { class: 'item' }, h('span', { class: 'app-ico' }, icon('repair')),
-        h('div', { class: 'body' }, h('div', { class: 'title' }, `${actionLabel(a.action)} → ${targetName(a.target)}`, riskTag(a.risk), simTag(isSim(a))), h('div', { class: 'desc' }, a.reason || ''),
-          h('div', { class: 'desc' }, `Requested ${fmtTime(tsOf(a))}${a.expiresAt ? ` · expires ${fmtTime(a.expiresAt)}` : ''}`)),
+        h('div', { class: 'body' }, h('div', { class: 'title' }, `${actionLabel(a.action)} → ${targetName(a.target)}`, riskTag(a.risk), simTag(isSim(a))), h('div', { class: 'desc' }, a.reason || a.trigger || ''),
+          (a.evidence || []).length ? h('ul', { class: 'reasons' }, a.evidence.slice(0, 5).map(e => h('li', {}, typeof e === 'string' ? e : JSON.stringify(e)))) : null,
+          h('div', { class: 'desc' }, `Requested ${fmtTime(tsOf(a))}${(a.expiresMs ?? a.expiresAt) ? ` · expires ${fmtTime(a.expiresMs ?? a.expiresAt)}` : ''}`)),
         btn('Approve', (e) => admin(e.currentTarget, 'coreApprove', { id: a.id }, (x) => toast(`Approved — transaction ${x.txId ?? '?'}`)), { small: true, kind: 'primary', disabled: !canAdmin() })))) : emptyState('Nothing is waiting for approval.')),
       h('div', { class: 'section-title' }, 'Recovery history'),
       h('div', { class: 'card flush' }, journalTable(r.history || [], 'No recovery actions recorded.')),

@@ -352,3 +352,4 @@ dialog.drawer[open] { display: flex; flex-direction: column; }
 .drawer li + li { margin-top: 3px; }
 .drawer .table-wrap { max-height: none; }
 .drawer .desc { color: var(--muted); font-size: 12.5px; }
+.drawer .drawer-summary { margin: 10px 0 0; color: var(--text-2); font-size: 13px; white-space: normal; }
