@@ -93,6 +93,88 @@ function privacyKeys(obj) {
   walk(obj, '');
   return bad;
 }
+// ---------------------------------------------------------------- kernel tracing (docs/core/etw.md)
+const ETW_SESSION = 'OpenSweepCoreKernel';
+const etwSessionExists = () => run('logman.exe', ['query', ETW_SESSION, '-ets']).code === 0;
+const plainName = (x) => isStr(x) && x.length > 0 && !/[\\/]/.test(x);
+const etwStatusShape = (e) => !!e && typeof e.running === 'boolean' && Array.isArray(e.flags) && e.flags.every(isStr) && num(e.eventsLost) && e.eventsLost >= 0 && num(e.costPercent) && e.costPercent >= 0;
+const driverShape = (d) => plainName(d.name) && isInt(d.dpcCount) && d.dpcCount >= 0 && isInt(d.isrCount) && d.isrCount >= 0 && num(d.totalUs) && d.totalUs >= 0 && num(d.maxUs) && d.maxUs >= 0
+  && Array.isArray(d.histogram) && d.histogram.length === 8 && d.histogram.every(n => isInt(n) && n >= 0);
+const diskShape = (p) => isInt(p.pid) && p.pid >= 0 && plainName(p.name) && ['readBps', 'writeBps', 'ios', 'meanLatencyMs', 'maxLatencyMs'].every(k => num(p[k]) && p[k] >= 0);
+const faultShape = (p) => isInt(p.pid) && p.pid >= 0 && plainName(p.name) && num(p.faultsPerSec) && p.faultsPerSec >= 0;
+// Disk workload from this process: write (with fsync, so the writes are issued now, not later by the
+// lazy writer) and read back a 32 MB temp file, `rounds` times. Returns bytes moved.
+function diskWorkload(rounds = 3) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'osc-disk-')), chunk = Buffer.alloc(MB, 0x5a), buf = Buffer.alloc(MB);
+  let bytes = 0;
+  try {
+    for (let r = 0; r < rounds; r++) {
+      const f = path.join(dir, `w${r}.bin`);
+      let fd = fs.openSync(f, 'w');
+      for (let i = 0; i < 32; i++) { chunk[0] = (i + r) & 0xff; fs.writeSync(fd, chunk); bytes += MB; }
+      fs.fsyncSync(fd); fs.closeSync(fd);
+      fd = fs.openSync(f, 'r');
+      while (fs.readSync(fd, buf, 0, MB, null) > 0) bytes += MB;
+      fs.closeSync(fd);
+      fs.unlinkSync(f);
+    }
+  } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } }
+  return bytes;
+}
+// latency / diskActivity / hardFaults: shapes, ETW running soon after start, a disk workload from
+// this process (attribution reported as a note: it depends on caching), top drivers printed.
+async function latencyChecks(c, label, { workload = false } = {}) {
+  section(`kernel tracing (${label})`);
+  let lat;
+  try { lat = await c.call('latency'); } catch (e) { ok('latency answers', false, `${e.code} ${e.message}`); return; }
+  // ETW must be running within ~10 s of the service start (uptime from hello).
+  const up = Number((await c.call('hello')).uptimeSec) || 0;
+  const wait = Math.max(2000, (12 - up) * 1000);
+  if (!(lat.status && lat.status.running)) lat = await until(async () => { const l = await c.call('latency'); return l.status && l.status.running ? l : null; }, wait, 500) || await c.call('latency');
+  const st = lat.status || {}, sys = lat.system || {};
+  ok('latency.status shape', etwStatusShape(st), JSON.stringify(st));
+  ok('latency.status.running within ~10 s of start (elevated)', st.running === true, `running=${st.running} at uptime ≈ ${(Number((await c.call('hello')).uptimeSec) || 0).toFixed(0)} s${st.reason ? ` reason: ${st.reason}` : ''}`);
+  note(`ETW flags [${(st.flags || []).join(', ')}] · cost ${st.costPercent} % · ${st.eventsLost} events lost`);
+  ok('latency.status.costPercent plausible (0–100)', num(st.costPercent) && st.costPercent <= 100, String(st.costPercent));
+  ok('latency.system shape', ['dpcPercent', 'isrPercent', 'worstDpcUs', 'worstIsrUs'].every(k => num(sys[k]) && sys[k] >= 0) && sys.dpcPercent <= 100 && sys.isrPercent <= 100, JSON.stringify(sys));
+  ok('latency.drivers shape (≤ 20, histogram of 8, plain driver names)', Array.isArray(lat.drivers) && lat.drivers.length <= 20 && lat.drivers.every(driverShape), `${(lat.drivers || []).length} driver(s) ${JSON.stringify((lat.drivers || []).find(d => !driverShape(d)) || '').slice(0, 200)}`);
+  const st2 = await c.call('status');
+  ok('status.etw present with the latency.status shape', etwStatusShape(st2.etw), JSON.stringify(st2.etw));
+
+  let bytes = 0;
+  const pid = process.pid;
+  let disk = await c.call('diskActivity'), mine = null;
+  if (workload) {
+    const t0 = Date.now();
+    bytes += diskWorkload(3);
+    note(`disk workload: ${(bytes / MB).toFixed(0)} MB written (fsync) and read by pid ${pid} in ${Date.now() - t0} ms`);
+    // Aggregation uses 1-minute windows: poll for up to ~70 s, repeating the workload every ~15 s.
+    let lastLoad = Date.now();
+    const end = Date.now() + 70000;
+    for (;;) {
+      disk = await c.call('diskActivity');
+      mine = (disk.processes || []).find(p => p.pid === pid);
+      lat = await c.call('latency');
+      if ((mine && (lat.drivers || []).length) || Date.now() > end) break;
+      if (Date.now() - lastLoad > 15000) { bytes += diskWorkload(2); lastLoad = Date.now(); }
+      await sleep(2000);
+    }
+  }
+  ok('diskActivity shape (≤ 20 processes, image names only)', Array.isArray(disk.processes) && disk.processes.length <= 20 && disk.processes.every(diskShape), `${(disk.processes || []).length} process(es) ${JSON.stringify((disk.processes || []).find(p => !diskShape(p)) || '').slice(0, 200)}`);
+  ok('diskActivity: no file paths / titles / command lines', privacyKeys(disk).length === 0 && !/[a-z]:\\/i.test(JSON.stringify(disk)), privacyKeys(disk).join(', '));
+  if (workload) {
+    if (mine) console.log(`  note: attribution OK: diskActivity has this test's pid ${pid} (${mine.name}): read ${(mine.readBps / MB).toFixed(1)} MB/s, write ${(mine.writeBps / MB).toFixed(1)} MB/s, ${mine.ios} I/Os, mean ${mine.meanLatencyMs} ms, max ${mine.maxLatencyMs} ms`);
+    else console.log(`  note: attribution NOT observed: no diskActivity entry for this test's pid ${pid} within ~70 s after ${(bytes / MB).toFixed(0)} MB of I/O (reads may be served from the file cache and writes flushed by the System process). Top entries: ${(disk.processes || []).slice(0, 5).map(p => `${p.name}(${p.pid}) r=${(p.readBps / MB).toFixed(1)} w=${(p.writeBps / MB).toFixed(1)} MB/s`).join(', ') || 'none'}`);
+    ok('latency: DPC/ISR seen for the workload (drivers non-empty)', (lat.drivers || []).length > 0, `${(lat.drivers || []).length} driver(s)`);
+  }
+  const hf = await c.call('hardFaults');
+  ok('hardFaults shape (≤ 20 processes, image names only)', Array.isArray(hf.processes) && hf.processes.length <= 20 && hf.processes.every(faultShape), `${(hf.processes || []).length} process(es) ${JSON.stringify((hf.processes || []).find(p => !faultShape(p)) || '').slice(0, 200)}`);
+  const top = [...(lat.drivers || [])].sort((a, b) => b.maxUs - a.maxUs).slice(0, 5);
+  console.log(`  top drivers by max µs (${label}): ${top.length ? '' : 'none'}`);
+  for (const d of top) console.log(`    ${d.name.padEnd(20)} max ${String(Math.round(d.maxUs)).padStart(6)} µs · DPC ${d.dpcCount} · ISR ${d.isrCount} · total ${(d.totalUs / 1000).toFixed(1)} ms · histogram [${d.histogram.join(', ')}]`);
+  note(`system: DPC ${sys.dpcPercent} % · ISR ${sys.isrPercent} % · worst DPC ${sys.worstDpcUs} µs · worst ISR ${sys.worstIsrUs} µs · top hard faults: ${(hf.processes || []).slice(0, 3).map(p => `${p.name} ${p.faultsPerSec}/s`).join(', ') || 'none'}`);
+}
+
 async function callTimed(c, cmd, args) { const t = Date.now(); const r = await c.call(cmd, args); return { r, ms: Date.now() - t }; }
 
 // Read commands: result shapes per the contract. `label` = 'console' | 'service'.
@@ -182,6 +264,8 @@ async function engineReadChecks(c, label, serverPid) {
   ok('topology.cpuSets: one per logical processor, unique ids', Array.isArray(sets) && sets.length === topo.logicalProcessors && new Set(sets.map(x => x.id)).size === sets.length, `${sets && sets.length} vs ${topo.logicalProcessors}`);
   ok('topology.cpuSets: efficiency classes consistent with hybrid flag', Array.isArray(sets) && (topo.hybrid ? new Set(sets.map(x => x.efficiencyClass)).size > 1 : new Set(sets.map(x => x.efficiencyClass)).size === 1));
 
+  await latencyChecks(c, label, { workload: label === 'console' });
+
   // Foreground hint: own pid accepted, bogus pids rejected.
   try { const r = await c.call('reportForeground', { pid: process.pid }); ok(`reportForeground with own pid accepted (${label})`, r && typeof r === 'object', JSON.stringify(r)); }
   catch (e) { ok(`reportForeground with own pid accepted (${label})`, false, `${e.code} ${e.message}`); }
@@ -206,8 +290,8 @@ const { spawnSync } = require('child_process');
 (async () => {
   const res = { elevated: spawnSync('net.exe', ['session'], { windowsHide: true }).status === 0, calls: {} };
   const c = cc.createCoreClient({ timeout: 5000 });
-  for (const [cmd, args] of [['status'], ['setMode', { mode: 'balanced' }], ['rollbackAll'], ['approve', { id: 'test-approval' }], ['disablePolicy', { txId: 1 }], ['exportDiagnostics']]) {
-    try { const r = await c.call(cmd, args); res.calls[cmd] = { ok: true, result: cmd === 'status' ? { mode: r.mode } : r }; }
+  for (const [cmd, args] of [['status'], ['latency'], ['setMode', { mode: 'balanced' }], ['rollbackAll'], ['approve', { id: 'test-approval' }], ['disablePolicy', { txId: 1 }], ['exportDiagnostics'], ['setEtw', { enabled: false }]]) {
+    try { const r = await c.call(cmd, args); res.calls[cmd] = { ok: true, result: cmd === 'status' ? { mode: r.mode } : cmd === 'latency' ? { running: r.status && r.status.running } : r }; }
     catch (e) { res.calls[cmd] = { ok: false, code: e.code, message: e.message }; }
   }
   c.close();
@@ -225,7 +309,8 @@ const { spawnSync } = require('child_process');
   if (res.elevated) { console.log('  not tested: non-admin rejection (runner is elevated and the runas /trustlevel client was still elevated)'); return; }
   note('de-elevated client started (net session refused => not elevated)');
   ok('non-admin client can still read (status)', res.calls.status && res.calls.status.ok === true, JSON.stringify(res.calls.status));
-  for (const cmd of ['setMode', 'rollbackAll', 'approve', 'disablePolicy', 'exportDiagnostics']) ok(`non-admin ${cmd} -> forbidden`, res.calls[cmd] && res.calls[cmd].ok === false && res.calls[cmd].code === 'forbidden', JSON.stringify(res.calls[cmd]));
+  ok('non-admin client can read latency', res.calls.latency && res.calls.latency.ok === true, JSON.stringify(res.calls.latency));
+  for (const cmd of ['setMode', 'rollbackAll', 'approve', 'disablePolicy', 'exportDiagnostics', 'setEtw']) ok(`non-admin ${cmd} -> forbidden`, res.calls[cmd] && res.calls[cmd].ok === false && res.calls[cmd].code === 'forbidden', JSON.stringify(res.calls[cmd]));
 }
 
 // 60 s soak in Monitor mode: service working set and tick cost, and no applied policy.
@@ -285,6 +370,23 @@ async function adminChecks(c) {
     ok('exportDiagnostics wrote valid JSON', !!j, p && fs.existsSync(p) ? `${fs.statSync(p).size} bytes` : 'missing');
     if (j) ok('diagnostics bundle has no window titles / command lines', privacyKeys(j).length === 0, privacyKeys(j).slice(0, 5).join(', '));
   } catch (e) { ok('exportDiagnostics', false, `${e.code} ${e.message}`); }
+  // Kernel tracing off → on (docs/core/etw.md `setEtw`).
+  await expectErr('setEtw without enabled -> bad_args', c.call('setEtw', {}), 'bad_args');
+  await expectErr('setEtw with enabled as string -> bad_args', c.call('setEtw', { enabled: 'false' }), 'bad_args');
+  try {
+    const off = await c.call('setEtw', { enabled: false }, { timeout: 15000 });
+    ok('setEtw false -> { enabled: false, running: false }', off.enabled === false && off.running === false, JSON.stringify(off));
+    const stopped = await until(async () => { const l = await c.call('latency'); return l.status && l.status.running === false ? l : null; }, 5000, 250);
+    ok('latency.status.running false after setEtw false', !!stopped, stopped ? (stopped.status.reason || '') : JSON.stringify((await c.call('latency')).status));
+    const se = (await c.call('status')).etw;
+    ok('status.etw.running false after setEtw false', se && se.running === false, JSON.stringify(se));
+    ok('kernel session gone after setEtw false (logman)', !etwSessionExists());
+    const on = await c.call('setEtw', { enabled: true }, { timeout: 15000 });
+    ok('setEtw true -> { enabled: true }', on.enabled === true && typeof on.running === 'boolean', JSON.stringify(on));
+    const t = Date.now();
+    const back = await until(async () => { const l = await c.call('latency'); return l.status && l.status.running ? l : null; }, 10000, 250);
+    ok('latency.status.running true again within 10 s of setEtw true', !!back, `${Date.now() - t} ms`);
+  } catch (e) { ok('setEtw false → true', false, `${e.code} ${e.message}`); try { await c.call('setEtw', { enabled: true }); } catch { /* reported above */ } }
   const s = await c.call('status');
   ok('ends in monitor mode', s.mode === 'monitor', s.mode);
 }
@@ -300,6 +402,7 @@ async function cleanup() {
     const u = fs.existsSync(exe) ? run(exe, ['--uninstall']) : run('sc.exe', ['delete', SERVICE]);
     if (u.code !== 0) run('sc.exe', ['delete', SERVICE]);
   }
+  if (process.platform === 'win32' && etwSessionExists()) { note(`cleanup: stopping leftover ${ETW_SESSION} session`); run('logman.exe', ['stop', ETW_SESSION, '-ets']); }
 }
 
 async function consoleTests() {
@@ -523,6 +626,7 @@ async function consoleTests() {
   ok('console process terminated', !!exited);
   const gone = await until(() => !pipeExists(), 5000, 100);
   ok('pipe disappears after the process is killed', !!gone);
+  note(`after killing the console process the ${ETW_SESSION} session ${etwSessionExists() ? 'is still present (expected after a hard kill; the service must stop it at start-up)' : 'is gone'}`);
   const p = await probeOnce();
   ok('client reports unavailable after shutdown', p.available === false && p.error.code === 'unavailable', p.error && p.error.code);
   return true;
@@ -585,6 +689,8 @@ async function serviceTests() {
   const stopped = await until(() => serviceState().state === 'STOPPED', 10000, 300);
   ok('service STOPPED after sc stop (≤ 10 s)', !!stopped, `${serviceState().state} after ${Date.now() - t1} ms`);
   ok('pipe gone after service stop', !!await until(() => !pipeExists(), 5000, 100));
+  const noOrphan = await until(() => !etwSessionExists(), 5000, 250);
+  ok(`no orphan ${ETW_SESSION} session after service stop`, !!noOrphan, noOrphan ? '' : 'logman still lists it');
 
   const un = run(exe, ['--uninstall']);
   ok('--uninstall exits 0', un.code === 0, un.out.split(/\r?\n/).slice(-2).join(' | '));

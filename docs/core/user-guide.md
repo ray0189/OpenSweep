@@ -57,11 +57,39 @@ that is currently applied.
   correlation value or confidence); it is not proof of what caused the problem.
 - **Optimisation:** the mode switch, recommendations ("would apply" or "blocked" with the reason), active changes with a
   **Disable** button each, **Roll back everything**, and the history of changes with their measured outcome.
+- **Latency:** which drivers delay your PC, which apps use the disk, and which apps make Windows read memory back
+  from disk (see below).
 - **Recovery:** whether automatic recovery is available (it pauses itself — "circuit breaker open" — after repeated
   failures), actions waiting for your approval with an **Approve** button, and the history of recovery actions.
 - **Events:** crashes, hangs, service failures, hardware and update events collected from the Windows logs.
 - **System:** the service's own memory and CPU use, how long each engine cycle takes, your processor layout (cores,
   NUMA, CPU sets) and **Export diagnostics**.
+
+### The Latency tab
+
+Stutter, crackling audio or a mouse that briefly freezes are often caused by a **driver** (the software that runs a
+piece of hardware, such as the Wi-Fi card or graphics card) that keeps the processor busy for too long at once. Core
+measures this with Windows' own kernel tracing (ETW) — no extra driver is installed.
+
+- **Kernel tracing** at the top shows whether tracing is running, what it measures, what it costs (normally well under
+  2 % of one CPU; Core reduces or stops it on its own if it costs more) and whether Windows dropped any events. **Turn
+  off / Turn on** needs OpenSweep running as administrator and asks you to confirm.
+- **DPC / interrupt time and longest DPC / ISR:** how much processor time drivers used, and the longest single call in
+  the last 10 minutes. Under 500 µs (0.5 ms) is normal; from about 2,000 µs (2 ms) it can cause audio dropouts or
+  stutter.
+- **Drivers causing latency:** every driver with its file name, a plain description (for example `ndis.sys` = network,
+  `nvlddmkm.sys` = NVIDIA graphics), how many calls it made, and the longest one. The small bars show how the calls
+  were spread from short (left, green) to long (right, red). A driver at the top is not necessarily broken: it only
+  means it had the longest calls. If it lines up with stutter you notice, updating or rolling back that driver, or
+  changing its power-saving settings, is the usual fix. Core never changes drivers itself.
+- **Disk activity by app** and **Hard faults by app** (last 2 minutes): which apps read or write the most and how long
+  the disk took to answer, and which apps made Windows read memory back from disk. Only app names, byte counts and
+  timings are kept — no file names.
+- **Related incidents:** driver-latency, heavy background disk use and paging incidents. Click one for the evidence and
+  what you can do.
+
+If the tab says "Update OpenSweep Core to see latency", the installed service is an older version without kernel
+tracing.
 
 Anything marked **Simulated** is not a measurement of your PC: either OpenSweep runs in demo mode (every number is made
 up to show how the page works), or it is a decision the engine only simulated in Monitor mode.

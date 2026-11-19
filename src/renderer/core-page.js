@@ -47,6 +47,34 @@ const MODE_INFO = [
   { id: 'advanced', ic: 'alert', t: 'Advanced', d: 'Adds experimental actions (e.g. efficiency cores on hybrid CPUs). Each one needs your separate approval. Does not bypass any Windows protection.', warn: 'Experimental. Review every intervention; roll back if anything feels slower.' },
 ];
 
+// ---- Latency tab helpers (docs/core/etw.md). Histogram buckets: <50, <100, <250, <500, <1000, <2000, <4000, ≥4000 µs.
+const LAT_BUCKETS = ['< 50 µs', '50–100 µs', '100–250 µs', '250–500 µs', '500–1000 µs', '1–2 ms', '2–4 ms', '≥ 4 ms'];
+const latSev = (us) => (!Number.isFinite(us) ? '' : us < 500 ? 'good' : us < 2000 ? 'warn' : 'bad');
+const bucketSev = (i) => (i <= 3 ? 'good' : i <= 5 ? 'warn' : 'bad');
+const fmtUs = (us) => (Number.isFinite(us) ? `${Math.round(us).toLocaleString()} µs` : '—');
+// Plain-language names for common Windows drivers (file name → what it is). Only a hint; vendors vary.
+const DRIVER_HINTS = [
+  [/^ndis\.sys$/i, 'Network (NDIS, all network adapters)'], [/^tcpip\.sys$/i, 'Windows network stack (TCP/IP)'], [/^netio\.sys$/i, 'Windows network I/O'],
+  [/^(rtwlan|rtwlane|rtl8\d*|rtwlanu)\w*\.sys$/i, 'Realtek Wi-Fi'], [/^netwtw\w*\.sys$/i, 'Intel Wi-Fi'], [/^netwbw\w*\.sys$/i, 'Intel Wi-Fi'], [/^(athw|qcamain|athr)\w*\.sys$/i, 'Qualcomm / Atheros Wi-Fi'], [/^bcmwl\w*\.sys$/i, 'Broadcom Wi-Fi'], [/^mtkwl\w*\.sys$/i, 'MediaTek Wi-Fi'],
+  [/^rt\d+x\d+\.sys$/i, 'Realtek Ethernet'], [/^(e1\w+|ix\w+)\.sys$/i, 'Intel Ethernet'], [/^(b57nd60a|bxvbda)\.sys$/i, 'Broadcom Ethernet'], [/^kill\w*\.sys$/i, 'Killer network'],
+  [/^nvlddmkm\.sys$/i, 'NVIDIA graphics driver'], [/^amdkmdag\.sys$/i, 'AMD graphics driver'], [/^atikmdag\.sys$/i, 'AMD graphics driver (older)'], [/^igdkmd\w*\.sys$/i, 'Intel graphics driver'], [/^dxgkrnl\.sys$/i, 'DirectX graphics kernel (Windows)'], [/^dxgmms\d\.sys$/i, 'DirectX graphics memory manager (Windows)'], [/^BasicDisplay\.sys$/i, 'Microsoft basic display driver'],
+  [/^storport\.sys$/i, 'Storage port driver (Windows)'], [/^stornvme\.sys$/i, 'NVMe SSD driver (Windows)'], [/^storahci\.sys$/i, 'SATA (AHCI) storage driver (Windows)'], [/^iaStor\w*\.sys$/i, 'Intel storage (RST) driver'], [/^(amdsata|amdxata|rcraid|rcbottom)\.sys$/i, 'AMD storage / RAID driver'], [/^(classpnp|disk|partmgr|volmgr|Ntfs|fvevol|volsnap)\.sys$/i, 'Windows disk / file system'], [/^secnvme\.sys$/i, 'Samsung NVMe driver'],
+  [/^ACPI\.sys$/i, 'Power management / ACPI (Windows)'], [/^intelppm\.sys$/i, 'Intel processor power management'], [/^amdppm\.sys$/i, 'AMD processor power management'], [/^(amdpsp|amdi2c|amdgpio2)\.sys$/i, 'AMD chipset'], [/^(iaLPSS|iaLPSS2)\w*\.sys$/i, 'Intel chipset (serial I/O)'],
+  [/^Wdf01000\.sys$/i, 'Driver framework (KMDF) — runs code of other drivers'], [/^ntoskrnl\.exe$/i, 'Windows kernel'], [/^hal\.dll$/i, 'Windows hardware abstraction layer'], [/^(CLASSPNP|pci)\.sys$/i, 'PCI bus (Windows)'],
+  [/^HDAudBus\.sys$/i, 'High Definition Audio bus'], [/^portcls\.sys$/i, 'Audio port class (Windows audio drivers)'], [/^(RTKVHD64|RTKVHDA64|RtkHDAud)\.sys$/i, 'Realtek audio'], [/^(IntcAudioBus|IntcSST|IntcDAud)\w*\.sys$/i, 'Intel audio'], [/^(nvhda64v|AtihdWT6)\.sys$/i, 'Graphics card audio (HDMI/DP)'], [/^ks\.sys$/i, 'Kernel streaming (audio/video, Windows)'],
+  [/^usbxhci\.sys$/i, 'USB 3 controller (Windows)'], [/^(USBPORT|usbehci|usbhub|usbhub3|UsbHub3|ucx01000)\.sys$/i, 'USB (Windows)'], [/^(HidUsb|hidclass|mouhid|kbdhid|i8042prt)\.sys$/i, 'Keyboard / mouse / HID'],
+  [/^(BthPort|BTHUSB|bthenum)\.sys$/i, 'Bluetooth'], [/^(Netio|afd|http)\.sys$/i, 'Windows networking'], [/^(WdFilter|WdNisDrv)\.sys$/i, 'Microsoft Defender'], [/^(vmbus|storvsc|netvsc)\.sys$/i, 'Hyper-V virtual device'], [/^unknown$/i, 'Not mapped to a driver yet'],
+];
+const driverHint = (name) => { const n = String(name || ''); const m = DRIVER_HINTS.find(([re]) => re.test(n)); return m ? m[1] : null; };
+const ETW_FLAG_LABEL = { process: 'processes', thread: 'threads', image_load: 'driver loads', dpc: 'DPC', interrupt: 'ISR', disk_io: 'disk I/O', hard_faults: 'hard faults' };
+const LATENCY_DETECTORS = ['driver_latency', 'disk_hog', 'paging_hog'];
+function latHistogram(hist) {
+  const v = (Array.isArray(hist) ? hist : []).slice(0, 8).map(n => Math.max(0, Number(n) || 0));
+  const top = Math.max(...v, 1), lg = Math.log10(top + 1);
+  return h('div', { class: 'lat-hist', role: 'img', 'aria-label': `Duration distribution: ${v.map((n, i) => `${LAT_BUCKETS[i]} ${n}`).join(', ')}` },
+    LAT_BUCKETS.map((l, i) => { const n = v[i] || 0; return h('span', { class: `b ${bucketSev(i)}${n ? '' : ' zero'}`, title: `${l}: ${n.toLocaleString()} call${n === 1 ? '' : 's'}`, style: { height: n ? `${Math.max(12, Math.round((Math.log10(n + 1) / lg) * 100))}%` : '' } }); }));
+}
+
 function scoreRing(score, label) {
   const wrapEl = h('div'), r = 54, c = 2 * Math.PI * r, ok = Number.isFinite(score);
   const col = !ok ? 'var(--border)' : score >= 80 ? 'var(--good)' : score >= 55 ? 'var(--warn)' : 'var(--bad)';
@@ -127,7 +155,7 @@ PAGES.core = async (main) => {
   function tabsBar() {
     const c = (engine() && engine().counts) || {};
     return tabs([['overview', 'Overview', 'pulse'], ['incidents', 'Incidents', 'alert', c.incidentsOpen || null], ['optimise', 'Optimisation', 'sliders', c.policiesActive || null],
-      ['recovery', 'Recovery', 'repair'], ['events', 'Events', 'list'], ['system', 'System', 'cpu']], V.tab, (id) => { V.tab = id; tabsSlot.replaceChildren(tabsBar()); renderTab(); });
+      ['latency', 'Latency', 'activity'], ['recovery', 'Recovery', 'repair'], ['events', 'Events', 'list'], ['system', 'System', 'cpu']], V.tab, (id) => { V.tab = id; tabsSlot.replaceChildren(tabsBar()); renderTab(); });
   }
 
   function draw() {
@@ -149,7 +177,7 @@ PAGES.core = async (main) => {
   async function renderTab() {
     const my = ++gen; live = null;
     body.replaceChildren(h('div', { class: 'card' }, loading('Loading…')));
-    const fn = { overview: tabOverview, incidents: tabIncidents, optimise: tabOptimise, recovery: tabRecovery, events: tabEvents, system: tabSystem }[V.tab] || tabOverview;
+    const fn = { overview: tabOverview, incidents: tabIncidents, optimise: tabOptimise, latency: tabLatency, recovery: tabRecovery, events: tabEvents, system: tabSystem }[V.tab] || tabOverview;
     try { const out = await fn(my); if (my === gen && out) body.replaceChildren(...[out].flat()); }
     catch (e) { if (my === gen) body.replaceChildren(h('div', { class: 'banner bad' }, icon('alert'), `Could not read from OpenSweep Core: ${coreErr(e)}`)); }
   }
@@ -338,6 +366,75 @@ PAGES.core = async (main) => {
       h('tbody', {}, list.map(t => h('tr', {}, h('td', { class: 'nowrap' }, fmtTime(tsOf(t))), h('td', {}, actionLabel(t.action || t.kind), t.value !== undefined && t.kind !== 'recovery' ? h('div', { class: 'desc mono' }, `${t.original !== undefined ? `${t.original} → ` : ''}${t.value}`) : null),
         h('td', {}, targetName(t.target)), h('td', {}, txTag(t.state), simTag(isSim(t) && t.state !== 'simulated')),
         h('td', {}, h('div', { class: 'desc' }, t.reason || t.trigger || ''), (t.outcome || t.verificationResult) ? h('div', { class: 'desc' }, h('b', {}, 'Measured: '), t.outcome || t.verificationResult) : null))))));
+  }
+
+  // ---- Latency: kernel tracing (ETW) — drivers with long DPC/ISR, disk activity and hard faults per app
+  async function tabLatency(my) {
+    const [lat, disk, hf, inc] = await Promise.all([read('coreLatency').catch(e => ({ _e: e })), read('coreDiskActivity').catch(e => ({ _e: e })), read('coreHardFaults').catch(e => ({ _e: e })), read('coreIncidents', { limit: 100 }).catch(() => null)]);
+    if (stale(my)) return null;
+    if (lat._e) {
+      if (/unknown_cmd|unknown command/i.test(coreErr(lat._e))) return h('div', { class: 'card' }, emptyState('Update OpenSweep Core to see latency. This version of the service does not include kernel tracing.', 'info', false));
+      return unavailableCard('Latency', lat._e);
+    }
+    const es = lat.status || {}, sys = lat.system || {}, on = !!es.running;
+    const flags = (es.flags || []).map(f => ETW_FLAG_LABEL[String(f).toLowerCase()] || human(String(f).toLowerCase()));
+    const cost = Number(es.costPercent), lost = Number(es.eventsLost) || 0;
+    const statusCard = h('div', { class: 'card' }, h('div', { class: 'card-head', style: { marginBottom: 0 } },
+      stateDot(on ? 'on' : 'off', on ? 'Running' : 'Off'),
+      h('div', { class: 't' }, h('h3', {}, `Kernel tracing: ${on ? 'running' : 'off'}`, simTag(isSim(lat))),
+        h('div', { class: 'sub' }, on ? [
+          `Measures ${flags.length ? flags.join(', ') : '—'}`,
+          Number.isFinite(cost) ? h('span', { class: `tag ${cost >= 2 ? 'warn' : ''}`, title: 'CPU time the service spends processing trace events (share of one CPU)' }, `cost ${fmtNum(cost, 2)} %`) : null,
+          h('span', { class: `tag ${lost ? 'warn' : ''}`, title: 'Events Windows dropped because buffers were full; numbers may be slightly low when this is not 0' }, `${lost.toLocaleString()} events lost`),
+          es.reason ? h('div', { class: 'desc' }, es.reason) : null,
+        ] : [es.reason ? `${es.reason}. ` : '', 'Driver latency, disk activity per app and hard faults per app are not measured while it is off.'])),
+      btn(on ? 'Turn off' : 'Turn on', (e) => admin(e.currentTarget, 'coreSetEtw', { enabled: !on }, (r) => toast(r.enabled ? (r.running ? 'Kernel tracing is on' : 'Kernel tracing enabled — starting…') : 'Kernel tracing is off')),
+        { small: true, kind: on ? '' : 'primary', ic: on ? 'stop' : 'play', disabled: !canAdmin(), title: canAdmin() ? null : 'Needs OpenSweep running as administrator' })));
+    const out = [statusCard];
+    const drivers = (lat.drivers || []).filter(d => d && d.name).sort((a, b) => (Number(b.maxUs) || 0) - (Number(a.maxUs) || 0));
+    if (on || drivers.length) {
+      const longDesc = (us) => `single call, last 10 min${!Number.isFinite(us) || us < 500 ? '' : us < 2000 ? ' · can matter for real-time audio' : ' · long enough to cause audio dropouts or stutter'}`;
+      out.push(h('div', { class: 'gap-16' }), h('div', { class: 'grid g4' },
+        kpi('DPC time', `${fmtNum(sys.dpcPercent, 2)} %`, '', 'cpu', h('div', { class: 'desc' }, 'of all CPUs · deferred driver work')),
+        kpi('Interrupt (ISR) time', `${fmtNum(sys.isrPercent, 2)} %`, '', 'bolt', h('div', { class: 'desc' }, 'of all CPUs · hardware interrupts')),
+        kpi('Longest DPC', fmtUs(sys.worstDpcUs), latSev(sys.worstDpcUs), 'activity', h('div', { class: 'desc' }, longDesc(sys.worstDpcUs))),
+        kpi('Longest ISR', fmtUs(sys.worstIsrUs), latSev(sys.worstIsrUs), 'activity', h('div', { class: 'desc' }, longDesc(sys.worstIsrUs)))));
+      out.push(h('div', { class: 'section-title' }, 'Drivers causing latency', simTag(isSim(lat))),
+        h('div', { class: 'card flush' },
+          h('div', { class: 'card-head', style: { padding: '14px 16px 0' } }, h('div', { class: 't' }, h('div', { class: 'sub' }, 'Kernel drivers ranked by their longest single DPC or interrupt in the last 10 minutes. Under 500 µs is normal; 2,000 µs or more can cause audio crackle, input lag or stutter. A long call happening at the same time as stutter is a correlation, not proof that the driver is faulty.'))),
+          drivers.length ? h('div', { class: 'table-wrap lat-wrap' }, h('table', { class: 'lat-table' },
+            h('thead', {}, h('tr', {}, h('th', {}, 'Driver'), h('th', { class: 'num' }, 'Calls (DPC / ISR)'), h('th', { class: 'num' }, 'Total time'), h('th', { class: 'num' }, 'Longest'), h('th', {}, 'Distribution'))),
+            h('tbody', {}, drivers.map(d => { const hint = driverHint(d.name), sev = latSev(Number(d.maxUs)); return h('tr', {},
+              h('td', {}, h('div', { class: 'mono' }, d.name), hint ? h('div', { class: 'desc' }, hint) : null),
+              h('td', { class: 'num nowrap' }, `${fmtNum(d.dpcCount, 0)} / ${fmtNum(d.isrCount, 0)}`),
+              h('td', { class: 'num nowrap' }, Number.isFinite(d.totalUs) ? `${fmtNum(d.totalUs / 1000, d.totalUs < 10000 ? 1 : 0)} ms` : '—'),
+              h('td', { class: 'num nowrap' }, h('span', { class: `tag ${sev}`, style: { marginLeft: 0 } }, fmtUs(Number(d.maxUs)))),
+              h('td', {}, latHistogram(d.histogram))); }))))
+            : emptyState(on ? 'No driver activity recorded yet. Data appears after the first minute of tracing.' : 'No driver data — kernel tracing is off.', 'info', false),
+          drivers.length ? h('div', { class: 'legend lat-legend' }, h('span', {}, 'Bars: number of calls per duration, < 50 µs on the left to ≥ 4 ms on the right (log scale).'), h('span', {}, h('span', { class: 'sw lat-sw good' }), '< 500 µs'), h('span', {}, h('span', { class: 'sw lat-sw warn' }), '500–2,000 µs'), h('span', {}, h('span', { class: 'sw lat-sw bad' }), '≥ 2,000 µs')) : null));
+    }
+    // Disk activity and hard faults by app (last 2 minutes)
+    const dlist = disk._e ? null : (disk.processes || []).slice().sort((a, b) => ((b.readBps || 0) + (b.writeBps || 0)) - ((a.readBps || 0) + (a.writeBps || 0)));
+    const flist = hf._e ? null : (hf.processes || []).slice().sort((a, b) => (b.faultsPerSec || 0) - (a.faultsPerSec || 0));
+    const rate = (b) => (b > 0 && b < 1024 ? '< 1 KB/s' : fmtRate(b || 0));
+    const errText = (e) => (/unknown_cmd|unknown command/i.test(coreErr(e)) ? 'Update OpenSweep Core to see this.' : `Not available: ${coreErr(e)}`);
+    out.push(h('div', { class: 'section-title' }, 'Disk activity by app', simTag(isSim(disk) && !disk._e)),
+      h('div', { class: 'card flush' }, h('div', { class: 'card-head', style: { padding: '14px 16px 0' } }, h('div', { class: 't' }, h('div', { class: 'sub' }, 'Reads and writes per app over the last 2 minutes, with how long the disk took to answer. Only app names, byte counts and timings are recorded — no file names.'))),
+        dlist === null ? emptyState(errText(disk._e), 'info', false) : dlist.length ? h('div', { class: 'table-wrap' }, h('table', {},
+          h('thead', {}, h('tr', {}, h('th', {}, 'App'), h('th', { class: 'num' }, 'PID'), h('th', { class: 'num' }, 'Read'), h('th', { class: 'num' }, 'Write'), h('th', { class: 'num' }, 'I/Os'), h('th', { class: 'num' }, 'Avg latency'), h('th', { class: 'num' }, 'Max latency'))),
+          h('tbody', {}, dlist.map(p => h('tr', {}, h('td', {}, p.name || '—'), h('td', { class: 'num' }, String(p.pid ?? '—')), h('td', { class: 'num nowrap' }, rate(p.readBps)), h('td', { class: 'num nowrap' }, rate(p.writeBps)),
+            h('td', { class: 'num' }, fmtNum(p.ios, 0)), h('td', { class: 'num nowrap' }, fmtUnit(p.meanLatencyMs, 'ms')), h('td', { class: 'num nowrap' }, h('span', { class: p.maxLatencyMs >= 50 ? 'lat-bad' : p.maxLatencyMs >= 20 ? 'lat-warn' : '' }, fmtUnit(p.maxLatencyMs, 'ms')))))))) : emptyState(on ? 'No disk activity recorded in the last 2 minutes.' : 'Not measured while kernel tracing is off.', 'info', false)));
+    const fmax = flist && flist.length ? Math.max(...flist.map(p => p.faultsPerSec || 0), 1) : 1;
+    const related = inc && Array.isArray(inc.incidents) ? inc.incidents.filter(x => LATENCY_DETECTORS.includes(x.detector) || LATENCY_DETECTORS.some(k => String(x.key || x.kind || '').startsWith(k))) : null;
+    out.push(h('div', { class: 'grid g2', style: { alignItems: 'start', marginTop: '26px' } },
+      h('div', { class: 'card' }, h('h3', {}, 'Hard faults by app', simTag(isSim(hf) && !hf._e)), h('div', { class: 'sub' }, 'How often Windows had to read an app’s memory back from disk (per second, last 2 minutes). Sustained high values mean memory is short.'),
+        flist === null ? emptyState(errText(hf._e), 'info', false) : flist.length ? h('div', { class: 'bars', style: { marginTop: '12px' } }, flist.map(p => h('div', { class: 'contrib' },
+          h('div', { class: 'row nowrap' }, h('b', { class: 'trunc' }, p.name || '—'), h('span', { class: 'meta' }, `PID ${p.pid ?? '—'}`), h('div', { class: 'spacer' }), h('span', { class: 'meta num' }, `${fmtNum(p.faultsPerSec, 1)} /s`)),
+          h('div', { class: 'meter thin' }, h('div', { style: { width: `${Math.round(((p.faultsPerSec || 0) / fmax) * 100)}%` } })))))
+          : emptyState(on ? 'No hard faults recorded in the last 2 minutes.' : 'Not measured while kernel tracing is off.', 'info', false)),
+      h('div', { class: 'card' }, h('h3', {}, 'Related incidents'), h('div', { class: 'sub' }, 'Driver latency, heavy background disk use and paging. Click one for the evidence and what you can do.'),
+        related === null ? emptyState('Incidents are not available.', 'info', false) : related.length ? h('div', { style: { marginTop: '8px' } }, incidentList(related)) : emptyState('No latency, disk or paging incidents.'))));
+    return out;
   }
 
   // ---- Recovery (SweepHeal)

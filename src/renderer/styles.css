@@ -353,3 +353,14 @@ dialog.drawer[open] { display: flex; flex-direction: column; }
 .drawer .table-wrap { max-height: none; }
 .drawer .desc { color: var(--muted); font-size: 12.5px; }
 .drawer .drawer-summary { margin: 10px 0 0; color: var(--text-2); font-size: 13px; white-space: normal; }
+/* Core: Latency tab */
+.lat-hist { display: flex; align-items: flex-end; gap: 2px; height: 26px; width: 104px; }
+.lat-hist .b { flex: 1; min-height: 2px; border-radius: 2px 2px 0 0; background: var(--good); }
+.lat-hist .b.warn { background: var(--warn); } .lat-hist .b.bad { background: var(--bad); }
+.lat-hist .b.zero { height: 2px; opacity: .3; background: var(--faint); }
+.lat-wrap { max-height: none; }
+.lat-table td { vertical-align: middle; }
+.lat-legend { padding: 10px 16px 14px; flex-wrap: wrap; }
+.legend .sw.lat-sw.good { background: var(--good); } .legend .sw.lat-sw.warn { background: var(--warn); } .legend .sw.lat-sw.bad { background: var(--bad); }
+.lat-warn { color: var(--warn); font-weight: 600; } .lat-bad { color: var(--bad); font-weight: 600; }
+.contrib .meta { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
