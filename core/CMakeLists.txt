@@ -40,6 +40,7 @@ add_library(opensweep_portable STATIC
   src/portable/protocol.cpp
   src/portable/stats.cpp
   src/portable/commands.cpp
+  src/portable/telemetry.cpp
 )
 target_include_directories(opensweep_portable PUBLIC src/portable)
 opensweep_set_warnings(opensweep_portable)
