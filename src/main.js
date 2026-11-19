@@ -151,15 +151,22 @@ function scheduleStability() {
 // %ProgramData%\OpenSweep holds scripts run as admin/SYSTEM, backups and install logs. By default
 // ordinary users can add files there, so lock it to SYSTEM + Administrators (read-only for Users).
 function hardenDataDir() {
-  try {
-    const { execFileSync } = require('child_process');
-    const dir = path.join(process.env.ProgramData || 'C:\\ProgramData', 'OpenSweep');
-    const run = path.join(dir, 'run');
+  // Runs in the background (never blocks start-up) and only when elevated; the folder is used for
+  // scripts only after a write test succeeds, so a failure just keeps using %TEMP%.
+  const { execFile } = require('child_process');
+  const pscore = require('./backend/pscore');
+  const dir = path.join(process.env.ProgramData || 'C:\\ProgramData', 'OpenSweep');
+  const run = path.join(dir, 'run');
+  const icacls = (args) => new Promise((resolve, reject) => execFile('icacls.exe', args, { windowsHide: true, timeout: 120000 }, (err) => (err ? reject(err) : resolve())));
+  pscore.isAdmin().then(async (admin) => {
+    if (!admin) return;
     fs.mkdirSync(run, { recursive: true });
-    execFileSync('icacls.exe', [dir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX', '/T', '/C', '/Q'], { windowsHide: true, timeout: 30000 });
-    execFileSync('icacls.exe', [dir, '/setowner', '*S-1-5-32-544', '/T', '/C', '/Q'], { windowsHide: true, timeout: 30000 });
-    require('./backend/pscore').setScriptDir(run);
-  } catch { /* not admin or icacls failed: keep using %TEMP% */ }
+    await icacls([dir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX', '/T', '/C', '/Q']);
+    await icacls([dir, '/setowner', '*S-1-5-32-544', '/T', '/C', '/Q']);
+    const probe = path.join(run, `probe-${process.pid}.tmp`);
+    fs.writeFileSync(probe, 'ok'); fs.rmSync(probe, { force: true });
+    pscore.setScriptDir(run);
+  }).catch(() => { /* icacls failed or folder not writable: keep using %TEMP% */ });
 }
 
 // ------------------------------------------------------------------ settings guard (keeps your tweaks applied)

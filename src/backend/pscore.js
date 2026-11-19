@@ -36,13 +36,24 @@ function withArgs(script, args) {
 }
 function writeScript(text) {
   const f = tmpFile('.ps1');
-  fs.writeFileSync(f, '\ufeff' + text, 'utf8'); // BOM so PS 5.1 reads UTF-8
-  return f;
+  try {
+    fs.writeFileSync(f, '\ufeff' + text, 'utf8'); // BOM so PS 5.1 reads UTF-8
+    return f;
+  } catch (e) {
+    // The protected folder is not writable (e.g. OpenSweep is not running as administrator):
+    // stop using it and fall back to %TEMP% rather than breaking every action.
+    if (!scriptDir) throw e;
+    scriptDir = null;
+    const t = tmpFile('.ps1');
+    fs.writeFileSync(t, '\ufeff' + text, 'utf8');
+    return t;
+  }
 }
 
 // Run a script as the current user; resolves with parsed JSON (or raw text).
 function ps(script, args, { timeout = 120000, json = true } = {}) {
-  const file = writeScript(withArgs(script, args));
+  let file;
+  try { file = writeScript(withArgs(script, args)); } catch (e) { return Promise.reject(e); }
   return new Promise((resolve, reject) => {
     execFile(PS, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file],
       { timeout, maxBuffer: 64 * 1024 * 1024, windowsHide: true },
@@ -62,8 +73,12 @@ function ps(script, args, { timeout = 120000, json = true } = {}) {
 // normally yes; then admin work runs directly, errors come back, and there is no UAC prompt.)
 let adminP = null;
 function isAdmin() {
-  if (!adminP) adminP = ps('Out-Json ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)')
-    .then(Boolean).catch(() => false);
+  // `net session` only succeeds in an elevated process; no script file needed, so it works even when
+  // the script folder is unusable. PowerShell is the fallback.
+  if (!adminP) adminP = new Promise(resolve => {
+    execFile(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'net.exe'), ['session'], { windowsHide: true, timeout: 10000 }, (err) => resolve(!err));
+  }).then(ok => ok || ps('Out-Json ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)', undefined, { timeout: 15000 })
+    .then(Boolean).catch(() => false));
   return adminP;
 }
 

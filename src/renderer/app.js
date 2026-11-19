@@ -676,7 +676,15 @@ function updateCard(set) {
 // ------------------------------------------------------------------ boot
 function applyTheme() { document.querySelector('.app').classList.toggle('compact', !!S.settings.compactNav); const t = S.settings.theme; if (t === 'system') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t); }
 (async function boot() {
-  [S.info, S.C, S.settings] = await Promise.all([window.api.call('info'), window.api.call('catalog'), window.api.call('getSettings')]);
+  try {
+    [S.info, S.C, S.settings] = await Promise.all([window.api.call('info'), window.api.call('catalog'), window.api.call('getSettings')]);
+  } catch (e) {
+    // Never leave a blank window: show what failed so it can be reported.
+    console.error(e);
+    $('#main').replaceChildren(h('div', { class: 'page' }, h('div', { class: 'banner bad' }, 'OpenSweep could not start: ' + (e && e.message ? e.message : String(e))),
+      h('p', {}, 'Try closing OpenSweep and opening it again (right-click → Run as administrator). If it keeps happening, send a screenshot of this message.')));
+    return;
+  }
   applyTheme();
   S.update = await window.api.call('updateStatus').catch(() => null);
   window.api.on((name, data) => {
