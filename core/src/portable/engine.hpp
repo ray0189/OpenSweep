@@ -48,6 +48,7 @@
 #include "incident.hpp"
 #include "journal.hpp"
 #include "json.hpp"
+#include "kernel_guard.hpp"
 #include "memory_policy.hpp"
 #include "scheduler_policy.hpp"
 #include "telemetry.hpp"
@@ -66,10 +67,11 @@ struct Settings {
     Mode mode = Mode::Monitor;  // fail-safe default
     bool simulation = false;
     std::vector<PolicyKind> opted_in;
+    bool etw = true;  // kernel tracing (docs/core/etw.md); absent in older files -> true
 };
 inline constexpr std::int64_t kSettingsVersion = 1;
 json::Value settings_to_json(const Settings& s);
-// Strict: { version:1, mode:"monitor"|"balanced"|"advanced", simulation:bool, optIn:[kind...] }.
+// Strict: { version:1, mode:"monitor"|"balanced"|"advanced", simulation:bool, optIn:[kind...], etw?:bool }.
 // Unknown keys, wrong types, unknown / duplicate kinds -> nullopt with `error` set.
 std::optional<Settings> settings_from_json(const json::Value& v, std::string& error);
 
@@ -99,6 +101,7 @@ struct EngineOptions {
     std::size_t max_captures = 8;                    // incident windows kept in memory
     std::int64_t capture_before_ms = 5 * 60'000;     // trace window captured before an incident opens
     guard::GuardConfig guard;          // logical_processors is overridden from `topology`
+    kguard::KernelGuardConfig kernel_guard;  // logical_processors is overridden from `topology`
     control::ControlConfig control;    // mode / simulation / opt-ins are overridden from config.json
     heal::HealConfig heal;
     memory::MemoryConfig memory;
@@ -210,7 +213,8 @@ public:
     std::vector<journal::Transaction> journal(std::size_t limit) const;
     HealView heal(std::size_t history_limit) const;
     std::vector<IncidentCapture> captures() const;
-    std::size_t tracked_processes() const;  // guard + scheduler bounded tracking (tests)
+    std::size_t tracked_processes() const;  // guard + scheduler + kernel guard bounded tracking (tests)
+    std::vector<std::string> kernel_notes() const;  // why kernel-trace hogs were not candidates (last tick)
 
     // ---- admin side (the IPC layer has already checked the admin capability) ----------------
     // `simulation` / `opt_in` are optional additive arguments of setMode (see ipc-protocol.md).
@@ -219,6 +223,10 @@ public:
     control::RollbackSummary rollback_all();
     bool disable_policy(const std::string& tx_id);
     ApproveResult approve(const std::string& id);
+    // Persists the kernel-tracing switch (config.json `etw`). The platform starts / stops the session.
+    // Returns true when config.json was written.
+    bool set_etw(bool enabled);
+    bool etw_enabled() const;
 
     // Writes `data` atomically to data_dir/name; returns the full path or nullopt.
     std::optional<std::string> write_data_file(std::string_view name, std::string_view data);
@@ -256,6 +264,7 @@ private:
     baseline::BaselineSet baselines_;
     incident::IncidentStore incidents_;
     guard::Guard guard_;
+    kguard::KernelGuard kernel_guard_;
     memory::SweepMemory memory_;
     sched::SweepScheduler scheduler_;
     journal::Journal journal_;
@@ -271,6 +280,8 @@ private:
     std::uint64_t tick_cost_us_ = 0;
     std::uint64_t tick_cost_max_us_ = 0;
 
+    std::vector<std::string> opened_;  // incidents opened by the last tick (guard + kernel guard)
+    std::vector<std::string> kernel_notes_;
     std::vector<control::Decision> last_decisions_;
     bool last_no_action_ = true;
     std::string last_reason_;

@@ -13,7 +13,8 @@ namespace opensweep::win {
 
 namespace {
 
-// Stop: pipe cancel (<= 2 s) + last engine tick + policy rollback + state persistence.
+// Stop: pipe cancel (<= 2 s) + last engine tick + kernel trace stop (<= ~6 s worst case) + policy
+// rollback + state persistence.
 constexpr DWORD kStopWaitHintMs = 15000;
 constexpr DWORD kStartWaitHintMs = 5000;
 
@@ -192,7 +193,15 @@ int install_service() {
     //   SeChangeNotifyPrivilege  - traverse checking (always required)
     //   SeImpersonatePrivilege   - ImpersonateNamedPipeClient, to read the client's SID for the audit log
     //   SeCreateGlobalPrivilege  - kept for future global named objects; harmless
-    static wchar_t privileges[] = L"SeChangeNotifyPrivilege\0SeImpersonatePrivilege\0SeCreateGlobalPrivilege\0";
+    //   SeSystemProfilePrivilege - kernel tracing (docs/core/etw.md): SystemTraceProvider / kernel
+    //                              logger sessions are profiling of the whole system; Windows checks
+    //                              this privilege for kernel profiling sources, so it is kept (and
+    //                              enabled at run time) for the private system-logger session.
+    //                              Nothing else is needed: SeDebugPrivilege is NOT requested.
+    // Note: required privileges are applied when the service is installed; an existing installation
+    // needs --uninstall / --install (or sc privs) to gain SeSystemProfilePrivilege.
+    static wchar_t privileges[] =
+        L"SeChangeNotifyPrivilege\0SeImpersonatePrivilege\0SeCreateGlobalPrivilege\0SeSystemProfilePrivilege\0";
     SERVICE_REQUIRED_PRIVILEGES_INFOW priv_info{};
     priv_info.pmszRequiredPrivileges = privileges;
     if (!config2(svc.h, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, &priv_info, "setting required privileges")) all_ok = false;

@@ -9,7 +9,8 @@ are applied only after an administrator switches to Balanced/Advanced *and* opts
 kind; each is journaled before it is applied, verified, rolled back automatically if it does not
 help, and rolled back when the service stops or restarts after a crash. It never trims working
 sets, purges the standby list, pins affinity or kills processes, and has no network, telemetry or
-cloud dependencies. Contract: [`docs/core/phases-2-8.md`](../docs/core/phases-2-8.md).
+cloud dependencies. Contract: [`docs/core/phases-2-8.md`](../docs/core/phases-2-8.md); kernel tracing:
+[`docs/core/etw.md`](../docs/core/etw.md).
 
 The wire protocol is specified in [`docs/core/ipc-protocol.md`](../docs/core/ipc-protocol.md)
 (binding). The Node client is `src/core-client.js`; the Windows integration test is
@@ -19,9 +20,9 @@ The wire protocol is specified in [`docs/core/ipc-protocol.md`](../docs/core/ipc
 
 | Path | Contents |
 |---|---|
-| `src/portable/` | Platform-independent code, built into the `opensweep_portable` static library: JSON (`json.*`), framing (`framing.*`), protocol + capability-checking `Dispatcher` (`protocol.*`), Phase 1 commands (`commands.*`), shared data model (`telemetry.*`), trace + baselines (`trace.*`, `baseline.*`), guard + incidents (`guard.*`, `incident.*`), memory/scheduler policies (`memory_policy.*`, `scheduler_policy.*`), control engine + journal (`control.*`, `journal.*`), self-healing (`heal.*`), **the engine that wires them together and owns persistence (`engine.*`)** and **the Phase 2–6 IPC commands (`commands2.*`)**. |
-| `src/win/` | Windows-only code: SCM integration (`service.*`), named-pipe server (`pipe_server.*`), Phase 1 metrics + 1 s CPU sampler (`metrics.*`), topology + CPU sets (`topology.*`), logging (`log.*`), collectors (`collectors.*`, `events.*`, `process_info.*`), actuator (`actuator.*`), secure data directory + durable file I/O (`storage.*`), recovery executor (`heal_executor.*`), wiring (`app.*`), CLI (`main.cpp`). |
-| `tests/` | `core_tests` (portable, CTest): every portable module incl. `test_engine.cpp` (loop, monitor never acts, balanced apply → verify → rollback, crash recovery, persistence round-trip, synthetic leak → incident, bounded memory, tick cost) and `test_commands2.cpp` (every contract command's shape, argument validation, capabilities). `tests/win/`: `core_win_tests` (collectors, events, actuator; Windows only). |
+| `src/portable/` | Platform-independent code, built into the `opensweep_portable` static library: JSON (`json.*`), framing (`framing.*`), protocol + capability-checking `Dispatcher` (`protocol.*`), Phase 1 commands (`commands.*`), shared data model (`telemetry.*`), trace + baselines (`trace.*`, `baseline.*`), guard + incidents (`guard.*`, `incident.*`), memory/scheduler policies (`memory_policy.*`, `scheduler_policy.*`), control engine + journal (`control.*`, `journal.*`), self-healing (`heal.*`), **the engine that wires them together and owns persistence (`engine.*`)**, **the Phase 2–6 IPC commands (`commands2.*`)**, and the kernel-tracing aggregator + detectors (`kernel_stats.*`, `kernel_guard.*`). |
+| `src/win/` | Windows-only code: SCM integration (`service.*`), named-pipe server (`pipe_server.*`), Phase 1 metrics + 1 s CPU sampler (`metrics.*`), topology + CPU sets (`topology.*`), logging (`log.*`), collectors (`collectors.*`, `events.*`, `process_info.*`), actuator (`actuator.*`), secure data directory + durable file I/O (`storage.*`), recovery executor (`heal_executor.*`), private kernel trace session (`etw.*`), wiring (`app.*`), CLI (`main.cpp`). |
+| `tests/` | `core_tests` (portable, CTest): every portable module incl. `test_engine.cpp` (loop, monitor never acts, balanced apply → verify → rollback, crash recovery, persistence round-trip, synthetic leak → incident, bounded memory, tick cost) and `test_commands2.cpp` (every contract command's shape, argument validation, capabilities), `test_kernel_stats.cpp` (address → driver mapping, attribution, windows / bounds, histograms, self-protection) and `test_kernel_guard.cpp` (driver_latency / disk_hog / paging_hog incl. Monitor never acts). `tests/win/`: `core_win_tests` (collectors, events, actuator, ETW kernel session; Windows only, elevated). |
 
 ## Building
 
@@ -38,8 +39,9 @@ ctest --test-dir core/build -C Release --output-on-failure
 The executable is `core\build\Release\OpenSweepCore.exe`. It links the static MSVC runtime
 (`/MT`), so no VC++ redistributable is needed. Compiler flags: `/W4 /permissive- /EHsc /utf-8
 /guard:cf`; linker: `/guard:cf /DYNAMICBASE /NXCOMPAT`. `WIN32_LEAN_AND_MEAN`, `NOMINMAX`,
-`UNICODE`, `_UNICODE` and `_WIN32_WINNT=0x0A00` are defined. Links `advapi32`, `psapi`,
-`shell32`, `ole32`, `uuid`, `pdh`, `wevtapi`.
+`UNICODE`, `_UNICODE` and `_WIN32_WINNT=0x0A00` are defined. Links `advapi32` (also ETW:
+`StartTraceW`, `OpenTraceW`, `ProcessTrace`, `ControlTraceW`, `CloseTrace`), `psapi`, `shell32`,
+`ole32`, `uuid`, `pdh`, `wevtapi`. TDH is not used (fixed, size-checked event layouts).
 
 ### Linux / macOS (portable part only)
 
@@ -68,8 +70,11 @@ All commands exit 0 on success (`--uninstall` also exits 0 if the service is not
 LocalSystem, quoted binary path, a description, failure actions *restart after 5 s, restart
 after 30 s, then none* (counter reset after 24 h, also applied to non-crash failures), service
 SID type *unrestricted*, and a reduced required-privileges list (`SeChangeNotifyPrivilege`,
-`SeImpersonatePrivilege`, `SeCreateGlobalPrivilege`; every other LocalSystem privilege is
-removed from the service token). It does not start the service: `sc start OpenSweepCore`.
+`SeImpersonatePrivilege`, `SeCreateGlobalPrivilege`, `SeSystemProfilePrivilege` for the kernel
+trace session; every other LocalSystem privilege is removed from the service token; no
+`SeDebugPrivilege`). It does not start the service: `sc start OpenSweepCore`. The privilege list
+is applied at install time: an installation made before kernel tracing existed must be
+re-installed (`--uninstall`, `--install`) to gain `SeSystemProfilePrivilege`.
 
 Install the binary in a directory that standard users cannot write to (e.g. under
 `C:\Program Files\OpenSweep\`), since the service runs it as LocalSystem.
@@ -100,7 +105,7 @@ Administrators. A non-elevated console run serves a single instance and logs a w
   (`bad_args`) → unknown command (`unknown_cmd`) → capability (`forbidden`) → handler.
   Handler exceptions become `internal` without exposing their text. A response that would exceed
   1 MiB is replaced by an `internal` error.
-- **Capabilities.** Every client allowed by the pipe ACL gets `read`. `admin` (setMode,
+- **Capabilities.** Every client allowed by the pipe ACL gets `read`. `admin` (setMode, setEtw,
   rollbackAll, disablePolicy, approve, exportDiagnostics) is granted only when the client's
   token (read while impersonating) has the Administrators group *enabled* (`CheckTokenMembership`
   ignores the deny-only group of a UAC-filtered token) **and** `TokenElevation` is set. The
@@ -122,7 +127,8 @@ Administrators. A non-elevated console run serves a single instance and logs a w
   `Engine::tick`).
 - **Stop.** The SCM stop/shutdown control reports `STOP_PENDING` (15 s hint) and signals an event;
   the pipe server cancels outstanding I/O (bounded 2 s wait) and closes all instances, the engine
-  thread finishes its current tick and is joined, `Engine::shutdown()` rolls back every active
+  thread finishes its current tick and is joined, the kernel trace session is stopped
+  (`ControlTraceW(STOP)` + `CloseTrace` + consumer join, bounded 5 s), `Engine::shutdown()` rolls back every active
   policy and persists trace/baselines/incidents/events, the sampler thread is joined and
   `STOPPED` is reported. A non-zero exit (e.g. the pipe name is taken) is reported as a
   service-specific error so the failure actions apply.
@@ -148,7 +154,7 @@ responsiveness signal exists in session 0, so the scheduler requires *severe* qu
 | `events.jsonl` | when new events arrive (append; compacted at 2× bound) + at stop |
 | `incidents.jsonl` | when an incident opens / re-opens / resolves; touch-only updates at most every 5 min |
 | `journal.jsonl` | write-ahead before every action (append + `FlushFileBuffers`) |
-| `config.json` | on every successful `setMode` (`{version:1, mode, simulation, optIn:[...]}`; invalid → monitor defaults + log) |
+| `config.json` | on every successful `setMode` / `setEtw` (`{version:1, mode, simulation, optIn:[...], etw}`; `etw` optional, default `true`; invalid → monitor defaults + log) |
 | `diagnostics.json` | on `exportDiagnostics` (overwritten; bounded) |
 
 Atomic writes: `<file>.tmp` → `FlushFileBuffers` → `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`.
@@ -160,6 +166,56 @@ point or not owned by SYSTEM/Administrators; without a trusted directory the eng
 Thread safety: every `Engine` method takes one mutex; IPC handlers copy data out and serialise
 after releasing it. Collectors are shared with the IPC thread (foreground hints) and the heal
 executor through `CollectorSlots` (own mutex; lock order engine → slots, never the reverse).
+
+## Kernel tracing (ETW)
+
+Contract: [`docs/core/etw.md`](../docs/core/etw.md). `win::KernelSession` (`src/win/etw.*`) runs a
+**private** SystemTraceProvider session — `StartTraceW` with `EVENT_TRACE_SYSTEM_LOGGER_MODE |
+EVENT_TRACE_REAL_TIME_MODE`, name `OpenSweepCoreKernel`, `Wnode.Guid = SystemTraceControlGuid`
+(a private session GUID is tried if that is rejected with `ERROR_INVALID_PARAMETER`),
+`ClientContext = 1` (QPC), 64 KB × 4–16 buffers, `FlushTimer` 1 s, flags `PROCESS | THREAD |
+IMAGE_LOAD | DPC | INTERRUPT | DISK_IO | HARD_FAULTS`. It never touches the "NT Kernel Logger".
+A stale session with the same name is stopped by name at start (crash recovery); the running session
+is stopped by its own handle. `OpenTraceW` (`REAL_TIME | EVENT_RECORD | RAW_TIMESTAMP`) +
+`ProcessTrace` run on a dedicated thread.
+
+Decoding (classic MOF events, by class GUID + opcode, fixed documented layouts, every field
+bounds-checked, pointer size from `EVENT_HEADER_FLAG_32_BIT_HEADER` / `_64_BIT_HEADER`; malformed
+events are counted and skipped):
+
+| Class / opcodes | Fields used |
+|---|---|
+| PerfInfo 66 ThreadedDPC, 68 DPC, 69 TimerDPC, 67 ISR, 50 ISR-MSI | `InitialTime` (u64), `Routine` (ptr) |
+| Image 10 Load, 3 DCStart, 2 Unload (v2+) | `ImageBase`, `ImageSize`, `ProcessId`, `FileName` (file name only; kernel images = pid 0 or kernel address) |
+| Thread 1 Start, 3 DCStart, 2 End | `ProcessId`, `TThreadId` |
+| Process 1 Start, 3 DCStart, 2 End (v3+) | `ProcessId`, `ImageFileName` (after skipping `UserSID`; the command line is never read). Unknown layout → name from `QueryFullProcessImageNameW` |
+| DiskIo 10 Read, 11 Write (v2+) | `TransferSize`, `HighResResponseTime` (QPC ticks), `IssuingThreadId` (v3) |
+| PageFault 32 HardFault | `TThreadId` |
+
+**DPC / ISR duration** = `EventHeader.TimeStamp − InitialTime`: these events are written when the
+routine returns and `InitialTime` is its entry time on the same (QPC) clock, which is why the
+consumer asks for raw timestamps. Values outside 0–1 s are rejected as malformed.
+
+Aggregation (`kstats::KernelStats`, portable): routine address → driver via sorted image ranges
+(unknown → `"unknown"`); disk I/O and hard faults attributed issuing/faulting thread → process;
+1-minute windows, 60 kept, top 64 keys per table; histograms `<50 … ≥4000 µs`; system DPC/ISR %;
+per-sample (2 s) fields appended to `telemetry::Sample` (`kernel`, `kernelDrivers`,
+`kernelProcesses`; ETW per-process hard faults also fill `ProcessSample::hard_faults_per_sec`).
+All maps are bounded (threads 65 536, processes 8 192, images 4 096). If no kernel image rundown
+arrives within 5 s, driver ranges are seeded from `EnumDeviceDrivers` (approximate sizes).
+
+Self-protection: a supervisor thread (1 s) reads the session's lost events (`EventsLost +
+RealTimeBuffersLost`) and the consumer thread's CPU time (`GetThreadTimes`); more than 2 % of one
+CPU over 30 s, or loss in every check for 30 s, restarts the session with fewer flags (DPC/ISR
+dropped first, then disk, then hard faults; after that tracing stays off) and `etw.reason` says
+why. The cost covers the consumer thread (decode + aggregation), not the kernel's own logging
+overhead. Off switch: `config.json` `etw:false` or IPC `setEtw` (admin).
+
+Detectors (`kguard::KernelGuard`, after SweepMemory in the tick): `driver_latency` (recommendations
+only, never acts), `disk_hog` (candidates in area `disk`, verified by disk latency) and
+`paging_hog` (contributor in open memory incidents, candidates in area `memory`). Candidates go
+through the normal control engine: verified background workloads only, protected list and
+foreground excluded, journaled, verified, rolled back; Monitor mode only simulates.
 
 Self-healing (`WinHealExecutor`): automatic, OpenSweep-owned: recreate the system collector after 3
 failed collections; event-subscription reconnect is reported after 1 min of failures (the
@@ -212,6 +268,11 @@ privileges — to be validated on Windows.
   dispatcher capability check; ring buffer; statistics; Phase 1 result shapes against a fake
   provider). Also run under AddressSanitizer/UBSan and a short mutation fuzz of the parser and
   dispatcher during development.
+- **Kernel tracing:** the aggregator and the three detectors are unit-tested on Linux with synthetic
+  events. The ETW session (`etw.cpp`, `test_win_etw.cpp`) was only cross-compiled with MinGW here;
+  it counts as tested once the `windows` CI job runs it (session starts, DPC/ISR seen, disk I/O of
+  the test attributed to its own pid, clean stop, no orphan session). Finding a specific bad driver
+  on a real PC is only known after a user runs it.
 - **Windows code:** compiled and linked with MinGW-w64 GCC during development (not the target
   toolchain; `topology.cpp` reads `EfficiencyClass` as the byte after `Flags` so both MinGW and
   MSVC headers work). It has **not** been compiled with MSVC or run on Windows here. `test/core-ipc.js`

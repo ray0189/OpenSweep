@@ -85,6 +85,14 @@ json::Value fit_list(const std::vector<T>& items, F&& to_json, std::size_t budge
     return arr;
 }
 
+kstats::EtwStatus etw_status_of(const engine::Engine& e, const Platform& p) {
+    if (p.etw_status) return p.etw_status();
+    kstats::EtwStatus st;
+    st.enabled = e.etw_enabled();
+    st.reason = "kernel tracing is not available on this platform";
+    return st;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -143,6 +151,47 @@ json::Value sample_to_json(const telemetry::Sample& s) {
     json::Value top = json::Value::array();
     for (const auto& p : s.top) top.push_back(process_to_json(p));
     o.set("top", std::move(top));
+    // Kernel tracing (additive): summary + per-interval driver / process lists.
+    o.set("kernel", kernel_sample_json(s));
+    json::Value kd = json::Value::array();
+    for (const auto& d : s.kernel_drivers) {
+        json::Value x = json::Value::object();
+        x.set("name", d.name);
+        x.set("maxUs", num(d.max_us));
+        x.set("totalUs", num(d.total_us));
+        x.set("count", d.count);
+        kd.push_back(std::move(x));
+    }
+    o.set("kernelDrivers", std::move(kd));
+    json::Value kp = json::Value::array();
+    for (const auto& p : s.kernel_processes) {
+        json::Value x = json::Value::object();
+        x.set("pid", p.pid);
+        x.set("name", p.name);
+        x.set("readBps", num(p.read_bps));
+        x.set("writeBps", num(p.write_bps));
+        x.set("meanLatencyMs", num(p.mean_latency_ms));
+        x.set("maxLatencyMs", num(p.max_latency_ms));
+        x.set("hardFaultsPerSec", num(p.hard_faults_per_sec));
+        kp.push_back(std::move(x));
+    }
+    o.set("kernelProcesses", std::move(kp));
+    return o;
+}
+
+json::Value kernel_sample_json(const telemetry::Sample& s) {
+    const auto& k = s.kernel;
+    json::Value o = json::Value::object();
+    o.set("valid", s.kernel_valid);
+    o.set("running", k.running);
+    o.set("dpcPercent", num(k.dpc_percent));
+    o.set("isrPercent", num(k.isr_percent));
+    o.set("worstDpcUs", num(k.worst_dpc_us));
+    o.set("worstIsrUs", num(k.worst_isr_us));
+    o.set("hardFaultsPerSec", num(k.hard_faults_per_sec));
+    o.set("diskBytesPerSec", num(k.disk_bytes_per_sec));
+    o.set("eventsLost", k.events_lost);
+    o.set("costPercent", num(k.cost_percent));
     return o;
 }
 
@@ -332,7 +381,11 @@ json::Value build_diagnostics(engine::Engine& engine, const Platform& platform) 
     svc.set("protocol", protocol::kProtocolVersion);
     if (platform.service) svc.set("startedAt", commands::format_iso8601_utc(platform.service->started_at_ms));
     d.set("service", std::move(svc));
-    d.set("status", status_to_json(engine.status()));
+    {
+        json::Value st = status_to_json(engine.status());
+        st.set("etw", kstats::etw_status_json(etw_status_of(engine, platform)));
+        d.set("status", std::move(st));
+    }
     if (auto s = engine.latest()) d.set("sample", sample_to_json(*s));
     d.set("baselines", baselines_to_json(engine.baselines_summary()));
     const auto incs = engine.incidents(kMaxIncidents);
@@ -383,9 +436,11 @@ void register_engine_commands(protocol::Dispatcher& d, engine::Engine& engine, c
     const Platform* pf = &platform;
 
     // ---- read ---------------------------------------------------------------------------------
-    d.add("status", Capability::Read, [e](const Request& req, const ClientContext&) {
+    d.add("status", Capability::Read, [e, pf](const Request& req, const ClientContext&) {
         allow_only(req, {});
-        return status_to_json(e->status());
+        json::Value o = status_to_json(e->status());
+        o.set("etw", kstats::etw_status_json(etw_status_of(*e, *pf)));
+        return o;
     });
     d.add("sample", Capability::Read, [e](const Request& req, const ClientContext&) {
         allow_only(req, {});
@@ -486,7 +541,42 @@ void register_engine_commands(protocol::Dispatcher& d, engine::Engine& engine, c
         throw CommandError(ErrorCode::Internal, "foreground hint could not be checked");
     });
 
+    // ---- kernel tracing (docs/core/etw.md) -----------------------------------------------------
+    d.add("latency", Capability::Read, [e, pf](const Request& req, const ClientContext&) {
+        allow_only(req, {});
+        const kstats::EtwStatus st = etw_status_of(*e, *pf);
+        return kstats::latency_json(st, pf->etw_latency ? pf->etw_latency() : kstats::LatencyView{});
+    });
+    d.add("diskActivity", Capability::Read, [pf](const Request& req, const ClientContext&) {
+        allow_only(req, {});
+        return kstats::disk_activity_json(pf->etw_disk ? pf->etw_disk() : std::vector<kstats::DiskProcessView>{});
+    });
+    d.add("hardFaults", Capability::Read, [pf](const Request& req, const ClientContext&) {
+        allow_only(req, {});
+        return kstats::hard_faults_json(pf->etw_faults ? pf->etw_faults() : std::vector<kstats::FaultProcessView>{});
+    });
+
     // ---- admin --------------------------------------------------------------------------------
+    d.add("setEtw", Capability::Admin, [e, pf](const Request& req, const ClientContext&) {
+        allow_only(req, {"enabled"});
+        const json::Value* v = req.args.find("enabled");
+        if (!v || !v->is_bool()) bad_args("enabled is required (boolean)");
+        const bool enabled = v->as_bool();
+        const bool persisted = e->set_etw(enabled);
+        kstats::EtwStatus st;
+        if (pf->set_etw) {
+            st = pf->set_etw(enabled);
+        } else {
+            st.enabled = enabled;
+            st.reason = "kernel tracing is not available on this platform";
+        }
+        json::Value o = json::Value::object();
+        o.set("enabled", enabled);
+        o.set("running", st.running);
+        o.set("persisted", persisted);
+        if (!st.reason.empty()) o.set("reason", st.reason);
+        return o;
+    });
     d.add("setMode", Capability::Admin, [e](const Request& req, const ClientContext&) {
         allow_only(req, {"mode", "simulation", "optIn"});
         const json::Value* m = req.args.find("mode");

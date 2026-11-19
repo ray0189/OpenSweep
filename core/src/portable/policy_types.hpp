@@ -11,9 +11,17 @@
 
 namespace opensweep::policy {
 
-enum class Area { Memory, Cpu };
+// Disk: candidates from the kernel-tracing disk_hog detector (verified by disk latency).
+enum class Area { Memory, Cpu, Disk };
 
-inline const char* to_string(Area a) noexcept { return a == Area::Memory ? "memory" : "cpu"; }
+inline const char* to_string(Area a) noexcept {
+    switch (a) {
+        case Area::Memory: return "memory";
+        case Area::Disk: return "disk";
+        case Area::Cpu: break;
+    }
+    return "cpu";
+}
 
 // Win32 priority class values (portable copies; the actuator uses the real constants).
 inline constexpr std::uint32_t kPriorityIdle = 0x40;
@@ -49,6 +57,7 @@ struct VerificationMetrics {
     double hard_faults = -1.0;     // hard faults per second
     double cpu_queue = -1.0;       // processor queue length per logical CPU
     double commit_percent = -1.0;  // commit charge / commit limit * 100
+    double disk_latency_ms = -1.0; // max(avg read, avg write) disk latency (appended; Area::Disk primary)
 };
 
 inline VerificationMetrics verification_metrics(const telemetry::Sample& s, std::uint32_t logical_count,
@@ -60,6 +69,8 @@ inline VerificationMetrics verification_metrics(const telemetry::Sample& s, std:
     m.cpu_queue = s.cpu_queue_length >= 0.0 ? s.cpu_queue_length / logical : -1.0;
     if (s.commit_limit > 0)
         m.commit_percent = static_cast<double>(s.commit_total) * 100.0 / static_cast<double>(s.commit_limit);
+    const double lat = s.disk_read_latency_ms > s.disk_write_latency_ms ? s.disk_read_latency_ms : s.disk_write_latency_ms;
+    m.disk_latency_ms = lat >= 0.0 ? lat : -1.0;  // NaN compares false -> unknown
     return m;
 }
 

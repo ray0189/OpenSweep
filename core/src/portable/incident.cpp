@@ -376,6 +376,25 @@ bool IncidentStore::resolve(std::string_view key, std::int64_t now_ms) {
     return true;
 }
 
+bool IncidentStore::add_contributor(std::string_view key, const Contributor& c, std::size_t max_contributors) {
+    Entry* e = newest_with_key(key);
+    if (!e || e->inc.state != State::Open) return false;
+    auto& cs = e->inc.contributors;
+    for (auto& x : cs) {
+        if (x.name == c.name && x.pid == c.pid) {
+            if (c.correlation > x.correlation) {
+                x.correlation = c.correlation;
+                e->dirty = true;
+            }
+            return true;
+        }
+    }
+    if (cs.size() >= max_contributors) return false;
+    cs.push_back(c);
+    e->dirty = true;
+    return true;
+}
+
 const Incident* IncidentStore::find_open(std::string_view key) const {
     for (auto it = items_.rbegin(); it != items_.rend(); ++it) {
         if (it->inc.key == key) return it->inc.state == State::Open ? &it->inc : nullptr;

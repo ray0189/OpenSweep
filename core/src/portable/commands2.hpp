@@ -13,6 +13,7 @@
 #include "commands.hpp"
 #include "engine.hpp"
 #include "json.hpp"
+#include "kernel_stats.hpp"
 #include "protocol.hpp"
 
 namespace opensweep::commands2 {
@@ -43,6 +44,13 @@ struct Platform {
     std::function<json::Value()> diagnostics_extra;
     // Service identity for the diagnostics bundle.
     const commands::ServiceInfo* service = nullptr;
+    // Kernel tracing (docs/core/etw.md). All optional: without them `latency` / `diskActivity` /
+    // `hardFaults` report an empty, not-running view and `setEtw` only persists the switch.
+    std::function<kstats::EtwStatus()> etw_status;
+    std::function<kstats::LatencyView()> etw_latency;                     // last 10 min, top 20
+    std::function<std::vector<kstats::DiskProcessView>()> etw_disk;       // last 2 min, top 20
+    std::function<std::vector<kstats::FaultProcessView>()> etw_faults;    // last 2 min, top 20
+    std::function<kstats::EtwStatus(bool enabled)> set_etw;               // starts / stops the session
 };
 
 // ---- JSON builders (exposed for tests and the diagnostics bundle) ------------------------------
@@ -50,6 +58,7 @@ json::Value sample_to_json(const telemetry::Sample& s);
 json::Value process_to_json(const telemetry::ProcessSample& p);
 json::Value event_to_json(const telemetry::EventRecord& e);       // { tsMs, kind, provider, eventId, level, subject, message, value }
 json::Value status_to_json(const engine::Status& st);
+json::Value kernel_sample_json(const telemetry::Sample& s);       // { valid, running, dpcPercent, ... } (sample.kernel)
 json::Value decision_to_json(const control::Decision& d);
 json::Value policy_to_json(const control::ActivePolicy& p);
 json::Value approval_to_json(const heal::Approval& a);

@@ -130,6 +130,9 @@ public:
     bool touch(std::string_view key, std::int64_t now_ms,
                double observed = std::numeric_limits<double>::quiet_NaN());
     bool resolve(std::string_view key, std::int64_t now_ms);
+    // Adds a contributor to the open incident with this key (no duplicate name + pid; at most
+    // `max_contributors`). Used to attach kernel-trace attribution to existing incidents.
+    bool add_contributor(std::string_view key, const Contributor& c, std::size_t max_contributors = 8);
 
     const Incident* find_open(std::string_view key) const;
     const Incident* find_id(std::string_view id) const;

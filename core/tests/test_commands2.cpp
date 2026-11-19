@@ -412,3 +412,82 @@ TEST(cmd2_responses_stay_below_the_frame_limit) {
     CHECK(bytes <= framing::kMaxResponsePayload);
     CHECK(Env::res(r).find("events")->size() > 100);
 }
+
+// ---- kernel tracing commands (docs/core/etw.md) -------------------------------------------------
+TEST(cmd2_etw_commands_without_platform_session) {
+    Env e;
+    for (const char* c : {"latency", "diskActivity", "hardFaults", "setEtw"}) CHECK(e.d.has(c));
+    // status gains etw:{ running, flags[], eventsLost, costPercent }.
+    const auto st = Env::res(e.call("status"));
+    const auto* etw = st.find("etw");
+    CHECK(etw && etw->find("running") && !etw->find("running")->as_bool());
+    CHECK(etw && etw->find("flags") && etw->find("flags")->is_array());
+    CHECK(etw && is_int(etw->find("eventsLost")) && is_num(etw->find("costPercent")));
+    const auto lat = Env::res(e.call("latency"));
+    CHECK(lat.find("status") && lat.find("system") && lat.find("drivers") && lat.find("drivers")->size() == 0);
+    CHECK(Env::res(e.call("diskActivity")).find("processes")->is_array());
+    CHECK(Env::res(e.call("hardFaults")).find("processes")->is_array());
+    CHECK_EQ(Env::code(e.call("latency", "{\"x\":1}")), std::string("bad_args"));
+    // setEtw: admin only (forbidden before argument checks), strict boolean.
+    CHECK_EQ(Env::code(e.call("setEtw", "{\"bogus\":1}")), std::string("forbidden"));
+    CHECK_EQ(Env::code(e.call("setEtw", "{}", true)), std::string("bad_args"));
+    CHECK_EQ(Env::code(e.call("setEtw", "{\"enabled\":1}", true)), std::string("bad_args"));
+    const auto r = e.call("setEtw", "{\"enabled\":false}", true);
+    CHECK(Env::ok(r));
+    CHECK(!Env::res(r).find("enabled")->as_bool());
+    CHECK(!Env::res(r).find("running")->as_bool());
+    CHECK(e.rig.io.files["/data/config.json"].find("\"etw\":false") != std::string::npos);
+    CHECK(!e.rig.eng->etw_enabled());
+}
+
+TEST(cmd2_etw_commands_with_platform_session) {
+    Env e;
+    bool enabled = true;
+    e.platform.etw_status = [&] {
+        kstats::EtwStatus s;
+        s.enabled = enabled;
+        s.running = enabled;
+        s.flags = kstats::flags_for_level(enabled ? 0 : 3);
+        s.events_lost = 2;
+        s.cost_percent = 0.3;
+        return s;
+    };
+    e.platform.etw_latency = [] {
+        kstats::LatencyView v;
+        kstats::DriverStats d;
+        d.name = "ndis.sys";
+        d.dpc_count = 5;
+        d.dpc_us = 900;
+        d.max_us = 400;
+        d.histogram[3] = 5;
+        v.drivers.push_back(d);
+        v.dpc_percent = 0.1;
+        return v;
+    };
+    e.platform.etw_disk = [] {
+        return std::vector<kstats::DiskProcessView>{{1234, "backup.exe", 1000.0, 2000.0, 7, 1.5, 9.0}};
+    };
+    e.platform.etw_faults = [] { return std::vector<kstats::FaultProcessView>{{1234, "backup.exe", 55.5}}; };
+    e.platform.set_etw = [&](bool on) {
+        enabled = on;
+        return e.platform.etw_status();
+    };
+    const json::Value status = Env::res(e.call("status"));  // copy: never point into a temporary
+    const json::Value* st = status.find("etw");
+    CHECK(st && st->find("running")->as_bool() && st->find("flags")->size() == 7);
+    const auto lat = Env::res(e.call("latency"));
+    CHECK(lat.find("drivers")->size() == 1);
+    const auto& d = lat.find("drivers")->as_array()[0];
+    CHECK_EQ(d.find("name")->as_string(), std::string("ndis.sys"));
+    CHECK(d.find("histogram")->size() == 8);
+    CHECK(lat.find("status")->find("eventsLost")->as_int() == 2);
+    const auto disk = Env::res(e.call("diskActivity")).find("processes")->as_array();
+    CHECK(disk.size() == 1 && disk[0].find("pid")->as_int() == 1234 && disk[0].find("writeBps")->as_double() == 2000.0);
+    const auto hf = Env::res(e.call("hardFaults")).find("processes")->as_array();
+    CHECK(hf.size() == 1 && hf[0].find("faultsPerSec")->as_double() == 55.5);
+    const auto off = Env::res(e.call("setEtw", "{\"enabled\":false}", true));
+    CHECK(!off.find("enabled")->as_bool() && !off.find("running")->as_bool());
+    CHECK(!Env::res(e.call("status")).find("etw")->find("running")->as_bool());
+    const auto on = Env::res(e.call("setEtw", "{\"enabled\":true}", true));
+    CHECK(on.find("enabled")->as_bool() && on.find("running")->as_bool());
+}

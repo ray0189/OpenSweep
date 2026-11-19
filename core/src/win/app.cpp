@@ -11,6 +11,7 @@
 #include "commands.hpp"
 #include "commands2.hpp"
 #include "engine.hpp"
+#include "etw.hpp"
 #include "events.hpp"
 #include "heal_executor.hpp"
 #include "log.hpp"
@@ -92,6 +93,17 @@ int run_core(HANDLE stop_event, const std::function<void()>& on_ready) {
     engine::Engine engine(actuator, executor, io, std::move(opts));
     engine.start();  // loads state and rolls back anything a crash left applied
 
+    // ---- kernel tracing (docs/core/etw.md) --------------------------------------------------------
+    KernelSession::Options etw_opts;
+    etw_opts.logical_processors = topo.logical_processors > 0 ? topo.logical_processors : 1;
+    KernelSession etw(etw_opts);
+    if (engine.etw_enabled()) {
+        if (!etw.start()) log::warn("kernel tracing unavailable: " + etw.status().reason);
+    } else {
+        etw.set_enabled(false);
+        log::info("kernel tracing disabled by config.json (etw:false)");
+    }
+
     // ---- IPC ------------------------------------------------------------------------------------
     CpuSampler cpu;  // Phase 1 `metrics` (GetSystemTimes; no PDH, so no duplicate counter query)
     cpu.start();
@@ -106,8 +118,14 @@ int run_core(HANDLE stop_event, const std::function<void()>& on_ready) {
     platform.report_foreground = [&slots](std::uint32_t pid, std::uint32_t session) {
         return check_foreground(slots, pid, session);
     };
-    platform.diagnostics_extra = [&slots, &file_io, &data_dir]() {
+    platform.etw_status = [&etw] { return etw.status(); };
+    platform.etw_latency = [&etw] { return etw.latency(); };
+    platform.etw_disk = [&etw] { return etw.disk_activity(); };
+    platform.etw_faults = [&etw] { return etw.hard_faults(); };
+    platform.set_etw = [&etw](bool on) { return etw.set_enabled(on); };
+    platform.diagnostics_extra = [&slots, &file_io, &data_dir, &etw]() {
         json::Value o = json::Value::object();
+        o.set("etw", etw.diagnostics());
         std::lock_guard<std::mutex> lock(slots.mu);
         if (slots.sys) {
             o.set("collectLastUs", slots.sys->last_collect_us());
@@ -133,6 +151,7 @@ int run_core(HANDLE stop_event, const std::function<void()>& on_ready) {
         std::lock_guard<std::mutex> lock(slots.mu);
         bool ok = slots.sys && slots.sys->collect(s);
         collect_failures = ok ? 0 : collect_failures + 1;
+        if (ok) etw.fill_sample(s);  // kernel fields + per-process hard faults (interval since last tick)
         if (slots.events) {
             if (slots.events->poll(ev))
                 event_failures = 0;
@@ -178,6 +197,7 @@ int run_core(HANDLE stop_event, const std::function<void()>& on_ready) {
             runner.stop();
         }
     }
+    etw.stop();  // ControlTrace(STOP) + CloseTrace + consumer join (bounded), before the engine shuts down
     const auto rb = engine.shutdown();  // rolls back every OpenSweep policy, persists state
     cpu.stop();
     log::info("stopped (exit code " + std::to_string(exit_code) + ", policies restored " + std::to_string(rb.restored) +

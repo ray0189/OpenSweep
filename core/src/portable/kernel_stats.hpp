@@ -246,6 +246,7 @@ private:
     void add_disk(Acc& a, std::uint32_t pid, std::uint64_t bytes, bool write, double latency_ms);
     void add_fault(Acc& a, std::uint32_t pid);
     void close_window();
+    void note_time(std::int64_t ts_ms);
     Window to_window(const Acc& a, std::int64_t end_ms) const;
     // Closed windows overlapping [now - span, now] plus the open window, merged.
     Window merged(std::int64_t now_ms, std::int64_t span_ms, std::int64_t& covered_ms);
@@ -262,6 +263,7 @@ private:
     std::deque<Window> windows_;
     Counters counters_;
     std::uint64_t events_lost_ = 0;
+    std::int64_t first_ms_ = -1;  // first activity: rates are never computed over time before it
 };
 
 // ---------------------------------------------------------------------------------------------

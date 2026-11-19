@@ -398,15 +398,24 @@ bool ControlEngine::improved(const ActivePolicy& ap, const policy::VerificationM
     const M hf{b.hard_faults, after.hard_faults, 5.0, "hard_faults"};
     const M q{b.cpu_queue, after.cpu_queue, 0.25, "cpu_queue"};
     const M cm{b.commit_percent, after.commit_percent, 1.0, "commit_percent"};
+    const M dl{b.disk_latency_ms, after.disk_latency_ms, 2.0, "disk_latency_ms"};
     for (const M* m : {&fg, &hf, &q, &cm}) {
         if (m->known() && m->after > m->before * (1.0 + cfg_.worsen_threshold) + m->floor) {
             why = std::string("worsened: ") + m->name + " " + fmt(m->before) + " -> " + fmt(m->after);
             return false;
         }
     }
+    // Disk latency is a worsening signal only for disk policies (it is noisy for the others).
+    if (ap.rec.area == policy::Area::Disk && dl.known() &&
+        dl.after > dl.before * (1.0 + cfg_.worsen_threshold) + dl.floor) {
+        why = std::string("worsened: ") + dl.name + " " + fmt(dl.before) + " -> " + fmt(dl.after);
+        return false;
+    }
     const M* primary = nullptr;
     if (ap.rec.area == policy::Area::Cpu)
         primary = fg.known() ? &fg : (q.known() ? &q : nullptr);
+    else if (ap.rec.area == policy::Area::Disk)
+        primary = dl.known() ? &dl : (fg.known() ? &fg : nullptr);
     else
         primary = hf.known() ? &hf : (cm.known() ? &cm : (fg.known() ? &fg : nullptr));
     if (!primary) {

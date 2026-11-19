@@ -55,6 +55,10 @@ jobs:
       # (collect() cost, PDH counter availability, event backfill sample) appear in the log.
       - name: Windows collectors / events / actuator tests (verbose)
         run: core/build/Release/core_win_tests.exe
+      # Kernel trace session (docs/core/etw.md): prints the top drivers (DPC/ISR), disk attribution of
+      # the generated workload, the consumer cost and the counters; asserts no orphan session remains.
+      - name: Kernel tracing (ETW) session test (verbose)
+        run: core/build/Release/core_win_tests.exe win_etw
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -73,3 +77,10 @@ jobs:
           'bench/run.ps1 parses'
       - name: IPC + service lifecycle integration test
         run: node test/core-ipc.js core/build/Release/OpenSweepCore.exe
+      # After the unit tests and the service lifecycle test: no kernel session may be left behind.
+      - name: No orphan OpenSweepCoreKernel session
+        shell: pwsh
+        run: |
+          $out = logman query -ets | Out-String
+          $out
+          if ($out -match 'OpenSweepCoreKernel') { Write-Error 'orphan OpenSweepCoreKernel session'; exit 1 }

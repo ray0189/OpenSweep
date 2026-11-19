@@ -38,6 +38,12 @@ guard::GuardConfig guard_config(const EngineOptions& o) {
     return g;
 }
 
+kguard::KernelGuardConfig kernel_guard_config(const EngineOptions& o) {
+    kguard::KernelGuardConfig g = o.kernel_guard;
+    g.logical_processors = o.topology.logical_count;
+    return g;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -49,6 +55,7 @@ json::Value settings_to_json(const Settings& s) {
     json::Value kinds = json::Value::array();
     for (PolicyKind k : s.opted_in) kinds.push_back(telemetry::to_string(k));
     v.set("optIn", std::move(kinds));
+    v.set("etw", s.etw);
     return v;
 }
 
@@ -58,7 +65,7 @@ std::optional<Settings> settings_from_json(const json::Value& v, std::string& er
         return std::nullopt;
     }
     for (const auto& [key, val] : v.as_object()) {
-        if (key != "version" && key != "mode" && key != "simulation" && key != "optIn") {
+        if (key != "version" && key != "mode" && key != "simulation" && key != "optIn" && key != "etw") {
             error = "unknown key in config";
             return std::nullopt;
         }
@@ -96,6 +103,13 @@ std::optional<Settings> settings_from_json(const json::Value& v, std::string& er
             }
             s.opted_in.push_back(*kind);
         }
+    }
+    if (const json::Value* etw = v.find("etw")) {
+        if (!etw->is_bool()) {
+            error = "etw must be a boolean";
+            return std::nullopt;
+        }
+        s.etw = etw->as_bool();
     }
     return s;
 }
@@ -186,6 +200,7 @@ Engine::Engine(telemetry::Actuator& actuator, heal::Executor& executor, trace::F
       jio_(io),
       cfg_(load_settings(io, join_path(options_.data_dir, kConfigFile))),
       guard_(guard_config(options_)),
+      kernel_guard_(kernel_guard_config(options_)),
       memory_(options_.memory),
       scheduler_(options_.scheduler),
       journal_(jio_, join_path(options_.data_dir, kJournalFile), options_.journal),
@@ -247,7 +262,7 @@ std::vector<std::uint32_t> Engine::suspected_leak_pids_locked() const {
 }
 
 void Engine::capture_incidents_locked(std::int64_t t) {
-    for (const auto& id : guard_.last_opened()) {
+    for (const auto& id : opened_) {
         if (options_.max_captures == 0) break;
         IncidentCapture c;
         c.incident_id = id;
@@ -259,7 +274,7 @@ void Engine::capture_incidents_locked(std::int64_t t) {
 }
 
 void Engine::propose_recoveries_locked(std::int64_t t) {
-    for (const auto& id : guard_.last_opened()) {
+    for (const auto& id : opened_) {
         const incident::Incident* inc = incidents_.find_id(id);
         if (!inc || inc->state != incident::State::Open) continue;
         heal::RecoveryRequest req;
@@ -347,8 +362,7 @@ void Engine::tick(const Sample& s, std::span<const EventRecord> events) {
     baselines_.observe_events(fresh);
     // DETECT (incidents with evidence + confidence)
     guard_.evaluate(s, fresh, baselines_, incidents_);
-    capture_incidents_locked(t);
-    propose_recoveries_locked(t);
+    opened_ = guard_.last_opened();
 
     // CLASSIFY / RECOMMEND
     memory::MemoryInputs min;
@@ -370,10 +384,22 @@ void Engine::tick(const Sample& s, std::span<const EventRecord> events) {
     sin.fg_latency_ms = std::nullopt;
     const sched::SchedulerAssessment sa = scheduler_.assess(s, options_.topology, sin);
 
+    // Kernel-trace detectors (driver_latency, disk_hog, paging_hog); no-op without kernel data.
+    kguard::KernelInputs kin;
+    kin.memory_level = ma.level;
+    kin.ecoqos_active = sin.opensweep_ecoqos_pids;
+    kin.memory_priority_active = control_.active_pids(PolicyKind::MemoryPriority);
+    kguard::KernelAssessment ka = kernel_guard_.evaluate(s, baselines_, incidents_, kin);
+    opened_.insert(opened_.end(), ka.opened.begin(), ka.opened.end());
+    if (s.kernel_valid) kernel_notes_ = std::move(ka.notes);
+    capture_incidents_locked(t);
+    propose_recoveries_locked(t);
+
     std::vector<policy::Recommendation> recs;
-    recs.reserve(ma.recommendations.size() + sa.recommendations.size());
+    recs.reserve(ma.recommendations.size() + sa.recommendations.size() + ka.recommendations.size());
     recs.insert(recs.end(), ma.recommendations.begin(), ma.recommendations.end());
     recs.insert(recs.end(), sa.recommendations.begin(), sa.recommendations.end());
+    recs.insert(recs.end(), ka.recommendations.begin(), ka.recommendations.end());
 
     // DECIDE / APPLY / VERIFY (write-ahead journal inside the control engine)
     const policy::VerificationMetrics vm =
@@ -392,7 +418,7 @@ void Engine::tick(const Sample& s, std::span<const EventRecord> events) {
     for (const auto& n : heal_->drain_notifications()) log("heal: " + n.kind + " " + n.detail);
 
     // PERSIST
-    const bool inc_changed = !guard_.last_opened().empty() || incidents_.size() != last_incident_size_ ||
+    const bool inc_changed = !opened_.empty() || incidents_.size() != last_incident_size_ ||
                              incidents_.open_count() != last_incident_open_;
     last_incident_size_ = incidents_.size();
     last_incident_open_ = incidents_.open_count();
@@ -528,7 +554,12 @@ std::vector<IncidentCapture> Engine::captures() const {
 
 std::size_t Engine::tracked_processes() const {
     std::lock_guard<std::mutex> lock(mu_);
-    return guard_.tracked_processes() + scheduler_.tracked();
+    return guard_.tracked_processes() + scheduler_.tracked() + kernel_guard_.tracked_processes();
+}
+
+std::vector<std::string> Engine::kernel_notes() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return kernel_notes_;
 }
 
 // ---- admin side -----------------------------------------------------------------------------
@@ -553,7 +584,7 @@ ModeResult Engine::set_mode(Mode m, std::optional<bool> simulation, std::optiona
     r.ok = mc.ok;
     if (!mc.ok) r.error = "mode change refused: the journal cannot record it (fail-safe)";
 
-    Settings next;
+    Settings next = cfg_.settings;
     next.mode = control_.mode();
     next.simulation = control_.config().simulation;
     next.opted_in = control_.config().opted_in;
@@ -614,6 +645,22 @@ ApproveResult Engine::approve(const std::string& id) {
     r.kind = ApproveResult::Kind::Unknown;
     r.detail = "unknown approval id";
     return r;
+}
+
+bool Engine::set_etw(bool enabled) {
+    std::lock_guard<std::mutex> lock(mu_);
+    const bool before = cfg_.settings.etw;
+    cfg_.settings.etw = enabled;
+    const bool ok = save_settings_locked(cfg_.settings);
+    if (!ok) log("config.json could not be written; the etw switch will not survive a restart");
+    if (before != enabled)
+        record_config_event(now(), std::string("Kernel tracing (ETW) ") + (enabled ? "enabled" : "disabled"));
+    return ok;
+}
+
+bool Engine::etw_enabled() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return cfg_.settings.etw;
 }
 
 std::optional<std::string> Engine::write_data_file(std::string_view name, std::string_view data) {
