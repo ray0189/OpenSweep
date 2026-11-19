@@ -13,7 +13,8 @@ namespace opensweep::win {
 
 namespace {
 
-constexpr DWORD kStopWaitHintMs = 5000;  // the core stops well within this (pipe cancel budget: 2 s)
+// Stop: pipe cancel (<= 2 s) + last engine tick + policy rollback + state persistence.
+constexpr DWORD kStopWaitHintMs = 15000;
 constexpr DWORD kStartWaitHintMs = 5000;
 
 std::mutex g_status_mu;

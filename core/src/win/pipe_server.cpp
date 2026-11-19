@@ -165,6 +165,7 @@ void PipeServer::identify_client(Instance& inst) {
     inst.identified = true;
     std::string sid = "unknown";
     bool admin = false;
+    std::uint32_t session_id = protocol::kUnknownSession;
     if (ImpersonateNamedPipeClient(inst.pipe)) {
         HANDLE token = nullptr;
         if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) {
@@ -178,13 +179,25 @@ void PipeServer::identify_client(Instance& inst) {
                     LocalFree(str);
                 }
             }
+            // admin = Administrators group *enabled* in the client token (CheckTokenMembership ignores
+            // deny-only groups, so a UAC-filtered token fails) AND the token is elevated.
             BYTE admins[SECURITY_MAX_SID_SIZE];
             DWORD admins_size = sizeof(admins);
             BOOL member = FALSE;
+            TOKEN_ELEVATION elevation{};
+            DWORD elevation_len = 0;
             if (CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, admins, &admins_size) &&
-                CheckTokenMembership(token, admins, &member) && member) {
+                CheckTokenMembership(token, admins, &member) && member &&
+                GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &elevation_len) &&
+                elevation.TokenIsElevated) {
                 admin = true;
             }
+            // Session of the *token* (not of the process id, which a client could have recycled, and
+            // never a value from the request): used by reportForeground.
+            DWORD session = 0;
+            DWORD session_len = 0;
+            if (GetTokenInformation(token, TokenSessionId, &session, sizeof(session), &session_len))
+                session_id = session;
             CloseHandle(token);
         }
         if (!RevertToSelf()) {
@@ -194,10 +207,13 @@ void PipeServer::identify_client(Instance& inst) {
             TerminateProcess(GetCurrentProcess(), 1);
         }
     }
-    // Phase 1: every client allowed by the pipe ACL gets `read`. `admin` (no Phase 1 command
-    // requires it) is granted only to tokens with the Administrators group enabled (elevated).
+    // Every client allowed by the pipe ACL gets `read`; `admin` (setMode, rollbackAll, disablePolicy,
+    // approve, exportDiagnostics) only elevated Administrators. If the token cannot be read (e.g. an
+    // anonymous-level client), the client keeps `read` only and an unknown session.
     if (admin) inst.ctx.capabilities |= protocol::cap_bit(protocol::Capability::Admin);
-    log::info("client identified " + pid_str(inst.client_pid) + " sid=" + sid + " admin=" + (admin ? "yes" : "no"));
+    inst.ctx.session_id = session_id;
+    log::info("client identified " + pid_str(inst.client_pid) + " sid=" + sid + " admin=" + (admin ? "yes" : "no") +
+              " session=" + (session_id == protocol::kUnknownSession ? std::string("unknown") : std::to_string(session_id)));
 }
 
 void PipeServer::begin_read(Instance& inst) {

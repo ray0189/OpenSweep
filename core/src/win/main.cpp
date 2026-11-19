@@ -70,7 +70,7 @@ int run_console() {
         return 1;
     }
     const int code = win::run_core(g_console_stop, [] {
-        std::fprintf(stderr, "Listening on \\\\.\\pipe\\OpenSweepCore.v1 (mode: monitor). Press Ctrl+C to stop.\n");
+        std::fprintf(stderr, "Listening on \\\\.\\pipe\\OpenSweepCore.v1. Press Ctrl+C to stop.\n");
     });
     SetEvent(g_console_done);
     return code;
@@ -78,7 +78,7 @@ int run_console() {
 
 void print_usage() {
     std::printf(
-        "OpenSweepCore %s - OpenSweep Core monitoring service (IPC protocol %lld)\n"
+        "OpenSweepCore %s - OpenSweep Core service (IPC protocol %lld)\n"
         "\n"
         "Usage:\n"
         "  OpenSweepCore.exe                 run as a Windows service (started by the SCM)\n"

@@ -8,6 +8,7 @@
 #include <string>
 
 #include "log.hpp"
+#include "process_info.hpp"
 
 namespace opensweep::win {
 
@@ -53,7 +54,10 @@ bool detect_topology(commands::TopologyInfo& out) {
         switch (info->Relationship) {
             case RelationProcessorCore: {
                 ++out.cores;
-                const std::size_t cls = info->Processor.EfficiencyClass;  // higher = more performant (documented)
+                // PROCESSOR_RELATIONSHIP is { BYTE Flags; BYTE EfficiencyClass; BYTE Reserved[20]; ... }.
+                // Older SDK / MinGW headers declare `BYTE Reserved[21]` instead of EfficiencyClass, so the
+                // byte after Flags is read directly (documented ABI). Higher = more performant.
+                const std::size_t cls = reinterpret_cast<const BYTE*>(&info->Processor.Flags)[1];
                 if (out.efficiency_classes.size() <= cls) out.efficiency_classes.resize(cls + 1, 0);
                 ++out.efficiency_classes[cls];
                 for (WORD g = 0; g < info->Processor.GroupCount; ++g)
@@ -87,6 +91,47 @@ bool detect_topology(commands::TopologyInfo& out) {
               " groups=" + std::to_string(out.groups) + " l3=" + std::to_string(out.l3_caches) +
               " hybrid=" + (out.hybrid() ? "yes" : "no"));
     return out.logical_processors > 0;
+}
+
+bool detect_cpu_sets(std::vector<commands2::CpuSetInfo>& out) {
+    out.clear();
+    using Fn = BOOL(WINAPI*)(void*, ULONG, PULONG, HANDLE, ULONG);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    const auto fn = k32 ? reinterpret_cast<Fn>(reinterpret_cast<void (*)()>(GetProcAddress(k32, "GetSystemCpuSetInformation")))
+                        : nullptr;
+    if (!fn) {
+        log::warn("GetSystemCpuSetInformation unavailable; topology.cpuSets is empty");
+        return false;
+    }
+    ULONG len = 0;
+    fn(nullptr, 0, &len, nullptr, 0);
+    if (len == 0 || len > 4u * 1024u * 1024u) {
+        log::warn("GetSystemCpuSetInformation (size query) failed: " + log::win32_error(GetLastError()));
+        return false;
+    }
+    std::unique_ptr<std::max_align_t[]> storage(new std::max_align_t[(len + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t)]);
+    if (!fn(storage.get(), len, &len, nullptr, 0)) {
+        log::warn("GetSystemCpuSetInformation failed: " + log::win32_error(GetLastError()));
+        return false;
+    }
+    const auto* base = reinterpret_cast<const std::byte*>(storage.get());
+    ULONG offset = 0;
+    while (offset + 8 <= len) {
+        const auto* e = reinterpret_cast<const procinfo::abi::CpuSetEntry*>(base + offset);
+        if (e->Size == 0 || offset + e->Size > len) break;  // defensive: malformed entry
+        if (e->Type == 0 && e->Size >= sizeof(procinfo::abi::CpuSetEntry)) {
+            commands2::CpuSetInfo c;
+            c.id = e->Id;
+            c.group = e->Group;
+            c.core = e->CoreIndex;
+            c.efficiency_class = e->EfficiencyClass;
+            c.numa = e->NumaNodeIndex;
+            out.push_back(c);
+        }
+        offset += e->Size;
+    }
+    log::info("cpu sets: " + std::to_string(out.size()));
+    return !out.empty();
 }
 
 }  // namespace opensweep::win

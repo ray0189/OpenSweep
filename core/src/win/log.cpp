@@ -16,8 +16,9 @@ namespace {
 
 constexpr ULONGLONG kMaxLogBytes = 1024 * 1024;  // rotate at 1 MiB
 constexpr std::size_t kMaxMessageChars = 1024;
-// Log directories: SYSTEM and Administrators only, inherited by files created inside.
-constexpr const wchar_t* kDirSddl = L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+// Data/log directories: SYSTEM and Administrators full control, Users read, inherited by files
+// created inside. Must stay identical to win::kDataDirSddl (storage.hpp): both re-apply it at start.
+constexpr const wchar_t* kDirSddl = L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)";
 
 struct State {
     std::mutex mu;

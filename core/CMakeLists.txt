@@ -50,6 +50,8 @@ add_library(opensweep_portable STATIC
   src/portable/journal.cpp
   src/portable/control.cpp
   src/portable/heal.cpp
+  src/portable/engine.cpp
+  src/portable/commands2.cpp
 )
 target_include_directories(opensweep_portable PUBLIC src/portable)
 opensweep_set_warnings(opensweep_portable)
@@ -74,6 +76,8 @@ add_executable(core_tests
   tests/test_journal.cpp
   tests/test_control.cpp
   tests/test_heal.cpp
+  tests/test_engine.cpp
+  tests/test_commands2.cpp
 )
 target_link_libraries(core_tests PRIVATE opensweep_portable)
 opensweep_set_warnings(core_tests)
@@ -94,6 +98,8 @@ if(WIN32)
     src/win/events.cpp
     src/win/actuator.cpp
     src/win/process_info.cpp
+    src/win/storage.cpp
+    src/win/heal_executor.cpp
   )
   target_link_libraries(OpenSweepCore PRIVATE pdh wevtapi)  # collectors (PDH) + events (wevtapi)
   target_include_directories(OpenSweepCore PRIVATE src/win)
