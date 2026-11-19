@@ -530,12 +530,16 @@ struct EventCollector::Impl {
                 }
             } else {
                 if (emitted >= opt.max_per_poll) break;
+                // Pull subscription: only call EvtNext when the signal is set, otherwise it can
+                // fail with ERROR_INVALID_OPERATION (Microsoft's pull-subscription sample does the same).
+                if (signal && WaitForSingleObject(signal, 0) != WAIT_OBJECT_0) break;
                 want = static_cast<DWORD>(std::min<std::size_t>(kBatch, opt.max_per_poll - emitted));
             }
             DWORD returned = 0;
             if (!EvtNext(sub, want, batch, 0, 0, &returned)) {
                 const DWORD err = GetLastError();
-                if (err == ERROR_NO_MORE_ITEMS || err == ERROR_TIMEOUT) {
+                if (err == ERROR_NO_MORE_ITEMS || err == ERROR_TIMEOUT || err == ERROR_INVALID_OPERATION) {
+                    if (signal) ResetEvent(signal);
                     finish_backfill(out);
                     break;
                 }

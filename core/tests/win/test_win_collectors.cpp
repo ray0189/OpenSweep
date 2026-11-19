@@ -58,7 +58,9 @@ struct Child {
         buf.push_back(L'\0');
         STARTUPINFOW si{};
         si.cb = sizeof(si);
-        if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        // Explicit NORMAL priority: CI runners may start jobs below normal and children inherit it.
+        if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
+                            nullptr, nullptr, &si, &pi)) {
             std::fprintf(stderr, "  CreateProcess(ping) failed: %lu\n", GetLastError());
             return;
         }
@@ -66,6 +68,11 @@ struct Child {
         target.pid = pi.dwProcessId;
         target.name = "PING.EXE";
         procinfo::creation_time_ms(pi.hProcess, target.process_start_ms);
+        // Memory priority is inherited too; reset it to normal (5) so the actuator has room to lower it.
+        struct { ULONG MemoryPriority; } mpi{5};  // MEMORY_PRIORITY_NORMAL (mirrored: SDK guards vary)
+        if (!SetProcessInformation(pi.hProcess, ProcessMemoryPriority, &mpi, sizeof(mpi)))
+            std::printf("  note: could not reset child memory priority: %lu\n", GetLastError());
+        std::printf("  child priority class=0x%lx\n", GetPriorityClass(pi.hProcess));
         Sleep(200);  // let the process finish initialising
     }
     void kill() {
