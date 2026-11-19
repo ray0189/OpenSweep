@@ -73,7 +73,7 @@ if(WIN32)
     src/win/log.cpp
   )
   target_include_directories(OpenSweepCore PRIVATE src/win)
-  target_link_libraries(OpenSweepCore PRIVATE opensweep_portable advapi32 kernel32 psapi shell32 ole32)
+  target_link_libraries(OpenSweepCore PRIVATE opensweep_portable advapi32 kernel32 psapi shell32 ole32 uuid)
   opensweep_set_warnings(OpenSweepCore)
   if(MSVC)
     # Console subsystem: --console/--install/--version print to the console; the SCM ignores it.

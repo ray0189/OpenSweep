@@ -1,4 +1,6 @@
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <string>
 
 #include "json.hpp"
@@ -184,7 +186,7 @@ TEST(json_numbers) {
     CHECK_EQ(serialize(Value(0.5)), std::string("0.5"));
     CHECK_EQ(serialize(Value(3.0)), std::string("3"));
     CHECK_EQ(serialize(Value(std::nan(""))), std::string("null"));
-    CHECK_EQ(serialize(Value(INFINITY)), std::string("null"));
+    CHECK_EQ(serialize(Value(std::numeric_limits<double>::infinity())), std::string("null"));
 
     // Round trip of a double.
     auto pi = parse(serialize(Value(3.141592653589793)));
