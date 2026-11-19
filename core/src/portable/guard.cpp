@@ -713,7 +713,10 @@ struct Guard::Impl {
         const double pct = trace::metric_value(s, Metric::CommitPercent);
         if (!std::isfinite(pct)) return;
         const Growth g = system_growth(&SysPoint::commit_pct, 10);
-        const auto tte = g.ok ? stats::time_to_threshold(pct, g.slope, 100.0) : std::nullopt;
+        // Extrapolate only a steady climb: a one-off step (an application starting) also produces a
+        // positive Theil-Sen slope over a short window but is not a trend.
+        const bool steady = g.ok && g.n >= 5 && g.inc >= cfg.commit_min_increasing;
+        const auto tte = steady ? stats::time_to_threshold(pct, g.slope, 100.0) : std::nullopt;
         const bool on = pct >= cfg.commit_high_percent ||
                         (pct >= cfg.commit_warn_percent && tte && *tte <= cfg.commit_tte_minutes);
         const bool off = pct < cfg.commit_resolve_percent;

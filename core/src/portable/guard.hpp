@@ -19,8 +19,8 @@
 //                        a running peak larger than 25 % of the growth (sawtooth guard), span >= 10
 //                        min. "suspected leak" once >= 90 % increasing over >= 20 min. Resolves after
 //                        10 min with slope < 0.5 MB/min, or when the process is gone.
-//   commit_exhaustion    commit % >= 90, or >= 80 with linear time-to-100 % <= 30 min (10-min slope),
-//                        for 60 s. Resolves below 75 % for 5 min. Contributors: processes whose private
+//   commit_exhaustion    commit % >= 90, or >= 80 with linear time-to-100 % <= 30 min (10-min
+//                        Theil-Sen slope, only when >= 70 % of those minutes rose), for 60 s. Resolves below 75 % for 5 min. Contributors: processes whose private
 //                        bytes moved with commit (Pearson r >= 0.6, growth > 0).
 //   cpu_runaway          a non-foreground process >= 90 % of one logical processor for 5 min.
 //                        Resolves below 50 % (or foreground) for 2 min.
@@ -117,6 +117,7 @@ struct GuardConfig {
     double commit_high_percent = 90.0;
     double commit_warn_percent = 80.0;
     double commit_tte_minutes = 30.0;
+    double commit_min_increasing = 0.7;   // fraction of rising minutes needed to extrapolate
     double commit_resolve_percent = 75.0;
     std::int64_t commit_open_ms = kMinute;
     std::int64_t commit_resolve_ms = 5 * kMinute;

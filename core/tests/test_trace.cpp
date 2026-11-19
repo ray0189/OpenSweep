@@ -169,8 +169,9 @@ TEST(trace_events_bounded_newest_first) {
     CHECK_EQ(ev.size(), 3u);
     CHECK_EQ(ev[0].ts_ms, 2599);
     CHECK_EQ(ev[2].ts_ms, 2597);
-    CHECK_EQ(t.events().size(), kMaxEvents);
-    CHECK_EQ(t.events().back().ts_ms, 600);
+    const auto all = t.events();
+    CHECK_EQ(all.size(), kMaxEvents);
+    CHECK(!all.empty() && all.back().ts_ms == 600);
 }
 
 TEST(trace_crc32_known_vector) {
@@ -305,7 +306,7 @@ TEST(trace_persistence_corrupt_block_skipped) {
         pos += 16 + u32(pos + 8);
     }
     CHECK(tier1_payload > 0);
-    bytes[tier1_payload + 100] ^= 0x5A;
+    bytes[tier1_payload + 100] = static_cast<char>(bytes[tier1_payload + 100] ^ 0x5A);
     Trace u;
     const auto rep = u.deserialize(bytes);
     CHECK_EQ(rep.corrupt, 1u);
@@ -338,7 +339,10 @@ TEST(trace_persistence_truncation_and_garbage_never_crash) {
     for (int i = 0; i < 200; ++i) {
         std::string g = bytes;
         const int flips = 1 + static_cast<int>(rng() % 8);
-        for (int f = 0; f < flips; ++f) g[rng() % g.size()] ^= static_cast<char>(1 + rng() % 255);
+        for (int f = 0; f < flips; ++f) {
+            const std::size_t k = rng() % g.size();
+            g[k] = static_cast<char>(g[k] ^ static_cast<char>(1 + rng() % 255));
+        }
         Trace v;
         const auto r = v.deserialize(g);
         CHECK(r.loaded <= total);
@@ -380,7 +384,8 @@ TEST(trace_events_jsonl_persist_load_compact) {
     Trace u;
     auto rep = u.load_events(io, "events.jsonl");
     CHECK(rep.found && rep.loaded == 15u && rep.corrupt == 0u);
-    CHECK_EQ(u.events(1)[0].subject, std::string("s14"));
+    const auto newest = u.events(1);
+    CHECK(!newest.empty() && newest[0].subject == "s14");
 
     // Corrupt one line and append a torn (partial) line: both are skipped and counted.
     std::string& f = io.files["events.jsonl"];
@@ -405,7 +410,8 @@ TEST(trace_events_jsonl_persist_load_compact) {
     Trace back;
     rep = back.load_events(io2, "e.jsonl");
     CHECK_EQ(back.event_count(), kMaxEvents);
-    CHECK_EQ(back.events(1)[0].ts_ms, 1000 + 8999);
+    const auto newest_big = back.events(1);
+    CHECK(!newest_big.empty() && newest_big[0].ts_ms == 1000 + 8999);
 
     // A failed write keeps events pending for the next attempt.
     MemFileIO io3;

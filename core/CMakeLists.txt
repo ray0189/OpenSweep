@@ -65,6 +65,10 @@ add_executable(core_tests
   tests/test_ringbuffer.cpp
   tests/test_stats.cpp
   tests/test_commands.cpp
+  tests/test_trace.cpp
+  tests/test_baseline.cpp
+  tests/test_incident.cpp
+  tests/test_guard.cpp
   tests/test_scheduler_policy.cpp
   tests/test_memory_policy.cpp
   tests/test_journal.cpp

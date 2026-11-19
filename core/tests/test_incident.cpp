@@ -188,8 +188,9 @@ TEST(incident_store_bounded_and_ids_unique) {
     CHECK_EQ(st.size(), 500u);
     // Open incidents are evicted last: all 400 open ones from i%3==0 within the last ... remain if possible.
     CHECK(st.open_count() == 400u);
-    CHECK_EQ(st.list(10).size(), 10u);
-    CHECK_EQ(st.list(10)[0].key, std::string("k1199"));
+    const auto top10 = st.list(10);
+    CHECK_EQ(top10.size(), 10u);
+    CHECK(!top10.empty() && top10[0].key == "k1199");
 }
 
 TEST(incident_store_persistence) {
