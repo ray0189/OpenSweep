@@ -4,6 +4,7 @@
 // journal, heal) consumes them. See docs/core/phases-2-8.md for the contract.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -39,6 +40,40 @@ struct ProcessSample {
                                         // non-ETW API, so hard_faults_per_sec stays 0
 };
 
+// Kernel tracing (ETW, docs/core/etw.md) per-sample data. Values cover the interval since the
+// previous sample (normally 2 s). Names are driver file names / process image names only.
+struct KernelDriverSample {
+    std::string name;            // e.g. "ndis.sys"; "unknown" when the routine address is not mapped
+    double max_us = 0.0;         // longest single DPC or ISR in the interval
+    double total_us = 0.0;       // DPC + ISR execution time in the interval
+    std::uint64_t count = 0;     // DPCs + ISRs
+};
+
+struct KernelProcessSample {
+    std::uint32_t pid = 0;
+    std::string name;
+    double read_bps = 0.0;            // disk bytes/s issued by this process (DiskIo completions)
+    double write_bps = 0.0;
+    double mean_latency_ms = 0.0;     // mean HighResResponseTime of its I/Os
+    double max_latency_ms = 0.0;
+    double hard_faults_per_sec = 0.0; // hard page faults attributed via thread -> process
+};
+
+struct KernelSummary {
+    bool running = false;             // the kernel session delivered this interval
+    double dpc_percent = 0.0;         // DPC time / (interval x logical CPUs) x 100
+    double isr_percent = 0.0;
+    double worst_dpc_us = 0.0;
+    double worst_isr_us = 0.0;
+    double hard_faults_per_sec = 0.0; // all attributed + unattributed hard faults
+    double disk_bytes_per_sec = 0.0;  // all DiskIo completions
+    std::uint64_t events_lost = 0;    // cumulative, since the session started
+    double cost_percent = 0.0;        // consumer CPU, % of one CPU (rolling 30 s)
+};
+
+inline constexpr std::size_t kMaxKernelDrivers = 24;    // bound of Sample::kernel_drivers
+inline constexpr std::size_t kMaxKernelProcesses = 24;  // bound of Sample::kernel_processes
+
 // One system-wide sample, taken every `kSampleIntervalMs`.
 struct Sample {
     std::int64_t ts_ms = 0;              // Unix epoch ms UTC
@@ -68,6 +103,12 @@ struct Sample {
     std::uint32_t handles = 0;
     std::uint32_t foreground_pid = 0;    // 0 = unknown
     std::vector<ProcessSample> top;      // top processes by CPU and by private bytes (bounded, <= 40)
+    // Added by the kernel tracing work (appended; existing fields unchanged). Empty / not valid when
+    // the ETW session is off or not running.
+    bool kernel_valid = false;
+    KernelSummary kernel;
+    std::vector<KernelDriverSample> kernel_drivers;     // <= kMaxKernelDrivers, largest total first
+    std::vector<KernelProcessSample> kernel_processes;  // <= kMaxKernelProcesses, disk or fault activity
 };
 
 // A Windows event relevant to stability. Collected from the System/Application logs and the
