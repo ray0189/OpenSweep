@@ -33,6 +33,7 @@ function id(x, what = 'id') {
   if (typeof x === 'string' && ID_RE.test(x)) return x;
   throw badArgs(`Invalid ${what}`);
 }
+function bool(x, what) { if (typeof x !== 'boolean') throw badArgs(`Invalid ${what}`); return x; }
 function pid(x) {
   if (!Number.isSafeInteger(x) || x <= 4 || x > PID_MAX) throw badArgs('Invalid process id');
   return x;
@@ -50,11 +51,16 @@ const CORE_METHODS = Object.freeze({
   corePolicies: { cmd: 'policies', cap: 'read' },
   coreJournal: { cmd: 'journal', cap: 'read', args: (a) => ({ limit: limit(a.limit) }) },
   coreHeal: { cmd: 'heal', cap: 'read' },
+  // Kernel tracing (docs/core/etw.md, "IPC additions").
+  coreLatency: { cmd: 'latency', cap: 'read' },
+  coreDiskActivity: { cmd: 'diskActivity', cap: 'read' },
+  coreHardFaults: { cmd: 'hardFaults', cap: 'read' },
   coreSetMode: { cmd: 'setMode', cap: 'admin', args: (a) => ({ mode: oneOf(a.mode, MODES, 'mode') }) },
   coreRollbackAll: { cmd: 'rollbackAll', cap: 'admin' },
   coreDisablePolicy: { cmd: 'disablePolicy', cap: 'admin', args: (a) => ({ txId: id(a.txId, 'transaction id') }) },
   coreApprove: { cmd: 'approve', cap: 'admin', args: (a) => ({ id: id(a.id, 'approval id') }) },
   coreExportDiagnostics: { cmd: 'exportDiagnostics', cap: 'admin' },
+  coreSetEtw: { cmd: 'setEtw', cap: 'admin', args: (a) => ({ enabled: bool(a.enabled, 'enabled') }) },
 });
 
 // Returns { cmd, cap, args } for a renderer method, or throws bad_args. Unknown keys are dropped;
@@ -98,6 +104,12 @@ function describeAdmin(method, args, ctx = {}) {
     }
     case 'coreExportDiagnostics':
       return { title: 'Export diagnostics', message: 'Write a diagnostics bundle?', detail: 'OpenSweep Core writes one JSON file with its status, recent incidents, events, baselines and journal to its data folder (%ProgramData%\\OpenSweep\\core). It contains process image names but no window titles, command lines or document contents. Nothing is sent anywhere.', ok: 'Export' };
+    case 'coreSetEtw': {
+      const cur = ctx.etw ? `\n\nNow: kernel tracing is ${ctx.etw.running ? 'running' : 'off'}.` : '';
+      return args.enabled
+        ? { title: 'Turn kernel tracing on', message: 'Turn kernel tracing on?', detail: `Turn kernel tracing on/off: OpenSweep Core starts its own private Windows kernel trace session (ETW, no driver) to measure which drivers delay the system (DPC/ISR time), disk activity per app and hard page faults per app. Only driver and app names, byte counts and timings are kept — no file paths, contents or keystrokes. It normally costs well under 2 % of one CPU; if it costs more, Core reduces or stops it on its own.${cur}`, ok: 'Turn on' }
+        : { title: 'Turn kernel tracing off', message: 'Turn kernel tracing off?', detail: `Turn kernel tracing on/off: OpenSweep Core stops its kernel trace session. The Latency tab and the driver-latency, disk and paging incidents stop updating; all other measurements continue. Nothing else is changed and you can turn it on again at any time.${cur}`, ok: 'Turn off' };
+    }
     default:
       throw badArgs('Not an admin method');
   }

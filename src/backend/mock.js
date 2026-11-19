@@ -38,7 +38,7 @@ const PROC_NAMES = [['chrome', 'Google LLC'], ['chrome', 'Google LLC'], ['chrome
 // { id, action, target, trigger, evidence[], risk, createdMs, expiresMs } is what the dashboard reads.
 const coreSim = (() => {
   const T0 = Date.now();
-  const sim = { mode: 'monitor', txSeq: 1046, policies: [], ticks0: T0 - 3 * 3600e3 - 17 * 60e3 };
+  const sim = { mode: 'monitor', txSeq: 1046, policies: [], ticks0: T0 - 3 * 3600e3 - 17 * 60e3, etw: true, etwSince: T0 - 3 * 3600e3 - 17 * 60e3 };
   const LEAK_START = T0 - 3 * 3600e3, LEAK_PID = 7712, CRASH_SVC = 'ExampleSyncSvc';
   // Deterministic noise per (metric, time bucket) so repeated history calls agree with each other.
   const hash = (str, n) => { let x = 2166136261 ^ n; for (let i = 0; i < str.length; i++) x = Math.imul(x ^ str.charCodeAt(i), 16777619); x ^= x >>> 13; x = Math.imul(x, 0x5bd1e995); x ^= x >>> 15; return ((x >>> 0) % 100000) / 100000; };
@@ -93,6 +93,19 @@ const coreSim = (() => {
       confidence: 0.88, confidenceLevel: 'high', risk: 'low',
       recommendedActions: ['Approve one controlled restart with back-off (waiting in Recovery)', 'Update or reinstall the app that owns the service', 'Disable the service if you do not use it'],
       autoRecoveryAllowed: false, simulated: true },
+    { id: 'inc-0008', key: 'driver_latency:Netwtw10.sys', detector: 'driver_latency', title: 'Driver Netwtw10.sys correlated with latency spikes (max 2,400 µs)', state: 'open', severity: 'warning',
+      summary: 'The Intel Wi-Fi driver had deferred procedure calls (DPCs) longer than 1,000 µs in 4 of the last 10 one-minute windows. Long DPCs can cause audio crackle, input lag or short stutters.',
+      firstSeen: ago(14 * 60e3), lastSeen: ago(60e3), resolvedAt: 0, occurrences: 4,
+      symptoms: ['Longest single DPC/ISR of Netwtw10.sys: 2,400 µs (usual for this PC: about 300 µs)', 'Spikes above 1,000 µs in 4 of the last 10 minutes'],
+      evidence: [
+        { metric: 'Netwtw10.sys longest DPC/ISR', unit: 'µs', observed: 2400, baseline: 290, mad: 80, robustZ: null, ...W(ago(10 * 60e3), ago(0)), note: '50 calls ≥ 1,000 µs in 10 min' },
+        { metric: 'dpcPercent', unit: '%', observed: 0.42, baseline: 0.25, mad: 0.08, robustZ: 1.4, ...W(ago(10 * 60e3), ago(0)) },
+      ],
+      contributors: [{ name: 'Netwtw10.sys', kind: 'driver', pid: 0, confidence: 0.71, detail: 'Intel Wi-Fi adapter driver' }],
+      confidence: 0.71, confidenceLevel: 'medium', risk: 'low',
+      possibleCauses: ['An outdated or buggy Wi-Fi driver', 'Aggressive Wi-Fi power saving waking the adapter often', 'Wi-Fi roaming / background scanning'],
+      recommendedActions: ['Update the Intel Wi-Fi driver (Device Manager → Network adapters → Intel Wi-Fi 6E AX211 → Update driver, or from Intel / the PC maker)', 'If the problem started after a driver update, roll it back (Device Manager → Properties → Driver → Roll Back Driver)', 'Check the adapter\'s power settings (Power Management tab, and the Wireless Adapter setting in the power plan)', 'If you can, test with Ethernet to see whether the stutter goes away'],
+      autoRecoveryAllowed: false, autoRecoveryReason: 'OpenSweep Core never changes drivers on its own.', simulated: true },
     { id: 'inc-0005', key: 'storage_latency:disk0', detector: 'storage_latency', title: 'Short storage latency spike', state: 'resolved', severity: 'warning',
       summary: 'Read latency was far above its usual range for about 90 seconds, then recovered on its own.',
       firstSeen: ago(26 * 3600e3), lastSeen: ago(25.97 * 3600e3), resolvedAt: ago(25.6 * 3600e3), occurrences: 1,
@@ -163,12 +176,63 @@ const coreSim = (() => {
     };
   }
 
+  // Kernel tracing (docs/core/etw.md): DPC/ISR per driver over the last 10 min, histogram buckets
+  // <50, <100, <250, <500, <1000, <2000, <4000, ≥4000 µs.
+  const ETW_FLAGS = ['PROCESS', 'THREAD', 'IMAGE_LOAD', 'DPC', 'INTERRUPT', 'DISK_IO', 'HARD_FAULTS'];
+  const MID = [25, 72, 160, 340, 680, 1350, 2700, 4600];
+  const DRIVERS = [ // name, dpcCount, isrCount, maxUs, histogram
+    ['Netwtw10.sys', 18400, 9100, 2400, [21800, 3900, 1300, 310, 140, 38, 12, 0]],
+    ['ACPI.sys', 2100, 1300, 1150, [2900, 310, 120, 40, 22, 8, 0, 0]],
+    ['nvlddmkm.sys', 42100, 21000, 610, [55200, 6400, 1310, 160, 30, 0, 0, 0]],
+    ['ndis.sys', 30500, 0, 420, [28100, 1900, 460, 40, 0, 0, 0, 0]],
+    ['ntoskrnl.exe', 51000, 0, 330, [49000, 1700, 270, 30, 0, 0, 0, 0]],
+    ['storport.sys', 12800, 0, 310, [11900, 720, 170, 10, 0, 0, 0, 0]],
+    ['Wdf01000.sys', 5600, 0, 260, [5200, 300, 90, 10, 0, 0, 0, 0]],
+    ['usbxhci.sys', 7200, 7200, 210, [13800, 520, 80, 0, 0, 0, 0, 0]],
+    ['dxgkrnl.sys', 9400, 0, 180, [9100, 260, 40, 0, 0, 0, 0, 0]],
+    ['tcpip.sys', 8800, 0, 140, [8500, 260, 40, 0, 0, 0, 0, 0]],
+    ['stornvme.sys', 0, 12900, 95, [12700, 200, 0, 0, 0, 0, 0, 0]],
+    ['HDAudBus.sys', 3000, 3000, 70, [5900, 100, 0, 0, 0, 0, 0, 0]],
+  ];
+  const etwStatus = () => (sim.etw ? { running: true, flags: [...ETW_FLAGS], eventsLost: 0, costPercent: Math.round((0.35 + 0.1 * noise('etw', Date.now(), 10e3)) * 100) / 100 }
+    : { running: false, flags: [], eventsLost: 0, costPercent: 0, reason: 'Turned off by an administrator' });
+  function latency() {
+    const drivers = !sim.etw ? [] : DRIVERS.map(([name, dpcCount, isrCount, maxUs, histogram]) => ({ name, dpcCount, isrCount,
+      totalUs: Math.round(histogram.reduce((a, n, i) => a + n * Math.min(MID[i], maxUs), 0)), maxUs, histogram: [...histogram] }));
+    return { simulated: true, status: etwStatus(), system: sim.etw ? { dpcPercent: Math.round(valueAt('dpcPercent', Date.now()) * 100) / 100, isrPercent: Math.round(valueAt('interruptPercent', Date.now()) * 100) / 100, worstDpcUs: 2400, worstIsrUs: 610 } : { dpcPercent: 0, isrPercent: 0, worstDpcUs: 0, worstIsrUs: 0 }, drivers };
+  }
+  function diskActivity() {
+    if (!sim.etw) return { simulated: true, processes: [] };
+    const t = Date.now(), j = (k, v) => Math.round(v * (1 + 0.15 * noise(k, t, 4e3)));
+    return { simulated: true, processes: [
+      { pid: 3324, name: 'MsMpEng.exe', readBps: j('d1', 31 * MB), writeBps: j('d2', 0.4 * MB), ios: j('d3', 38200), meanLatencyMs: 0.9, maxLatencyMs: 14.2 },
+      { pid: 9120, name: 'OneDrive.exe', readBps: j('d4', 2.1 * MB), writeBps: j('d5', 8.7 * MB), ios: j('d6', 9100), meanLatencyMs: 1.4, maxLatencyMs: 22.8 },
+      { pid: 5520, name: 'SearchIndexer.exe', readBps: j('d7', 3.4 * MB), writeBps: j('d8', 0.9 * MB), ios: j('d9', 6400), meanLatencyMs: 0.8, maxLatencyMs: 9.1 },
+      { pid: 4410, name: 'chrome.exe', readBps: j('da', 0.6 * MB), writeBps: j('db', 1.8 * MB), ios: j('dc', 4100), meanLatencyMs: 0.6, maxLatencyMs: 6.3 },
+      { pid: 11840, name: 'Code.exe', readBps: j('dd', 0.4 * MB), writeBps: j('de', 0.2 * MB), ios: j('df', 1300), meanLatencyMs: 0.5, maxLatencyMs: 4.0 },
+      { pid: 4, name: 'System', readBps: j('dg', 0.3 * MB), writeBps: j('dh', 1.1 * MB), ios: j('di', 2900), meanLatencyMs: 0.7, maxLatencyMs: 11.5 },
+      { pid: LEAK_PID, name: 'LeakyHelper.exe', readBps: j('dj', 0.9 * MB), writeBps: 0, ios: j('dk', 2200), meanLatencyMs: 1.1, maxLatencyMs: 8.7 },
+    ].sort((a, b) => (b.readBps + b.writeBps) - (a.readBps + a.writeBps)) };
+  }
+  function hardFaults() {
+    if (!sim.etw) return { simulated: true, processes: [] };
+    const t = Date.now(), j = (k, v) => Math.max(0, Math.round(v * (1 + 0.25 * noise(k, t, 4e3)) * 10) / 10);
+    return { simulated: true, processes: [
+      { pid: LEAK_PID, name: 'LeakyHelper.exe', faultsPerSec: j('h1', 12 + 30 * leak(t)) },
+      { pid: 4410, name: 'chrome.exe', faultsPerSec: j('h2', 6.1) },
+      { pid: 3324, name: 'MsMpEng.exe', faultsPerSec: j('h3', 4.2) },
+      { pid: 11840, name: 'Code.exe', faultsPerSec: j('h4', 1.3) },
+      { pid: 2210, name: 'explorer.exe', faultsPerSec: j('h5', 0.6) },
+    ].sort((a, b) => b.faultsPerSec - a.faultsPerSec) };
+  }
+
   function status() {
     const open = incidents().filter(i => i.state === 'open').length;
     const ticks = Math.floor((Date.now() - sim.ticks0) / 2000);
     return { simulated: true, mode: sim.mode, simulation: sim.mode === 'monitor', engine: { running: true, ticks, lastTickMs: Date.now() - (Date.now() % 2000), tickCostUs: rnd(700, 1400) },
       stabilityScore: 74, scoreReasons: ['Service crash loop: ExampleSyncSvc (−14)', 'Steadily growing memory use: LeakyHelper.exe (−9)', 'No unexpected shutdowns, bugchecks or WHEA errors in 14 days (+0)', 'Storage latency within baseline (+0)'],
-      counts: { incidentsOpen: open, policiesActive: sim.policies.length, recommendations: recommendations().length }, heal: { breakerOpen: breaker.open } };
+      counts: { incidentsOpen: open, policiesActive: sim.policies.length, recommendations: recommendations().length }, heal: { breakerOpen: breaker.open },
+      etw: (({ reason, ...e }) => e)(etwStatus()) };
   }
 
   function nextTx() { return `tx-${++sim.txSeq}`; }
@@ -202,6 +266,17 @@ const coreSim = (() => {
       case 'topology': return { simulated: true, logicalProcessors: 16, cores: 8, packages: 1, numaNodes: 1, groups: 1, hybrid: false, efficiencyClasses: [8], l3Caches: 1,
         cpuSets: [...Array(16)].map((_, i) => ({ id: 256 + i, group: 0, core: i >> 1, efficiencyClass: 0, numa: 0 })) };
       case 'reportForeground': return {};
+      case 'latency': return latency();
+      case 'diskActivity': return diskActivity();
+      case 'hardFaults': return hardFaults();
+      case 'setEtw': {
+        if (typeof args.enabled !== 'boolean') throw badArgs('enabled must be a boolean');
+        if (sim.etw !== args.enabled) {
+          sim.etw = args.enabled;
+          journal.push(tx({ txId: nextTx(), createdMs: Date.now(), kind: 'config', action: 'set_etw', target: { pid: 0, name: 'kernel tracing', startMs: 0 }, value: args.enabled ? 'on' : 'off', original: args.enabled ? 'off' : 'on', requiredAuth: 'admin', state: 'applied', trigger: 'Changed by an administrator from the OpenSweep app.' }));
+        }
+        return { simulated: true, enabled: sim.etw, running: sim.etw };
+      }
       case 'setMode': {
         if (!['monitor', 'balanced', 'advanced'].includes(args.mode)) throw badArgs('mode must be monitor, balanced or advanced');
         const prev = sim.mode; sim.mode = args.mode;

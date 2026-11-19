@@ -8,8 +8,8 @@ const rejects = (name, fn) => { try { const r = fn(); ok(name, false, `accepted:
 const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
 // ---- method table matches the contract (docs/core/phases-2-8.md)
-const READ = { coreSample: 'sample', coreHistory: 'history', coreBaselines: 'baselines', coreIncidents: 'incidents', coreEvents: 'events', coreRecommendations: 'recommendations', corePolicies: 'policies', coreJournal: 'journal', coreHeal: 'heal' };
-const ADMIN = { coreSetMode: 'setMode', coreRollbackAll: 'rollbackAll', coreDisablePolicy: 'disablePolicy', coreApprove: 'approve', coreExportDiagnostics: 'exportDiagnostics' };
+const READ = { coreSample: 'sample', coreHistory: 'history', coreBaselines: 'baselines', coreIncidents: 'incidents', coreEvents: 'events', coreRecommendations: 'recommendations', corePolicies: 'policies', coreJournal: 'journal', coreHeal: 'heal', coreLatency: 'latency', coreDiskActivity: 'diskActivity', coreHardFaults: 'hardFaults' };
+const ADMIN = { coreSetMode: 'setMode', coreRollbackAll: 'rollbackAll', coreDisablePolicy: 'disablePolicy', coreApprove: 'approve', coreExportDiagnostics: 'exportDiagnostics', coreSetEtw: 'setEtw' };
 ok('method table has exactly the contract methods', eq(Object.keys(v.CORE_METHODS).sort(), [...Object.keys(READ), ...Object.keys(ADMIN)].sort()), Object.keys(v.CORE_METHODS).join(','));
 for (const [m, cmd] of Object.entries(READ)) ok(`${m} → ${cmd} (read)`, v.CORE_METHODS[m].cmd === cmd && v.CORE_METHODS[m].cap === 'read');
 for (const [m, cmd] of Object.entries(ADMIN)) ok(`${m} → ${cmd} (admin)`, v.CORE_METHODS[m].cmd === cmd && v.CORE_METHODS[m].cap === 'admin');
@@ -26,7 +26,7 @@ rejects('args string rejected', () => v.prepare('coreSample', 'x'));
 rejects('args number rejected', () => v.prepare('coreIncidents', 5));
 
 // ---- no-arg commands send no args, even if the renderer sends junk
-for (const m of ['coreSample', 'coreBaselines', 'coreRecommendations', 'corePolicies', 'coreHeal', 'coreRollbackAll', 'coreExportDiagnostics']) {
+for (const m of ['coreSample', 'coreBaselines', 'coreRecommendations', 'corePolicies', 'coreHeal', 'coreLatency', 'coreDiskActivity', 'coreHardFaults', 'coreRollbackAll', 'coreExportDiagnostics']) {
   const p = v.prepare(m, { cmd: 'setMode', mode: 'advanced', __proto__: { x: 1 }, args: { a: 1 } });
   ok(`${m}: extra fields dropped, no args sent`, p.args === undefined && p.cmd === v.CORE_METHODS[m].cmd);
 }
@@ -59,6 +59,14 @@ for (const m of v.MODES) ok(`setMode ${m} accepted`, eq(v.prepare('coreSetMode',
 for (const bad of ['Monitor', 'aggressive', '', ' monitor', 'monitor\u0000', null, 1, ['monitor'], { mode: 'monitor' }]) rejects(`setMode ${JSON.stringify(bad)} rejected`, () => v.prepare('coreSetMode', { mode: bad }));
 rejects('setMode without mode rejected', () => v.prepare('coreSetMode', {}));
 
+// ---- setEtw (kernel tracing on/off)
+ok('setEtw true accepted', eq(v.prepare('coreSetEtw', { enabled: true }).args, { enabled: true }));
+ok('setEtw false accepted', eq(v.prepare('coreSetEtw', { enabled: false }).args, { enabled: false }));
+ok('setEtw sends only { enabled }', eq(v.prepare('coreSetEtw', { enabled: false, mode: 'advanced', flags: ['DPC'] }).args, { enabled: false }));
+for (const bad of [1, 0, 'true', 'false', '', null, [], {}, [true]]) rejects(`setEtw enabled ${JSON.stringify(bad)} rejected`, () => v.prepare('coreSetEtw', { enabled: bad }));
+rejects('setEtw without enabled rejected', () => v.prepare('coreSetEtw', {}));
+rejects('setEtw with no args rejected', () => v.prepare('coreSetEtw'));
+
 // ---- ids
 for (const good of [1, 1042, 2 ** 53 - 1, 'tx-1042', 'apr-0006', 'a', 'A1_b.c:d-e', 'x'.repeat(64)]) {
   ok(`disablePolicy txId ${JSON.stringify(good).slice(0, 20)} accepted`, v.prepare('coreDisablePolicy', { txId: good }).args.txId === good);
@@ -85,7 +93,12 @@ ok('rollback-all dialog states the count', /3 active policies/.test(v.describeAd
 ok('approve dialog names the action and target', /restartService on ExampleSyncSvc/.test(v.describeAdmin('coreApprove', { id: 'apr-1' }, { approval: { action: 'restartService', target: { name: 'ExampleSyncSvc' } } }).detail));
 ok('export dialog says nothing leaves the machine', /Nothing is sent/.test(v.describeAdmin('coreExportDiagnostics', {}).detail));
 ok('dialog text truncates long service-provided strings', v.describeAdmin('coreDisablePolicy', { txId: 1 }, { policy: { kind: 'x'.repeat(5000) } }).detail.length < 1000);
+const etwOn = v.describeAdmin('coreSetEtw', { enabled: true }, { etw: { running: false } }), etwOff = v.describeAdmin('coreSetEtw', { enabled: false });
+ok('setEtw dialogs say "Turn kernel tracing on/off"', /^Turn kernel tracing on\/off/.test(etwOn.detail) && /^Turn kernel tracing on\/off/.test(etwOff.detail) && etwOn.ok === 'Turn on' && etwOff.ok === 'Turn off');
+ok('setEtw on dialog states privacy and cost, and the current state', /no file paths/i.test(etwOn.detail) && /2 %/.test(etwOn.detail) && /currently|Now: kernel tracing is off/.test(etwOn.detail) && !etwOn.consent);
+ok('setEtw off dialog says other measurements continue', /other measurements continue/i.test(etwOff.detail));
 rejects('describeAdmin rejects read methods', () => v.describeAdmin('coreSample', {}));
+rejects('describeAdmin rejects coreLatency (read)', () => v.describeAdmin('coreLatency', {}));
 
 console.log(failed ? `\n${failed} check(s) FAILED` : '\nAll core-validate checks passed');
 process.exit(failed ? 1 : 0);

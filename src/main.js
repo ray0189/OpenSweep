@@ -356,6 +356,7 @@ async function coreAdmin(method, input) {
   // Look up what is being acted on so the dialog can describe it (and unknown ids fail before anything is sent).
   const ctx = {};
   if (method === 'coreSetMode') ctx.current = await coreRead('status').then(s => s && s.mode).catch(() => null);
+  if (method === 'coreSetEtw') ctx.etw = await coreRead('status').then(s => (s && s.etw) || null).catch(() => null);
   if (method === 'coreRollbackAll' || method === 'coreDisablePolicy') {
     const active = (await coreRead('policies')).active || [];
     ctx.count = active.length;
