@@ -1,7 +1,7 @@
 {
   "name": "opensweep",
   "productName": "OpenSweep",
-  "version": "0.4.0-alpha.3",
+  "version": "0.4.0-alpha.4",
   "description": "Free, open-source PC care toolkit for Windows 10/11: cleanup, boost, startup, privacy, tweaks, repair and more.",
   "main": "src/main.js",
   "license": "MIT",

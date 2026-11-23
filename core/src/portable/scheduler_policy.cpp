@@ -34,6 +34,11 @@ constexpr std::string_view kLatencyCritical[] = {
     // DAWs / pro audio
     "ableton live*", "reaper", "fl64", "fl", "cubase*", "studio one", "bitwig studio", "protools",
     "audacity", "voicemeeter*", "nuendo*",
+    // voice chat and game launchers / overlays (a game may depend on them; never throttle during play)
+    "discord*", "teamspeak*", "ts3client_win64", "mumble", "skype*", "slack",
+    "steam", "steamwebhelper", "steamservice", "gameoverlayui", "epicgameslauncher", "eadesktop", "eabackgroundservice",
+    "battle.net", "ubisoftconnect", "upc", "galaxyclient", "xboxpcapp", "gamingservices", "riotclientservices",
+    "nvidia overlay", "nvcontainer", "amdrsserv", "radeonsoftware",
 };
 
 constexpr std::string_view kBackground[] = {
