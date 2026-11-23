@@ -763,7 +763,12 @@ BoostResult Engine::set_boost(bool enabled) {
     r.restored = boost_.set_enabled(enabled, t);
     r.persisted = save_settings_locked(cfg_.settings);
     if (!r.persisted) log("config.json could not be written; the boost switch will not survive a restart");
-    if (before != enabled) record_config_event(t, std::string("Game boost ") + (enabled ? "enabled" : "disabled"));
+    if (before != enabled) {
+        record_config_event(t, std::string("Game boost ") + (enabled ? "enabled" : "disabled"));
+        if (!control_.record_config(t, "set_boost", enabled ? 1 : 0, before ? 1 : 0,
+                                    std::string("game boost ") + (before ? "on" : "off") + " -> " + (enabled ? "on" : "off")))
+            log("journal: the game boost change could not be recorded");
+    }
     r.enabled = boost_.enabled();
     r.active = boost_.active();
     return r;

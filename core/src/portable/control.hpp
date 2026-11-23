@@ -142,6 +142,11 @@ public:
     // Admin operations (the IPC layer checks the caller is an elevated administrator).
     // Journaled. -> monitor rolls everything back; advanced -> balanced rolls back CPU Sets.
     // Escalating out of monitor is refused when the journal cannot record it (fail-safe).
+    // Journals an admin configuration change (e.g. the game boost switch) as a retained config transaction.
+    bool record_config(std::int64_t now, std::string_view action, std::int64_t value, std::int64_t original,
+                       std::string_view detail) {
+        return journal_config(now, action, value, original, detail);
+    }
     ModeChange set_mode(Mode m, std::int64_t now_ms);
     void set_simulation(bool on) noexcept { cfg_.simulation = on; }
     // Journaled. Opting out rolls back active policies of that kind.
