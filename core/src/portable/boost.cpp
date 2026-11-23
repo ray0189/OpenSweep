@@ -288,7 +288,9 @@ bool GameBoost::throttle(const telemetry::ProcessSample& p, WorkloadClass cls, d
     const std::pair<PolicyKind, std::int64_t> actions[] = {{PolicyKind::EcoQoS, 1},
                                                           {PolicyKind::MemoryPriority, cfg_.memory_priority}};
     bool journal_ok = true;
-    for (const auto& [kind, value] : actions) {
+    for (const auto& action : actions) {
+        const PolicyKind kind = action.first;  // plain locals: lambdas below capture them
+        const std::int64_t value = action.second;
         journal::Transaction tx;
         tx.kind = "policy";
         tx.trigger = kTrigger;

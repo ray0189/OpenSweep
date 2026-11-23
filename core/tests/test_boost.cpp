@@ -159,8 +159,11 @@ TEST(boost_session_timing_start_5s_end_10s) {
     r.step(true);  // +6 s >= 5 s
     CHECK(r.b->active());
     CHECK(r.t - first >= 5000);
-    CHECK_EQ(r.b->view().since, r.t);
-    CHECK_EQ(r.b->view().foreground_pid, kGame);
+    {
+        const boost::View started = r.b->view();
+        CHECK_EQ(started.since, r.t);
+        CHECK_EQ(started.foreground_pid, kGame);
+    }
     CHECK(r.act.throttled(600));
     CHECK_EQ(r.act.get(PolicyKind::MemoryPriority, 600), std::int64_t{2});
 
@@ -313,7 +316,8 @@ TEST(boost_caps_at_16_targets) {
     CHECK_EQ(r.act.applies, 32);
     r.b->end(r.t, "service_stop");
     CHECK(r.act.pristine());
-    CHECK_EQ(r.b->view().last_session->throttled_count, std::size_t{16});
+    const boost::View ended = r.b->view();
+    CHECK(ended.last_session && ended.last_session->throttled_count == 16);
 }
 
 TEST(boost_rollback_on_every_end_path) {

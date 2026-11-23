@@ -20,7 +20,7 @@ const CHECK_IDS = ['ram_speed', 'refresh_rate', 'pcie_gpu', 'ssd', 'power', 'the
 //                         dmPelsWidth@172, dmPelsHeight@176, dmDisplayFlags@180, dmDisplayFrequency@184
 //   SYSTEM_POWER_STATUS (12 bytes): ACLineStatus@0, BatteryFlag@1, BatteryLifePercent@2, SystemStatusFlag@3
 const NATIVE = String.raw`
-$N = $null; $nativeErr = $null
+$OsNative = $null; $nativeErr = $null
 try {
   $asm = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object Reflection.AssemblyName 'OpenSweepHw'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
   $tb = $asm.DefineDynamicModule('OpenSweepHw').DefineType('OpenSweepHw.N', 'Public, Class')
@@ -34,9 +34,9 @@ try {
     $m = $tb.DefinePInvokeMethod($d[0], $d[1], $attr, [Reflection.CallingConventions]::Standard, $d[2], $d[3], [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
     $m.SetImplementationFlags('PreserveSig')
   }
-  $N = $tb.CreateType()
+  $OsNative = $tb.CreateType()
 } catch { $nativeErr = $_.Exception.Message }
-function Need-Native { if (-not $N) { throw ('Windows display/power functions unavailable: ' + $nativeErr) } }
+function Need-Native { if (-not $OsNative) { throw ('Windows display/power functions unavailable: ' + $nativeErr) } }
 function U32($b, $o) { [BitConverter]::ToUInt32($b, $o) }
 function WS($b, $o, $n) { [Text.Encoding]::Unicode.GetString($b, $o, $n).Split([char]0)[0] }
 function New-DD { $d = New-Object byte[] 840; [BitConverter]::GetBytes([UInt32]840).CopyTo($d, 0); ,$d }
@@ -46,7 +46,7 @@ function Get-Rates($dev, $w, $h, $bpp) {
   $rates = New-Object 'System.Collections.Generic.List[int]'
   for ($j = 0; $j -lt 5000; $j++) {
     $m = New-DM
-    if ($N::EnumDisplaySettings($dev, $j, $m) -eq 0) { break }
+    if ($OsNative::EnumDisplaySettings($dev, $j, $m) -eq 0) { break }
     $mw = U32 $m 172; $mh = U32 $m 176
     if (((($mw -eq $w) -and ($mh -eq $h)) -or (($mw -eq $h) -and ($mh -eq $w))) -and ((U32 $m 168) -eq $bpp) -and -not ((U32 $m 180) -band 2)) {
       $f = [int](U32 $m 184); if ($f -gt 1 -and -not $rates.Contains($f)) { $rates.Add($f) }
@@ -91,15 +91,15 @@ Try-Part 'display' {
   $out = @()
   for ($i = 0; $i -lt 32; $i++) {
     $dd = New-DD
-    if ($N::EnumDisplayDevices([NullString]::Value, [UInt32]$i, $dd, [UInt32]0) -eq 0) { break }
+    if ($OsNative::EnumDisplayDevices([NullString]::Value, [UInt32]$i, $dd, [UInt32]0) -eq 0) { break }
     $flags = U32 $dd 324
     if (-not ($flags -band 1)) { continue }   # DISPLAY_DEVICE_ATTACHED_TO_DESKTOP
     $dev = WS $dd 4 64
     $md = New-DD; $mon = ''; $monId = ''
-    if ($N::EnumDisplayDevices($dev, [UInt32]0, $md, [UInt32]0) -ne 0) { $mon = WS $md 68 256; $monId = WS $md 328 256 }
+    if ($OsNative::EnumDisplayDevices($dev, [UInt32]0, $md, [UInt32]0) -ne 0) { $mon = WS $md 68 256; $monId = WS $md 328 256 }
     $hw = ''; $p = $monId -split '\\'; if ($p.Count -ge 2) { $hw = $p[1].ToUpper() }
     $cur = New-DM
-    if ($N::EnumDisplaySettings($dev, -1, $cur) -eq 0) { continue }   # ENUM_CURRENT_SETTINGS
+    if ($OsNative::EnumDisplaySettings($dev, -1, $cur) -eq 0) { continue }   # ENUM_CURRENT_SETTINGS
     $w = U32 $cur 172; $h = U32 $cur 176; $bpp = U32 $cur 168
     $out += [pscustomobject]@{ device = $dev; adapter = (WS $dd 68 256); monitor = $(if ($hw -and $names[$hw]) { $names[$hw] } else { $mon }); primary = [bool]($flags -band 4);
       width = $w; height = $h; bpp = $bpp; hz = [int](U32 $cur 184); rates = (Get-Rates $dev $w $h $bpp) }
@@ -135,7 +135,7 @@ Try-Part 'power' {
     $plans += [pscustomobject]@{ guid = $m.Groups[1].Value.ToLower(); name = $m.Groups[2].Value; active = $m.Groups[3].Success }
   }
   $ac = $null; $saver = $null; $pctB = $null
-  if ($N) { $s = New-Object byte[] 12; if ($N::GetSystemPowerStatus($s) -ne 0) { $ac = [int]$s[0]; $pctB = [int]$s[2]; $saver = [int]$s[3] } }
+  if ($OsNative) { $s = New-Object byte[] 12; if ($OsNative::GetSystemPowerStatus($s) -ne 0) { $ac = [int]$s[0]; $pctB = [int]$s[2]; $saver = [int]$s[3] } }
   $ov = $null
   try { $k = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes'; $ov = @{ ac = [string]$k.ActiveOverlayAcPowerScheme; dc = [string]$k.ActiveOverlayDcPowerScheme } } catch {}
   @{ plans = $plans; ac = $ac; saver = $saver; batteryPercent = $pctB; overlay = $ov }
@@ -173,15 +173,15 @@ const REFRESH_SCRIPT = String.raw`$ErrorActionPreference = 'Stop'
 Need-Native
 $dev = [string]$a.device; $rate = [int]$a.rate
 $cur = New-DM
-if ($N::EnumDisplaySettings($dev, -1, $cur) -eq 0) { throw 'Could not read the current display mode.' }
+if ($OsNative::EnumDisplaySettings($dev, -1, $cur) -eq 0) { throw 'Could not read the current display mode.' }
 $before = [int](U32 $cur 184)
 if (-not ((Get-Rates $dev (U32 $cur 172) (U32 $cur 176) (U32 $cur 168)) -contains $rate)) { throw ("$rate Hz is not offered at the current resolution.") }
 [BitConverter]::GetBytes([UInt32]$rate).CopyTo($cur, 184)
 [BitConverter]::GetBytes([UInt32]0x400000).CopyTo($cur, 72)   # dmFields = DM_DISPLAYFREQUENCY only
-$t = $N::ChangeDisplaySettingsEx($dev, $cur, [IntPtr]::Zero, [UInt32]2, [IntPtr]::Zero)   # CDS_TEST
+$t = $OsNative::ChangeDisplaySettingsEx($dev, $cur, [IntPtr]::Zero, [UInt32]2, [IntPtr]::Zero)   # CDS_TEST
 if ($t -ne 0) { throw ("Windows refused $rate Hz for this display (code $t).") }
-$r = $N::ChangeDisplaySettingsEx($dev, $cur, [IntPtr]::Zero, [UInt32]1, [IntPtr]::Zero)   # CDS_UPDATEREGISTRY
-$after = New-DM; [void]$N::EnumDisplaySettings($dev, -1, $after)
+$r = $OsNative::ChangeDisplaySettingsEx($dev, $cur, [IntPtr]::Zero, [UInt32]1, [IntPtr]::Zero)   # CDS_UPDATEREGISTRY
+$after = New-DM; [void]$OsNative::EnumDisplaySettings($dev, -1, $after)
 [Console]::Out.Write((ConvertTo-Json -InputObject @{ code = $r; before = $before; after = [int](U32 $after 184) } -Compress))
 `;
 const RETRIM_SCRIPT = String.raw`Optimize-Volume -DriveLetter $a.letter -ReTrim -ErrorAction Stop

@@ -101,14 +101,20 @@ TEST(cmd2_every_contract_command_is_registered_with_the_right_capability) {
     Env e;
     for (const char* c : {"status", "sample", "history", "baselines", "incidents", "events", "recommendations",
                           "policies", "journal", "heal", "topology", "reportForeground", "setMode", "rollbackAll",
-                          "disablePolicy", "approve", "exportDiagnostics", "hello", "health", "metrics"})
+                          "disablePolicy", "approve", "exportDiagnostics", "hello", "health", "metrics", "boost",
+                          "scorecard", "setBoost", "captureBaseline"})
         CHECK(e.d.has(c));
+    // Read commands of alpha.4 work for read-only clients.
+    for (const char* c : {"boost", "scorecard"}) CHECK(Env::ok(e.call(c)));
     // Admin commands: forbidden for read-only clients, before any argument validation.
-    for (const char* c : {"setMode", "rollbackAll", "disablePolicy", "approve", "exportDiagnostics"}) {
+    for (const char* c : {"setMode", "rollbackAll", "disablePolicy", "approve", "exportDiagnostics", "setBoost",
+                          "captureBaseline"}) {
         const auto r = e.call(c, "{\"bogus\":1}");
         CHECK_EQ(Env::code(r), std::string("forbidden"));
     }
     CHECK(e.rig.io.files.count("/data/diagnostics.json") == 0);
+    CHECK(e.rig.io.files["/data/scorecard.json"].find("capturedAt") == std::string::npos);
+    CHECK(!e.rig.eng->boost_enabled());
 }
 
 TEST(cmd2_status_shape_and_hello_mode) {
@@ -490,4 +496,106 @@ TEST(cmd2_etw_commands_with_platform_session) {
     CHECK(!Env::res(e.call("status")).find("etw")->find("running")->as_bool());
     const auto on = Env::res(e.call("setEtw", "{\"enabled\":true}", true));
     CHECK(on.find("enabled")->as_bool() && on.find("running")->as_bool());
+}
+
+TEST(cmd2_report_foreground_fullscreen_argument) {
+    Env e;
+    CHECK(Env::ok(e.call("reportForeground", "{\"pid\":100,\"fullscreen\":true}", false, 1)));
+    CHECK(Env::ok(e.call("reportForeground", "{\"pid\":100,\"fullscreen\":false}", false, 1)));
+    CHECK(Env::ok(e.call("reportForeground", "{\"pid\":300,\"fullscreen\":true}", false, 0)));  // ignored
+    const auto before = e.fg_calls.size();
+    for (const char* bad : {"{\"pid\":100,\"fullscreen\":1}", "{\"pid\":100,\"fullscreen\":\"true\"}",
+                            "{\"pid\":100,\"fullscreen\":null}", "{\"fullscreen\":true}"})
+        CHECK_EQ(Env::code(e.call("reportForeground", bad, false, 1)), std::string("bad_args"));
+    CHECK_EQ(e.fg_calls.size(), before);
+}
+
+TEST(cmd2_boost_commands_and_shapes) {
+    Env e;
+    e.rig.act.start[300] = 1300;
+    const json::Value st0 = Env::res(e.call("status"));
+    const json::Value* sb = st0.find("boost");
+    CHECK(sb && sb->find("enabled") && !sb->find("enabled")->as_bool() && sb->find("active") &&
+          !sb->find("active")->as_bool());
+
+    const json::Value b0 = Env::res(e.call("boost"));
+    CHECK(!b0.find("enabled")->as_bool() && !b0.find("active")->as_bool());
+    CHECK(b0.find("since")->is_null() && b0.find("lastSession")->is_null());
+    CHECK(b0.find("throttled")->is_array() && b0.find("throttled")->size() == 0);
+    CHECK(b0.find("foregroundPid") && b0.find("foregroundName"));
+    CHECK_EQ(Env::code(e.call("boost", "{\"x\":1}")), std::string("bad_args"));
+
+    CHECK_EQ(Env::code(e.call("setBoost", "{}", true)), std::string("bad_args"));
+    CHECK_EQ(Env::code(e.call("setBoost", "{\"enabled\":1}", true)), std::string("bad_args"));
+    CHECK_EQ(Env::code(e.call("setBoost", "{\"enabled\":true,\"x\":1}", true)), std::string("bad_args"));
+    const json::Value on = Env::res(e.call("setBoost", "{\"enabled\":true}", true));
+    CHECK(on.find("enabled")->as_bool() && !on.find("active")->as_bool());
+    CHECK(e.rig.io.files["/data/config.json"].find("\"boost\":true") != std::string::npos);
+
+    // A fullscreen session through the IPC hint.
+    auto gen = [](std::int64_t ts) {
+        telemetry::Sample s = quiet(ts);
+        s.top[1].cpu_percent = 5.0;
+        s.top.push_back(proc(300, "ffmpeg.exe", 15.0, 100));
+        return s;
+    };
+    for (int i = 0; i < 20; ++i) {
+        e.rig.now += kTick;
+        if (i >= 15) CHECK(Env::ok(e.call("reportForeground", "{\"pid\":100,\"fullscreen\":true}", false, 1)));
+        e.rig.tick(gen(e.rig.now));
+    }
+    const json::Value b1 = Env::res(e.call("boost"));
+    CHECK(b1.find("enabled")->as_bool() && b1.find("active")->as_bool());
+    CHECK(is_num(b1.find("since")));
+    CHECK_EQ(b1.find("foregroundPid")->as_int().value_or(0), 100);
+    CHECK_EQ(b1.find("foregroundName")->as_string(), std::string("word.exe"));
+    CHECK_EQ(b1.find("throttled")->size(), std::size_t{2});
+    for (const auto& t : b1.find("throttled")->as_array()) {
+        CHECK(is_int(t.find("pid")) && t.find("name")->is_string());
+        CHECK(t.find("kind")->as_string() == "background" || t.find("kind")->as_string() == "throughput");
+    }
+    CHECK(Env::res(e.call("status")).find("boost")->find("active")->as_bool());
+    // Journal: boost transactions are policy transactions with trigger "boost".
+    const json::Value jr = Env::res(e.call("journal"));
+    std::size_t boost_tx = 0;
+    for (const auto& t : jr.find("entries")->as_array())
+        if (t.find("trigger")->as_string() == "boost" && t.find("kind")->as_string() == "policy") ++boost_tx;
+    CHECK_EQ(boost_tx, std::size_t{4});
+
+    const json::Value off = Env::res(e.call("setBoost", "{\"enabled\":false}", true));
+    CHECK(!off.find("enabled")->as_bool() && !off.find("active")->as_bool());
+    CHECK_EQ(e.rig.act.restores, 4);
+    const json::Value b2 = Env::res(e.call("boost"));
+    const json::Value* ls = b2.find("lastSession");
+    CHECK(ls && ls->is_object() && is_num(ls->find("start")) && is_num(ls->find("end")) &&
+          ls->find("throttledCount")->as_int() == 2);
+    CHECK(b2.find("since")->is_null());
+}
+
+TEST(cmd2_scorecard_and_capture_baseline) {
+    Env e;
+    const json::Value s0 = Env::res(e.call("scorecard"));
+    CHECK(s0.find("baseline") && s0.find("baseline")->is_null());
+    const json::Value* cur = s0.find("current");
+    CHECK(cur && cur->find("metrics") && cur->find("metrics")->is_object());
+    const json::Value* m = cur->find("metrics");
+    for (const char* k : {"bootMs", "idleCpuPercent", "idleRamUsedBytes", "diskLatencyMs", "hardFaultsPerSec",
+                          "stutterPerHour", "crashesPerWeek"})
+        CHECK(m->find(k) != nullptr);
+    CHECK(m->find("idleCpuPercent")->is_null() && m->find("bootMs")->is_null());
+    CHECK(is_num(s0.find("hoursMeasured")));
+    CHECK_EQ(Env::code(e.call("scorecard", "{\"x\":1}")), std::string("bad_args"));
+
+    e.rig.run(400, [](std::int64_t ts) { return quiet(ts); });
+    CHECK_EQ(Env::code(e.call("captureBaseline", "{\"x\":1}", true)), std::string("bad_args"));
+    const json::Value cap = Env::res(e.call("captureBaseline", "", true));
+    CHECK(cap.find("persisted")->as_bool());
+    CHECK(cap.find("baseline")->find("capturedAt")->as_int() == e.rig.now);
+    CHECK(is_num(cap.find("baseline")->find("metrics")->find("idleCpuPercent")));
+    CHECK(e.rig.io.files["/data/scorecard.json"].find("capturedAt") != std::string::npos);
+    const json::Value s1 = Env::res(e.call("scorecard"));
+    const json::Value* base = s1.find("baseline");
+    CHECK(base && base->is_object() && base->find("capturedAt")->as_int() == e.rig.now);
+    CHECK(is_num(s1.find("current")->find("metrics")->find("idleCpuPercent")));
+    CHECK(s1.find("hoursMeasured")->as_double() > 0.0);
 }

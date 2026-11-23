@@ -62,7 +62,7 @@ contract table. Lists are newest first and additionally trimmed so a response st
 
 | cmd | cap | args | result |
 |---|---|---|---|
-| `status` | read | — | `{ mode, simulation, engine:{ running, ticks, lastTickMs, tickCostUs, tickCostMaxUs(+) }, stabilityScore 0–100, scoreReasons:[str], counts:{ incidentsOpen, policiesActive, recommendations, pendingApprovals(+) }, heal:{ breakerOpen }, simulationFlag(+), optIn(+):[kind], decision(+):{ noActionNeeded, reason }, memory(+):{ level, score }, cpu(+):{ contention }, etw:{ running, flags[], eventsLost, costPercent, reason?, enabled(+), level(+), events(+) } }` (`etw`: see "Kernel tracing" below). `simulation` = decisions are simulated (monitor, or the simulation flag); `simulationFlag` = the dry-run flag itself. |
+| `status` | read | — | `{ mode, simulation, engine:{ running, ticks, lastTickMs, tickCostUs, tickCostMaxUs(+) }, stabilityScore 0–100, scoreReasons:[str], counts:{ incidentsOpen, policiesActive, recommendations, pendingApprovals(+) }, heal:{ breakerOpen }, simulationFlag(+), optIn(+):[kind], decision(+):{ noActionNeeded, reason }, memory(+):{ level, score }, cpu(+):{ contention }, boost(+):{ enabled, active }, etw:{ running, flags[], eventsLost, costPercent, reason?, enabled(+), level(+), events(+) } }` (`etw`: see "Kernel tracing" below). `simulation` = decisions are simulated (monitor, or the simulation flag); `simulationFlag` = the dry-run flag itself. |
 | `sample` | read | — | latest `Sample`: `{ tsMs, cpuPercent, cpuQueueLength, contextSwitchesPerSec, dpcPercent, interruptPercent, memTotal, memAvail, memLoadPercent, commitTotal, commitLimit, systemCache, kernelPaged, kernelNonpaged, compressedBytes, hardFaultsPerSec, pageFaultsPerSec, diskReadLatencyMs, diskWriteLatencyMs, diskQueueLength, diskBytesPerSec, cpuFreqPercent, processes, threads, handles, foregroundPid, top:[{ pid, parentPid, name, cpuPercent, privateBytes, workingSet, hardFaultsPerSec, pageFaultsPerSec, handles, threads, sessionId, priorityClass, foreground, isSystemCritical, isSecuritySoftware, isService, hasAudio, signedByMicrosoft, startMs }], kernel(+):{ valid, running, dpcPercent, isrPercent, worstDpcUs, worstIsrUs, hardFaultsPerSec, diskBytesPerSec, eventsLost, costPercent }, kernelDrivers(+):[{ name, maxUs, totalUs, count }], kernelProcesses(+):[{ pid, name, readBps, writeBps, meanLatencyMs, maxLatencyMs, hardFaultsPerSec }] }` (≤ 40 processes; kernel lists ≤ 24, values over the last sample interval; `top[].hardFaultsPerSec` comes from kernel tracing when it runs). `internal` until the first tick. |
 | `history` | read | `{ metric, range:"30m"\|"24h"\|"14d" }` (both required) | `{ metric, unit, range(+), points:[[tsMs, value]...] }` ascending, ≤ 900 points. Metrics: the camelCase numeric `Sample` fields above (except `tsMs`/`foregroundPid`) plus `commitPercent`. |
 | `baselines` | read | — | `{ metrics:{ name:{ median, mad, ewma, samples, ready } } }` — a metric appears once its first minute has been committed (no `null` medians); `bootDurationMs` appears after the first boot event. |
@@ -73,12 +73,58 @@ contract table. Lists are newest first and additionally trimmed so a response st
 | `journal` | read | `{ limit? 1–500, default 100 }` | `{ entries:[Transaction] }` newest first; `Transaction` = `{ txId, kind:"policy"\|"recovery"\|"config", trigger, evidence, preconditions, target:{ pid, name, startMs }, action, value, original, requiredAuth, state:"intent"\|"applied"\|"verifying"\|"retained"\|"rolled_back"\|"failed"\|"expired", verification, verificationResult, rollback, cooldownUntil, attempt, maxAttempts, createdMs, updatedMs, audit:[{ ts, event, detail }] }` |
 | `heal` | read | — | `{ breaker:{ open, failures, openedAt }, pending:[Approval], history:[Transaction] }` — `Approval` = `{ id, kind:"recovery"\|"policy", action, description, target (string), trigger, evidence:[str], risk:"low"\|"medium"\|"high", auth, createdMs, expiresMs }` (+ `targetPid`, `value` for `kind:"policy"`, the Advanced-mode consents); `history` = recovery transactions (≤ 50) |
 | `topology` | read | — | Phase 1 shape + `cpuSets:[{ id, group, core, efficiencyClass, numa }]` (one per CPU set = logical processor) |
-| `reportForeground` | read | `{ pid }` (integer > 4) | `{}`. The pid must exist and be in the caller's token session (`bad_args` otherwise; `forbidden` if the caller's session is unknown). A session-0 caller reporting its own session-0 pid is accepted but not recorded (session 0 has no foreground window). The hint expires after 10 s without a refresh. |
+| `reportForeground` | read | `{ pid }` (integer > 4), `fullscreen?(+)`: bool | `{}`. The pid must exist and be in the caller's token session (`bad_args` otherwise; `forbidden` if the caller's session is unknown). A session-0 caller reporting its own session-0 pid is accepted but not recorded (session 0 has no foreground window). The hint expires after 10 s without a refresh. `fullscreen` (alpha.4, `SHQueryUserNotificationState` in the app) feeds game boost; absent = `false`; a non-boolean is `bad_args`. |
 | `setMode` | admin | `{ mode:"monitor"\|"balanced"\|"advanced", simulation?(+): bool, optIn?(+): [kind] }` | `{ mode, simulation, simulationFlag(+), optIn(+), persisted(+), rolledBack(+):{ restored, failed, expired } }`. Journaled; → monitor rolls everything back; `optIn` replaces the opt-in set (opting out rolls back that kind). Persisted in `config.json`. Escalation is refused (`internal`) when the journal cannot record it. |
 | `rollbackAll` | admin | — | `{ restored, failed, expired(+) }` |
 | `disablePolicy` | admin | `{ txId }` | `{ restored:bool }` (`false` for an unknown or inactive txId) |
 | `approve` | admin | `{ id }` | `{ txId, kind(+):"recovery"\|"policy", detail(+) }` — runs a pending recovery once, or records consent for an Advanced action (applied on a later tick if every gate still passes). Unknown, expired or refused ids → `bad_args`. |
 | `exportDiagnostics` | admin | — | `{ path, bytes(+) }` — writes `%ProgramData%\OpenSweep\core\diagnostics.json` (overwritten each time): status, latest sample, baselines, incidents, events, recommendations, policies, journal, heal, captured incident windows, topology, collector counters. No window titles, command lines or document contents; nothing leaves the machine. |
+
+### Game boost and scorecard (docs/core/alpha4.md, 0.4.0-alpha.4)
+
+| cmd | cap | args | result |
+|---|---|---|---|
+| `boost` | read | — | `{ enabled, active, since: tsMs\|null, foregroundPid: pid\|null, foregroundName: str\|null, throttled:[{ pid, name, kind }], lastSession:{ start, end, throttledCount }\|null }` |
+| `setBoost` | admin | `{ enabled: bool }` (required) | `{ enabled, active, persisted(+) }` — persists `config.json` `boost` (absent in older files = `false`). `false` ends an active session and restores every target before returning. Journaled as an `opensweep_config` event. |
+| `scorecard` | read | — | `{ baseline:{ capturedAt, metrics }\|null, current:{ metrics }, hoursMeasured }` with `metrics` = `{ bootMs, idleCpuPercent, idleRamUsedBytes, diskLatencyMs, hardFaultsPerSec, stutterPerHour, crashesPerWeek }`, each a number or `null` (not measured / not enough data). |
+| `captureBaseline` | admin | — | `{ baseline:{ capturedAt, metrics }, persisted }` — stores the current metrics as the "before" numbers in `%ProgramData%\OpenSweep\core\scorecard.json` (atomic write; replaces an existing baseline). |
+
+**Game boost.** An explicit user opt-in (default off) that works in every mode, including `monitor`.
+- *Start*: boost enabled and the latest `reportForeground` hint says `fullscreen:true` for the process the
+  collector also sees as the foreground, continuously for ≥ 5 s (hints older than 15 s are ignored).
+- *End* (every path restores every target): the session's process is not the fullscreen foreground for
+  ≥ 10 s, that process exits, `setBoost {enabled:false}`, `rollbackAll` (a new session then starts only after
+  the game has left fullscreen once), service stop, and crash recovery at the next start. `setMode` does not
+  end a session.
+- *Targets*: processes averaging ≥ 1 % CPU (of the whole machine) over the last 30 s whose workload is
+  verified as `background` or `throughput`, never the foreground app or any of its descendants (parent pid
+  chain), never protected images, audio, anti-cheat, security software, system-critical or session-0
+  processes, unknown workloads, OpenSweep itself, or processes the control engine already holds; at most 16,
+  re-evaluated every tick. Each target gets EcoQoS on + memory priority 2 (never raised if it was already
+  lower); a target that becomes the foreground is restored at once.
+- `throttled[].kind` is the verified workload class (`"background"` | `"throughput"`); every target always
+  gets both actions. `foregroundPid`/`foregroundName` = the boosted game while `active`, otherwise the current
+  foreground (or `null`). `since` is `null` while inactive. `lastSession` is kept in memory (reset by a restart).
+- *Journal*: one transaction per (target, action), `kind:"policy"`, `trigger:"boost"`, `action:"ecoqos"` |
+  `"memory_priority"`, `state` `applied` → `rolled_back` | `expired` (process gone) | `failed`. Boost targets
+  are not listed by `policies` (that is the control engine's verify/retain list) and the control engine never
+  acts on a process boost holds (its recommendations for it are dropped).
+
+**Scorecard.** Computed on request from measured data only; `null` means "not enough data yet".
+- `idleCpuPercent`, `idleRamUsedBytes`: means over the *idle* 1-minute rows of the 24 h trace tier — a minute
+  is idle when its mean CPU is < 15 % and no fullscreen foreground was reported during it (minute
+  granularity, because the 24 h tier stores per-minute means). RAM used = memTotal − memAvail. ≥ 10 idle minutes.
+- `diskLatencyMs`: mean of max(read, write) latency over the minutes with a latency > 0; `hardFaultsPerSec`:
+  mean over all minutes (≥ 10 minutes each).
+- `stutterPerHour`: 1-minute windows in which any single DPC or ISR ran ≥ 2000 µs, per hour of kernel-traced
+  time in the last 24 h (≥ 30 traced minutes; needs kernel tracing).
+- `bootMs`: median boot duration of the newest 5 Diagnostics-Performance 100 events.
+- `crashesPerWeek`: AppCrash + Bugcheck events of the last 7 days scaled to a week by the covered time
+  (since the first start minus the 24 h event-log backfill, at most 7 days; ≥ 24 h covered).
+- `hoursMeasured`: 1-minute rows in the last 24 h / 60 (one decimal).
+- The baseline is captured automatically once, 24 h after the first start of a scorecard-capable Core, when no
+  baseline exists (and at least one metric is measured). `scorecard.json` = `{ version:1, firstStartMs,
+  baseline, minutes:[[minuteIndex, flags]] }` (flags: 1 kernel-traced, 2 stutter, 4 fullscreen; ≤ 1440).
 
 ### Kernel tracing (docs/core/etw.md)
 
