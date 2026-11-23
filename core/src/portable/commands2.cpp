@@ -245,6 +245,49 @@ json::Value status_to_json(const engine::Status& st) {
     json::Value cpu = json::Value::object();
     cpu.set("contention", st.cpu_contention);
     o.set("cpu", std::move(cpu));
+    json::Value boost = json::Value::object();
+    boost.set("enabled", st.boost_enabled);
+    boost.set("active", st.boost_active);
+    o.set("boost", std::move(boost));
+    return o;
+}
+
+json::Value boost_to_json(const boost::View& v) {
+    json::Value o = json::Value::object();
+    o.set("enabled", v.enabled);
+    o.set("active", v.active);
+    o.set("since", v.active ? json::Value(v.since) : json::Value());
+    o.set("foregroundPid", v.foreground_pid != 0 ? json::Value(v.foreground_pid) : json::Value());
+    o.set("foregroundName", v.foreground_pid != 0 && !v.foreground_name.empty() ? json::Value(v.foreground_name)
+                                                                                 : json::Value());
+    json::Value arr = json::Value::array();
+    for (const auto& t : v.throttled) {
+        json::Value x = json::Value::object();
+        x.set("pid", t.target.pid);
+        x.set("name", t.target.name);
+        x.set("kind", boost::workload_name(t.workload));
+        arr.push_back(std::move(x));
+    }
+    o.set("throttled", std::move(arr));
+    if (v.last_session) {
+        json::Value ls = json::Value::object();
+        ls.set("start", v.last_session->start);
+        ls.set("end", v.last_session->end);
+        ls.set("throttledCount", v.last_session->throttled_count);
+        o.set("lastSession", std::move(ls));
+    } else {
+        o.set("lastSession", json::Value());
+    }
+    return o;
+}
+
+json::Value scorecard_to_json(const engine::ScorecardView& v) {
+    json::Value o = json::Value::object();
+    o.set("baseline", v.baseline ? scorecard::baseline_to_json(*v.baseline) : json::Value());
+    json::Value cur = json::Value::object();
+    cur.set("metrics", scorecard::metrics_to_json(v.current));
+    o.set("current", std::move(cur));
+    o.set("hoursMeasured", num(v.hours_measured));
     return o;
 }
 
@@ -399,6 +442,8 @@ json::Value build_diagnostics(engine::Engine& engine, const Platform& platform) 
     const auto jr = engine.journal(kMaxJournal);
     d.set("journal", fit_list(jr, [](const journal::Transaction& t) { return journal::to_json(t); }, 4u << 20));
     d.set("heal", heal_to_json(engine.heal(kHealHistory)));
+    d.set("boost", boost_to_json(engine.boost_view()));
+    d.set("scorecard", scorecard_to_json(engine.scorecard()));
     json::Value caps = json::Value::array();
     for (const auto& c : engine.captures()) {
         json::Value cj = json::Value::object();
@@ -523,22 +568,39 @@ void register_engine_commands(protocol::Dispatcher& d, engine::Engine& engine, c
         if (!pf->provider || !pf->provider->topology(t)) throw CommandError(ErrorCode::Internal, "topology unavailable");
         return topology_to_json(t, pf->cpu_sets);
     });
-    d.add("reportForeground", Capability::Read, [pf](const Request& req, const ClientContext& ctx) {
-        allow_only(req, {"pid"});
+    d.add("reportForeground", Capability::Read, [e, pf](const Request& req, const ClientContext& ctx) {
+        allow_only(req, {"pid", "fullscreen"});
         const json::Value* v = req.args.find("pid");
         const auto pid = v ? v->as_int() : std::nullopt;
         if (!pid || *pid <= 4 || *pid > 0xFFFFFFFFLL) bad_args("pid must be an integer process id > 4");
+        bool fullscreen = false;  // absent (older clients): not fullscreen, so no game boost
+        if (const json::Value* f = req.args.find("fullscreen")) {
+            if (!f->is_bool()) bad_args("fullscreen must be a boolean");
+            fullscreen = f->as_bool();
+        }
         if (ctx.session_id == protocol::kUnknownSession)
             throw CommandError(ErrorCode::Forbidden, "the caller's session could not be determined");
         if (!pf->report_foreground) throw CommandError(ErrorCode::Internal, "foreground hints are not supported");
         switch (pf->report_foreground(static_cast<std::uint32_t>(*pid), ctx.session_id)) {
             case ForegroundVerdict::Accepted:
+                e->report_foreground(static_cast<std::uint32_t>(*pid), fullscreen);
+                return json::Value::object();
             case ForegroundVerdict::Ignored: return json::Value::object();
             case ForegroundVerdict::NoSuchProcess: bad_args("no such process");
             case ForegroundVerdict::WrongSession: bad_args("the process is not in the caller's session");
             case ForegroundVerdict::Unavailable: break;
         }
         throw CommandError(ErrorCode::Internal, "foreground hint could not be checked");
+    });
+
+    // ---- game boost + scorecard (docs/core/alpha4.md) -------------------------------------------
+    d.add("boost", Capability::Read, [e](const Request& req, const ClientContext&) {
+        allow_only(req, {});
+        return boost_to_json(e->boost_view());
+    });
+    d.add("scorecard", Capability::Read, [e](const Request& req, const ClientContext&) {
+        allow_only(req, {});
+        return scorecard_to_json(e->scorecard());
     });
 
     // ---- kernel tracing (docs/core/etw.md) -----------------------------------------------------
@@ -575,6 +637,25 @@ void register_engine_commands(protocol::Dispatcher& d, engine::Engine& engine, c
         o.set("running", st.running);
         o.set("persisted", persisted);
         if (!st.reason.empty()) o.set("reason", st.reason);
+        return o;
+    });
+    d.add("setBoost", Capability::Admin, [e](const Request& req, const ClientContext&) {
+        allow_only(req, {"enabled"});
+        const json::Value* v = req.args.find("enabled");
+        if (!v || !v->is_bool()) bad_args("enabled is required (boolean)");
+        const engine::BoostResult r = e->set_boost(v->as_bool());
+        json::Value o = json::Value::object();
+        o.set("enabled", r.enabled);
+        o.set("active", r.active);
+        o.set("persisted", r.persisted);
+        return o;
+    });
+    d.add("captureBaseline", Capability::Admin, [e](const Request& req, const ClientContext&) {
+        allow_only(req, {});
+        const engine::CaptureResult r = e->capture_baseline();
+        json::Value o = json::Value::object();
+        o.set("baseline", scorecard::baseline_to_json(r.baseline));
+        o.set("persisted", r.persisted);
         return o;
     });
     d.add("setMode", Capability::Admin, [e](const Request& req, const ClientContext&) {

@@ -64,6 +64,11 @@ json::Value policy_to_json(const control::ActivePolicy& p);
 json::Value approval_to_json(const heal::Approval& a);
 json::Value consent_to_json(const control::PendingConsent& c);
 json::Value heal_to_json(const engine::HealView& h);
+// { enabled, active, since|null, foregroundPid|null, foregroundName|null, throttled:[{ pid, name, kind }],
+//   lastSession:{ start, end, throttledCount }|null }
+json::Value boost_to_json(const boost::View& v);
+// { baseline:{ capturedAt, metrics }|null, current:{ metrics }, hoursMeasured }
+json::Value scorecard_to_json(const engine::ScorecardView& v);
 json::Value baselines_to_json(const json::Value& summary);       // drops metrics without data yet
 json::Value topology_to_json(const commands::TopologyInfo& t, const std::vector<CpuSetInfo>& sets);
 json::Value build_diagnostics(engine::Engine& engine, const Platform& platform);

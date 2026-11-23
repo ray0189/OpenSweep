@@ -8,8 +8,8 @@ const rejects = (name, fn) => { try { const r = fn(); ok(name, false, `accepted:
 const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
 // ---- method table matches the contract (docs/core/phases-2-8.md)
-const READ = { coreSample: 'sample', coreHistory: 'history', coreBaselines: 'baselines', coreIncidents: 'incidents', coreEvents: 'events', coreRecommendations: 'recommendations', corePolicies: 'policies', coreJournal: 'journal', coreHeal: 'heal', coreLatency: 'latency', coreDiskActivity: 'diskActivity', coreHardFaults: 'hardFaults' };
-const ADMIN = { coreSetMode: 'setMode', coreRollbackAll: 'rollbackAll', coreDisablePolicy: 'disablePolicy', coreApprove: 'approve', coreExportDiagnostics: 'exportDiagnostics', coreSetEtw: 'setEtw' };
+const READ = { coreSample: 'sample', coreHistory: 'history', coreBaselines: 'baselines', coreIncidents: 'incidents', coreEvents: 'events', coreRecommendations: 'recommendations', corePolicies: 'policies', coreJournal: 'journal', coreHeal: 'heal', coreLatency: 'latency', coreDiskActivity: 'diskActivity', coreHardFaults: 'hardFaults', coreBoost: 'boost', coreScorecard: 'scorecard' };
+const ADMIN = { coreSetMode: 'setMode', coreRollbackAll: 'rollbackAll', coreDisablePolicy: 'disablePolicy', coreApprove: 'approve', coreExportDiagnostics: 'exportDiagnostics', coreSetEtw: 'setEtw', coreSetBoost: 'setBoost', coreCaptureBaseline: 'captureBaseline' };
 ok('method table has exactly the contract methods', eq(Object.keys(v.CORE_METHODS).sort(), [...Object.keys(READ), ...Object.keys(ADMIN)].sort()), Object.keys(v.CORE_METHODS).join(','));
 for (const [m, cmd] of Object.entries(READ)) ok(`${m} → ${cmd} (read)`, v.CORE_METHODS[m].cmd === cmd && v.CORE_METHODS[m].cap === 'read');
 for (const [m, cmd] of Object.entries(ADMIN)) ok(`${m} → ${cmd} (admin)`, v.CORE_METHODS[m].cmd === cmd && v.CORE_METHODS[m].cap === 'admin');
@@ -26,7 +26,7 @@ rejects('args string rejected', () => v.prepare('coreSample', 'x'));
 rejects('args number rejected', () => v.prepare('coreIncidents', 5));
 
 // ---- no-arg commands send no args, even if the renderer sends junk
-for (const m of ['coreSample', 'coreBaselines', 'coreRecommendations', 'corePolicies', 'coreHeal', 'coreLatency', 'coreDiskActivity', 'coreHardFaults', 'coreRollbackAll', 'coreExportDiagnostics']) {
+for (const m of ['coreSample', 'coreBaselines', 'coreRecommendations', 'corePolicies', 'coreHeal', 'coreLatency', 'coreDiskActivity', 'coreHardFaults', 'coreRollbackAll', 'coreExportDiagnostics', 'coreBoost', 'coreScorecard', 'coreCaptureBaseline']) {
   const p = v.prepare(m, { cmd: 'setMode', mode: 'advanced', __proto__: { x: 1 }, args: { a: 1 } });
   ok(`${m}: extra fields dropped, no args sent`, p.args === undefined && p.cmd === v.CORE_METHODS[m].cmd);
 }
@@ -67,6 +67,15 @@ for (const bad of [1, 0, 'true', 'false', '', null, [], {}, [true]]) rejects(`se
 rejects('setEtw without enabled rejected', () => v.prepare('coreSetEtw', {}));
 rejects('setEtw with no args rejected', () => v.prepare('coreSetEtw'));
 
+// ---- setBoost (Core game boost on/off)
+ok('setBoost true accepted', eq(v.prepare('coreSetBoost', { enabled: true }).args, { enabled: true }));
+ok('setBoost false accepted', eq(v.prepare('coreSetBoost', { enabled: false }).args, { enabled: false }));
+ok('setBoost sends only { enabled }', eq(v.prepare('coreSetBoost', { enabled: true, pid: 1234, targets: ['x'] }).args, { enabled: true }));
+for (const bad of [1, 0, 'true', 'on', '', null, [], {}, [true]]) rejects(`setBoost enabled ${JSON.stringify(bad)} rejected`, () => v.prepare('coreSetBoost', { enabled: bad }));
+rejects('setBoost without enabled rejected', () => v.prepare('coreSetBoost', {}));
+rejects('setBoost with no args rejected', () => v.prepare('coreSetBoost'));
+ok('boost / scorecard are read, setBoost / captureBaseline are admin', v.prepare('coreBoost').cap === 'read' && v.prepare('coreScorecard').cap === 'read' && v.prepare('coreSetBoost', { enabled: true }).cap === 'admin' && v.prepare('coreCaptureBaseline').cap === 'admin');
+
 // ---- ids
 for (const good of [1, 1042, 2 ** 53 - 1, 'tx-1042', 'apr-0006', 'a', 'A1_b.c:d-e', 'x'.repeat(64)]) {
   ok(`disablePolicy txId ${JSON.stringify(good).slice(0, 20)} accepted`, v.prepare('coreDisablePolicy', { txId: good }).args.txId === good);
@@ -97,6 +106,12 @@ const etwOn = v.describeAdmin('coreSetEtw', { enabled: true }, { etw: { running:
 ok('setEtw dialogs say "Turn kernel tracing on/off"', /^Turn kernel tracing on\/off/.test(etwOn.detail) && /^Turn kernel tracing on\/off/.test(etwOff.detail) && etwOn.ok === 'Turn on' && etwOff.ok === 'Turn off');
 ok('setEtw on dialog states privacy and cost, and the current state', /no file paths/i.test(etwOn.detail) && /2 %/.test(etwOn.detail) && /currently|Now: kernel tracing is off/.test(etwOn.detail) && !etwOn.consent);
 ok('setEtw off dialog says other measurements continue', /other measurements continue/i.test(etwOff.detail));
+const bOn = v.describeAdmin('coreSetBoost', { enabled: true }, { boost: { enabled: false } }), bOff = v.describeAdmin('coreSetBoost', { enabled: false });
+ok('setBoost on dialog says what is never touched and that it is rolled back', /never touches the game/i.test(bOn.detail) && /anti-cheat/.test(bOn.detail) && /rolled back/.test(bOn.detail) && /Now: Core game boost is off/.test(bOn.detail) && bOn.ok === 'Turn on' && !bOn.consent);
+ok('setBoost off dialog says throttled apps are restored', /restored immediately/.test(bOff.detail) && bOff.ok === 'Turn off');
+const cb = v.describeAdmin('coreCaptureBaseline', {}), cb2 = v.describeAdmin('coreCaptureBaseline', {}, { hasBaseline: true });
+ok('captureBaseline dialog says nothing is sent and nothing changes', /nothing is sent/i.test(cb.detail) && /no Windows setting changes/.test(cb.detail) && !/replacing/.test(cb.detail) && /replacing/.test(cb2.detail));
+rejects('describeAdmin rejects coreBoost (read)', () => v.describeAdmin('coreBoost', {}));
 rejects('describeAdmin rejects read methods', () => v.describeAdmin('coreSample', {}));
 rejects('describeAdmin rejects coreLatency (read)', () => v.describeAdmin('coreLatency', {}));
 

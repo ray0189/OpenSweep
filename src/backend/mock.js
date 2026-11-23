@@ -235,6 +235,31 @@ const coreSim = (() => {
       etw: (({ reason, ...e }) => e)(etwStatus()) };
   }
 
+  // Game boost (docs/core/alpha4.md §2): a simulated game is full screen for 30 s, then not for 30 s.
+  const BOOST_PERIOD = 60e3, BOOST_ON = 30e3;
+  const BOOST_THROTTLED = [{ pid: 9120, name: 'OneDrive.exe', kind: 'ecoqos' }, { pid: 11872, name: 'Teams.exe', kind: 'ecoqos' }, { pid: 6644, name: 'Spotify.exe', kind: 'memory_priority' }];
+  sim.boost = { enabled: true, enabledAt: T0 - 2 * 3600e3 };
+  function boost() {
+    const now = Date.now(), b = sim.boost;
+    const phase = (now - b.enabledAt) % BOOST_PERIOD, cycleStart = now - phase;
+    const active = b.enabled && phase < BOOST_ON;
+    const prevStart = active ? cycleStart - BOOST_PERIOD : cycleStart;
+    const lastSession = b.enabled && prevStart >= b.enabledAt ? { start: prevStart, end: prevStart + BOOST_ON, throttledCount: BOOST_THROTTLED.length }
+      : b.lastSession || null;
+    return { simulated: true, enabled: b.enabled, active, since: active ? cycleStart : null, foregroundPid: active ? 15320 : 2210, foregroundName: active ? 'ExampleGame.exe' : 'explorer.exe',
+      throttled: active ? BOOST_THROTTLED.map(t => ({ ...t })) : [], restored: !active && !!lastSession, lastSession };
+  }
+  // Scorecard (docs/core/alpha4.md §3): "before" captured 9 days ago; "now" shows modest gains and one regression.
+  const SC_METRICS_BEFORE = { bootMs: 41200, idleCpuPercent: 4.1, idleRamUsedBytes: Math.round(7.9 * GB), diskLatencyMs: 1.9, hardFaultsPerSec: 31, stutterPerHour: 6.5, crashesPerWeek: 2 };
+  const SC_METRICS_NOW = { bootMs: 33800, idleCpuPercent: 2.6, idleRamUsedBytes: 6.4 * GB, diskLatencyMs: 2.3, hardFaultsPerSec: 22, stutterPerHour: 3.1, crashesPerWeek: null };
+  sim.scorecard = { baseline: { capturedAt: T0 - 9 * 86400e3, metrics: { ...SC_METRICS_BEFORE } } };
+  function scorecard() {
+    const jitter = (v, k) => (v === null ? null : Math.round(v * (1 + 0.01 * noise(k, Date.now(), 60e3)) * 100) / 100);
+    const metrics = Object.fromEntries(Object.entries(SC_METRICS_NOW).map(([k, v]) => [k, k === 'bootMs' || k === 'crashesPerWeek' ? v : k === 'idleRamUsedBytes' ? Math.round(jitter(v, k)) : jitter(v, k)]));
+    return { simulated: true, baseline: sim.scorecard.baseline ? { capturedAt: sim.scorecard.baseline.capturedAt, metrics: { ...sim.scorecard.baseline.metrics } } : null,
+      current: { metrics }, hoursMeasured: Math.round((Date.now() - sim.ticks0) / 3600e3 * 10) / 10 + 213 };
+  }
+
   function nextTx() { return `tx-${++sim.txSeq}`; }
   function command(cmd, args = {}) {
     if (!state.core || !state.core.running) { const e = new Error('Simulated OpenSweep Core is stopped'); e.code = 'unavailable'; throw e; }
@@ -265,7 +290,27 @@ const coreSim = (() => {
       case 'heal': return { simulated: true, breaker: { ...breaker }, pending: approvals.map(a => ({ ...a })), history: journal.filter(j => j.kind === 'recovery').sort((x, y) => y.createdMs - x.createdMs) };
       case 'topology': return { simulated: true, logicalProcessors: 16, cores: 8, packages: 1, numaNodes: 1, groups: 1, hybrid: false, efficiencyClasses: [8], l3Caches: 1,
         cpuSets: [...Array(16)].map((_, i) => ({ id: 256 + i, group: 0, core: i >> 1, efficiencyClass: 0, numa: 0 })) };
-      case 'reportForeground': return {};
+      case 'reportForeground': {
+        if (!Number.isSafeInteger(args.pid) || args.pid <= 4) throw badArgs('pid must be a process id');
+        if (args.fullscreen !== undefined && typeof args.fullscreen !== 'boolean') throw badArgs('fullscreen must be a boolean');
+        return {};
+      }
+      case 'boost': return boost();
+      case 'setBoost': {
+        if (typeof args.enabled !== 'boolean') throw badArgs('enabled must be a boolean');
+        if (sim.boost.enabled !== args.enabled) {
+          if (!args.enabled) { const b = boost(); sim.boost.lastSession = b.active ? { start: b.since, end: Date.now(), throttledCount: b.throttled.length } : b.lastSession; }
+          sim.boost.enabled = args.enabled; sim.boost.enabledAt = Date.now();
+          journal.push(tx({ txId: nextTx(), createdMs: Date.now(), kind: 'config', action: 'set_boost', target: { pid: 0, name: 'game boost', startMs: 0 }, value: args.enabled ? 'on' : 'off', original: args.enabled ? 'off' : 'on', requiredAuth: 'admin', state: 'applied', trigger: 'Changed by an administrator from the OpenSweep app.' }));
+        }
+        return boost();
+      }
+      case 'scorecard': return scorecard();
+      case 'captureBaseline': {
+        const cur = scorecard().current.metrics;
+        sim.scorecard.baseline = { capturedAt: Date.now(), metrics: { ...cur } };
+        return scorecard();
+      }
       case 'latency': return latency();
       case 'diskActivity': return diskActivity();
       case 'hardFaults': return hardFaults();

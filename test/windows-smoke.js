@@ -136,6 +136,20 @@ Register-ScheduledTask -TaskName 'OpenSweepFakeAppUpdate' -Action (New-Scheduled
   await step('setCleanSchedule weekly', () => W.setCleanSchedule({ freq: 'weekly', exe: process.execPath }));
   await step('setCleanSchedule off', () => W.setCleanSchedule({ freq: 'off', exe: process.execPath }));
 
+  // ---------------- 0.4.0-alpha.4: Hardware check (read-only; no fixes are run here)
+  const HW = require('../src/backend/hardware');
+  const hwr = await step('hwCheck', () => HW.hwCheck());
+  if (hwr) {
+    const checks = Array.isArray(hwr.checks) ? hwr.checks : [];
+    for (const id of HW.CHECK_IDS) if (!checks.some(c => c.id === id)) fail('hwCheck', `check ${id} missing`);
+    for (const c of checks) {
+      for (const p of HW.validateCheck(c)) fail(`hwCheck ${c.id}`, p);
+      console.log(`  ${({ ok: '✓', warn: '!', bad: '✗', unknown: '?' })[c.status] || c.status} ${c.id}: ${c.found} | expected ${c.expected}${c.status === 'unknown' ? ` | ${c.why}` : ''}`);
+      for (const i of c.items || []) console.log(`      - ${i.label}: ${i.found}`);
+    }
+    console.log('  timings (ms):', JSON.stringify(hwr.ms));
+  }
+
   console.log(failures ? `\n${failures} problem(s) found` : '\nAll good');
   process.exit(failures ? 1 : 0);
 })().catch(e => { console.error(e); process.exit(1); });

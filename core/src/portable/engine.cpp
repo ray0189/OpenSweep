@@ -44,6 +44,12 @@ kguard::KernelGuardConfig kernel_guard_config(const EngineOptions& o) {
     return g;
 }
 
+boost::BoostConfig boost_config(const EngineOptions& o) {
+    boost::BoostConfig b = o.boost;
+    b.lists = o.scheduler.lists;  // one protection list for every module
+    return b;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -56,6 +62,7 @@ json::Value settings_to_json(const Settings& s) {
     for (PolicyKind k : s.opted_in) kinds.push_back(telemetry::to_string(k));
     v.set("optIn", std::move(kinds));
     v.set("etw", s.etw);
+    v.set("boost", s.boost);
     return v;
 }
 
@@ -65,7 +72,8 @@ std::optional<Settings> settings_from_json(const json::Value& v, std::string& er
         return std::nullopt;
     }
     for (const auto& [key, val] : v.as_object()) {
-        if (key != "version" && key != "mode" && key != "simulation" && key != "optIn" && key != "etw") {
+        if (key != "version" && key != "mode" && key != "simulation" && key != "optIn" && key != "etw" &&
+            key != "boost") {
             error = "unknown key in config";
             return std::nullopt;
         }
@@ -110,6 +118,13 @@ std::optional<Settings> settings_from_json(const json::Value& v, std::string& er
             return std::nullopt;
         }
         s.etw = etw->as_bool();
+    }
+    if (const json::Value* b = v.find("boost")) {
+        if (!b->is_bool()) {
+            error = "boost must be a boolean";
+            return std::nullopt;
+        }
+        s.boost = b->as_bool();
     }
     return s;
 }
@@ -204,7 +219,9 @@ Engine::Engine(telemetry::Actuator& actuator, heal::Executor& executor, trace::F
       memory_(options_.memory),
       scheduler_(options_.scheduler),
       journal_(jio_, join_path(options_.data_dir, kJournalFile), options_.journal),
-      control_(actuator, journal_, control_config(options_, cfg_.settings)) {
+      control_(actuator, journal_, control_config(options_, cfg_.settings)),
+      boost_(actuator, journal_, boost_config(options_)) {
+    boost_.set_enabled(cfg_.settings.boost, 0);  // enabling never touches the system by itself
     owned_exec_ = std::make_unique<OwnedExecutor>(*this, executor);
     heal_ = std::make_unique<heal::SweepHeal>(journal_, *owned_exec_, options_.heal);
     mode_.store(control_.mode(), std::memory_order_relaxed);
@@ -232,12 +249,21 @@ StartReport Engine::start() {
     rep.incidents = incidents_.load(io_, data_path(kIncidentsFile));
     rep.journal = journal_.load();
 
+    rep.scorecard = scorecard_.load(io_, data_path(kScorecardFile));
+    if (rep.scorecard.corrupt) log("scorecard.json is invalid; starting a new scorecard");
+
     const std::int64_t t = now();
-    // Crash recovery: anything the journal says may still be applied is rolled back.
+    // Crash recovery: anything the journal says may still be applied is rolled back. Boost
+    // transactions (trigger "boost") belong to GameBoost; the control engine skips them.
+    rep.boost_recovered = boost_.recover(t);
     rep.recovered = control_.recover(t);
     rep.heal_expired = heal_->recover(t);
     last_incident_size_ = incidents_.size();
     last_incident_open_ = incidents_.open_count();
+    if (scorecard_.first_start() <= 0) {
+        scorecard_.set_first_start(t);
+        save_scorecard_locked();
+    }
     started_ = true;
     mode_.store(control_.mode(), std::memory_order_relaxed);
 
@@ -247,7 +273,8 @@ StartReport Engine::start() {
         " incidents=" + std::to_string(rep.incidents.loaded) + " journal=" + std::to_string(rep.journal.loaded) +
         " (corrupt " + std::to_string(rep.journal.corrupt) + ") recovered: restored=" +
         std::to_string(rep.recovered.restored) + " failed=" + std::to_string(rep.recovered.failed) +
-        " expired=" + std::to_string(rep.recovered.expired) + " heal_expired=" + std::to_string(rep.heal_expired));
+        " expired=" + std::to_string(rep.recovered.expired) + " boost restored=" +
+        std::to_string(rep.boost_recovered.restored) + " heal_expired=" + std::to_string(rep.heal_expired));
     return rep;
 }
 
@@ -301,6 +328,10 @@ void Engine::propose_recoveries_locked(std::int64_t t) {
 
 void Engine::clear_caches_locked() { captures_.clear(); }
 
+void Engine::save_scorecard_locked() {
+    if (!scorecard_.save(io_, data_path(kScorecardFile))) log("scorecard.json could not be written");
+}
+
 void Engine::record_config_event(std::int64_t t, std::string message) {
     EventRecord e;
     e.ts_ms = t;
@@ -338,6 +369,10 @@ void Engine::persist_locked(std::int64_t t, bool force, bool incidents_changed, 
     if (force || incidents_changed || inc_due) {
         if (!incidents_.persist(io_, data_path(kIncidentsFile))) log("incidents.jsonl could not be written");
         last_incident_save_ = t;
+    }
+    if (due(last_scorecard_save_, options_.scorecard_persist_ms)) {
+        save_scorecard_locked();
+        last_scorecard_save_ = t;
     }
     if (force || events_changed || events_dirty_) {
         events_dirty_ = !trace_.persist_events(io_, data_path(kEventsFile));
@@ -401,6 +436,29 @@ void Engine::tick(const Sample& s, std::span<const EventRecord> events) {
     recs.insert(recs.end(), sa.recommendations.begin(), sa.recommendations.end());
     recs.insert(recs.end(), ka.recommendations.begin(), ka.recommendations.end());
 
+    // GAME BOOST (explicit user opt-in; works in any mode). Never touches what the control engine
+    // holds, and the control engine never sees recommendations for what boost holds.
+    {
+        std::vector<std::uint32_t> held;
+        for (const auto& ap : control_.active()) held.push_back(ap.rec.target.pid);
+        boost_.tick(s, held);
+        const auto boosted = boost_.held_pids();
+        if (!boosted.empty())
+            std::erase_if(recs, [&](const policy::Recommendation& r) {
+                return std::find(boosted.begin(), boosted.end(), r.target.pid) != boosted.end();
+            });
+    }
+    scorecard_.observe(s, boost_.fullscreen_now());
+    if (scorecard_.auto_capture_due(t)) {
+        const auto evs = trace_.events(0);
+        scorecard::Metrics m = scorecard_.compute(trace_, evs, t);
+        if (m.any()) {
+            scorecard_.set_baseline({t, m});
+            save_scorecard_locked();
+            log("scorecard baseline captured automatically (24 h after the first start)");
+        }
+    }
+
     // DECIDE / APPLY / VERIFY (write-ahead journal inside the control engine)
     const policy::VerificationMetrics vm =
         policy::verification_metrics(s, options_.topology.logical_count, std::nullopt);
@@ -434,7 +492,8 @@ void Engine::tick(const Sample& s, std::span<const EventRecord> events) {
 control::RollbackSummary Engine::shutdown() {
     std::lock_guard<std::mutex> lock(mu_);
     const std::int64_t t = now();
-    const control::RollbackSummary s = control_.shutdown(t);
+    control::RollbackSummary s = boost_.end(t, "service_stop");
+    s.add(control_.shutdown(t));
     persist_locked(t, true, true, true);
     log("engine shutdown: restored=" + std::to_string(s.restored) + " failed=" + std::to_string(s.failed) +
         " expired=" + std::to_string(s.expired));
@@ -478,6 +537,8 @@ Status Engine::status() const {
     st.memory_level = memory::to_string(mem_level_);
     st.memory_score = mem_score_;
     st.cpu_contention = contention_;
+    st.boost_enabled = boost_.enabled();
+    st.boost_active = boost_.active();
     return st;
 }
 
@@ -562,6 +623,32 @@ std::vector<std::string> Engine::kernel_notes() const {
     return kernel_notes_;
 }
 
+boost::View Engine::boost_view() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return boost_.view();
+}
+
+bool Engine::boost_enabled() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return boost_.enabled();
+}
+
+ScorecardView Engine::scorecard() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    ScorecardView v;
+    const std::int64_t t = now();
+    const auto evs = trace_.events(0);
+    v.baseline = scorecard_.baseline();
+    v.current = scorecard_.compute(trace_, evs, t);
+    v.hours_measured = scorecard_.hours_measured(trace_, t);
+    return v;
+}
+
+void Engine::report_foreground(std::uint32_t pid, bool fullscreen) {
+    std::lock_guard<std::mutex> lock(mu_);
+    boost_.report_foreground(pid, fullscreen, now());
+}
+
 // ---- admin side -----------------------------------------------------------------------------
 bool Engine::save_settings_locked(const Settings& s) {
     return io_.write_atomic(data_path(kConfigFile), json::serialize(settings_to_json(s)) + "\n");
@@ -603,7 +690,11 @@ ModeResult Engine::set_mode(Mode m, std::optional<bool> simulation, std::optiona
 
 control::RollbackSummary Engine::rollback_all() {
     std::lock_guard<std::mutex> lock(mu_);
-    return control_.rollback_all(now(), "admin_rollback_all");
+    const std::int64_t t = now();
+    // Also ends a boost session; a new one starts only after the game left fullscreen.
+    control::RollbackSummary s = boost_.end(t, "admin_rollback_all", /*suppress=*/true);
+    s.add(control_.rollback_all(t, "admin_rollback_all"));
+    return s;
 }
 
 bool Engine::disable_policy(const std::string& tx_id) {
@@ -661,6 +752,34 @@ bool Engine::set_etw(bool enabled) {
 bool Engine::etw_enabled() const {
     std::lock_guard<std::mutex> lock(mu_);
     return cfg_.settings.etw;
+}
+
+BoostResult Engine::set_boost(bool enabled) {
+    std::lock_guard<std::mutex> lock(mu_);
+    BoostResult r;
+    const std::int64_t t = now();
+    const bool before = cfg_.settings.boost;
+    cfg_.settings.boost = enabled;
+    r.restored = boost_.set_enabled(enabled, t);
+    r.persisted = save_settings_locked(cfg_.settings);
+    if (!r.persisted) log("config.json could not be written; the boost switch will not survive a restart");
+    if (before != enabled) record_config_event(t, std::string("Game boost ") + (enabled ? "enabled" : "disabled"));
+    r.enabled = boost_.enabled();
+    r.active = boost_.active();
+    return r;
+}
+
+CaptureResult Engine::capture_baseline() {
+    std::lock_guard<std::mutex> lock(mu_);
+    CaptureResult r;
+    const std::int64_t t = now();
+    const auto evs = trace_.events(0);
+    r.baseline.captured_at = t;
+    r.baseline.metrics = scorecard_.compute(trace_, evs, t);
+    scorecard_.set_baseline(r.baseline);
+    r.persisted = scorecard_.save(io_, data_path(kScorecardFile));
+    if (!r.persisted) log("scorecard.json could not be written; the baseline will not survive a restart");
+    return r;
 }
 
 std::optional<std::string> Engine::write_data_file(std::string_view name, std::string_view data) {

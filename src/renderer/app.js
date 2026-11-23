@@ -102,7 +102,7 @@ function meter(p, warnAt = 75, badAt = 90) { return h('div', { class: 'meter' + 
 // ------------------------------------------------------------------ state + router
 const S = { page: 'home', timers: [], C: null, info: null, settings: null, cache: {}, listeners: {}, onLeave: null };
 const NAV = [
-  ['Overview', [['home', 'home', 'Home'], ['clean', 'sparkles', 'Clean everything'], ['optimize', 'sliders', 'Optimize'], ['debloat', 'scissors', 'Debloat & AI']]],
+  ['Overview', [['home', 'home', 'Home'], ['clean', 'sparkles', 'Clean everything'], ['optimize', 'sliders', 'Optimize'], ['performance', 'zap', 'Performance'], ['debloat', 'scissors', 'Debloat & AI']]],
   ['Manage', [['apps', 'package', 'Uninstaller'], ['storage', 'pie', 'Space analyzer'], ['startup', 'power', 'Startup apps'], ['processes', 'activity', 'Processes']]],
   ['Protect', [['security', 'shield', 'Security'], ['reliability', 'pulse', 'Reliability'], ['updates', 'refresh', 'Windows Update'], ['network', 'wifi', 'Network'], ['core', 'cpu', 'OpenSweep Core']]],
   ['Tools', [['repair', 'repair', 'Repair & power'], ['toolbox', 'grid', 'Toolbox'], ['system', 'info', 'System info'], ['history', 'history', 'History & undo'], ['settings', 'gear', 'Settings']]],

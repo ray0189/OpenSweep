@@ -54,6 +54,8 @@ add_library(opensweep_portable STATIC
   src/portable/commands2.cpp
   src/portable/kernel_stats.cpp
   src/portable/kernel_guard.cpp
+  src/portable/boost.cpp
+  src/portable/scorecard.cpp
 )
 target_include_directories(opensweep_portable PUBLIC src/portable)
 opensweep_set_warnings(opensweep_portable)
@@ -82,6 +84,8 @@ add_executable(core_tests
   tests/test_commands2.cpp
   tests/test_kernel_stats.cpp
   tests/test_kernel_guard.cpp
+  tests/test_boost.cpp
+  tests/test_scorecard.cpp
 )
 target_link_libraries(core_tests PRIVATE opensweep_portable)
 opensweep_set_warnings(core_tests)

@@ -78,6 +78,15 @@ const RANGES = ['30m', '24h', '14d'];
 const DASH_METRICS = ['cpuPercent', 'memLoadPercent', 'commitTotal', 'diskReadLatencyMs', 'hardFaultsPerSec'];
 const isInt = (x) => Number.isInteger(x);
 const isStr = (x) => typeof x === 'string';
+// Game boost + scorecard (docs/core/alpha4.md). Timestamps may be epoch ms or ISO strings.
+const isTs = (x) => num(x) || (isStr(x) && !Number.isNaN(Date.parse(x)));
+const SCORE_METRICS = ['bootMs', 'idleCpuPercent', 'idleRamUsedBytes', 'diskLatencyMs', 'hardFaultsPerSec', 'stutterPerHour', 'crashesPerWeek'];
+const boostShape = (b) => !!b && typeof b.enabled === 'boolean' && typeof b.active === 'boolean' && (b.since === null || b.since === undefined || isTs(b.since))
+  && (b.foregroundPid === null || b.foregroundPid === undefined || isInt(b.foregroundPid)) && (b.foregroundName === null || b.foregroundName === undefined || isStr(b.foregroundName))
+  && Array.isArray(b.throttled) && b.throttled.length <= 16 && b.throttled.every(t => isInt(t.pid) && isStr(t.name) && !/[\\/]/.test(t.name) && isStr(t.kind))
+  && (b.lastSession === null || b.lastSession === undefined || (isTs(b.lastSession.start) && isTs(b.lastSession.end) && isInt(b.lastSession.throttledCount)));
+const metricsShape = (m) => !!m && typeof m === 'object' && SCORE_METRICS.every(k => m[k] === null || m[k] === undefined || num(m[k]));
+const scorecardShape = (s) => !!s && (s.baseline === null || (isTs(s.baseline.capturedAt) && metricsShape(s.baseline.metrics))) && s.current && metricsShape(s.current.metrics) && num(s.hoursMeasured) && s.hoursMeasured >= 0;
 const tsOf = (x) => Number(x && (x.tsMs ?? x.ts ?? x.createdMs ?? x.firstSeen ?? x.appliedAt)) || 0;
 // "newest first": true if the list is descending by any of the given timestamp fields.
 const newestFirst = (list, keys) => keys.some(k => list.every((x, i) => i === 0 || Number(x[k]) <= Number(list[i - 1][k])));
@@ -266,6 +275,12 @@ async function engineReadChecks(c, label, serverPid) {
 
   await latencyChecks(c, label, { workload: label === 'console' });
 
+  // Game boost + scorecard reads (docs/core/alpha4.md).
+  try { const b = await c.call('boost'); ok(`boost shape (${label})`, boostShape(b), JSON.stringify(b).slice(0, 300)); ok(`boost: never active while disabled (${label})`, b.active === false || b.enabled === true, JSON.stringify({ enabled: b.enabled, active: b.active })); }
+  catch (e) { ok(`boost answers (${label})`, false, `${e.code} ${e.message}`); }
+  try { const sc = await c.call('scorecard'); ok(`scorecard shape (${label})`, scorecardShape(sc), JSON.stringify(sc).slice(0, 400)); }
+  catch (e) { ok(`scorecard answers (${label})`, false, `${e.code} ${e.message}`); }
+
   // Foreground hint: own pid accepted, bogus pids rejected.
   try { const r = await c.call('reportForeground', { pid: process.pid }); ok(`reportForeground with own pid accepted (${label})`, r && typeof r === 'object', JSON.stringify(r)); }
   catch (e) { ok(`reportForeground with own pid accepted (${label})`, false, `${e.code} ${e.message}`); }
@@ -273,6 +288,13 @@ async function engineReadChecks(c, label, serverPid) {
   await expectErr('reportForeground with pid 0 -> bad_args', c.call('reportForeground', { pid: 0 }), 'bad_args');
   await expectErr('reportForeground with pid as string -> bad_args', c.call('reportForeground', { pid: String(process.pid) }), 'bad_args');
   await expectErr('reportForeground without pid -> bad_args', c.call('reportForeground', {}), 'bad_args');
+  for (const fs of [true, false]) {
+    try { const r = await c.call('reportForeground', { pid: process.pid, fullscreen: fs }); ok(`reportForeground with fullscreen ${fs} accepted (${label})`, r && typeof r === 'object', JSON.stringify(r)); }
+    catch (e) { ok(`reportForeground with fullscreen ${fs} accepted (${label})`, false, `${e.code} ${e.message}`); }
+  }
+  await expectErr('reportForeground with fullscreen "yes" -> bad_args', c.call('reportForeground', { pid: process.pid, fullscreen: 'yes' }), 'bad_args');
+  await expectErr('reportForeground with fullscreen 1 -> bad_args', c.call('reportForeground', { pid: process.pid, fullscreen: 1 }), 'bad_args');
+  try { await c.call('reportForeground', { pid: process.pid, fullscreen: false }); } catch { /* leave Core with a non-full-screen foreground */ }
   if (label === 'console') console.log('  not tested: reportForeground with a pid from another session (needs a second interactive session)');
   return true;
 }
@@ -290,8 +312,8 @@ const { spawnSync } = require('child_process');
 (async () => {
   const res = { elevated: spawnSync('net.exe', ['session'], { windowsHide: true }).status === 0, calls: {} };
   const c = cc.createCoreClient({ timeout: 5000 });
-  for (const [cmd, args] of [['status'], ['latency'], ['setMode', { mode: 'balanced' }], ['rollbackAll'], ['approve', { id: 'test-approval' }], ['disablePolicy', { txId: 1 }], ['exportDiagnostics'], ['setEtw', { enabled: false }]]) {
-    try { const r = await c.call(cmd, args); res.calls[cmd] = { ok: true, result: cmd === 'status' ? { mode: r.mode } : cmd === 'latency' ? { running: r.status && r.status.running } : r }; }
+  for (const [cmd, args] of [['status'], ['latency'], ['setMode', { mode: 'balanced' }], ['rollbackAll'], ['approve', { id: 'test-approval' }], ['disablePolicy', { txId: 1 }], ['exportDiagnostics'], ['setEtw', { enabled: false }], ['boost'], ['scorecard'], ['setBoost', { enabled: true }], ['captureBaseline']]) {
+    try { const r = await c.call(cmd, args); res.calls[cmd] = { ok: true, result: cmd === 'status' ? { mode: r.mode } : cmd === 'latency' ? { running: r.status && r.status.running } : cmd === 'boost' ? { enabled: r.enabled } : cmd === 'scorecard' ? { baseline: !!r.baseline } : r }; }
     catch (e) { res.calls[cmd] = { ok: false, code: e.code, message: e.message }; }
   }
   c.close();
@@ -310,7 +332,8 @@ const { spawnSync } = require('child_process');
   note('de-elevated client started (net session refused => not elevated)');
   ok('non-admin client can still read (status)', res.calls.status && res.calls.status.ok === true, JSON.stringify(res.calls.status));
   ok('non-admin client can read latency', res.calls.latency && res.calls.latency.ok === true, JSON.stringify(res.calls.latency));
-  for (const cmd of ['setMode', 'rollbackAll', 'approve', 'disablePolicy', 'exportDiagnostics', 'setEtw']) ok(`non-admin ${cmd} -> forbidden`, res.calls[cmd] && res.calls[cmd].ok === false && res.calls[cmd].code === 'forbidden', JSON.stringify(res.calls[cmd]));
+  ok('non-admin client can read boost and scorecard', res.calls.boost && res.calls.boost.ok === true && res.calls.scorecard && res.calls.scorecard.ok === true, JSON.stringify([res.calls.boost, res.calls.scorecard]));
+  for (const cmd of ['setMode', 'rollbackAll', 'approve', 'disablePolicy', 'exportDiagnostics', 'setEtw', 'setBoost', 'captureBaseline']) ok(`non-admin ${cmd} -> forbidden`, res.calls[cmd] && res.calls[cmd].ok === false && res.calls[cmd].code === 'forbidden', JSON.stringify(res.calls[cmd]));
 }
 
 // 60 s soak in Monitor mode: service working set and tick cost, and no applied policy.
@@ -387,6 +410,31 @@ async function adminChecks(c) {
     const back = await until(async () => { const l = await c.call('latency'); return l.status && l.status.running ? l : null; }, 10000, 250);
     ok('latency.status.running true again within 10 s of setEtw true', !!back, `${Date.now() - t} ms`);
   } catch (e) { ok('setEtw false → true', false, `${e.code} ${e.message}`); try { await c.call('setEtw', { enabled: true }); } catch { /* reported above */ } }
+  // Game boost on → off (docs/core/alpha4.md `setBoost`), then the original setting is put back.
+  await expectErr('setBoost without enabled -> bad_args', c.call('setBoost', {}), 'bad_args');
+  await expectErr('setBoost with enabled as string -> bad_args', c.call('setBoost', { enabled: 'true' }), 'bad_args');
+  let boostWas = null;
+  try {
+    boostWas = (await c.call('boost')).enabled;
+    const on = await c.call('setBoost', { enabled: true }, { timeout: 15000 });
+    const b1 = await c.call('boost');
+    ok('setBoost true -> boost.enabled true', b1.enabled === true && (!on || on.enabled === undefined || on.enabled === true), JSON.stringify({ result: on, enabled: b1.enabled }));
+    ok('boost shape after setBoost true', boostShape(b1), JSON.stringify(b1).slice(0, 300));
+    const off = await c.call('setBoost', { enabled: false }, { timeout: 15000 });
+    const b2 = await c.call('boost');
+    ok('setBoost false -> boost.enabled false, not active, nothing throttled', b2.enabled === false && b2.active === false && b2.throttled.length === 0, JSON.stringify({ result: off, boost: b2 }).slice(0, 300));
+    const jr2 = await c.call('journal', { limit: 50 });
+    ok('setBoost is journaled', jr2.entries.some(t => /boost/i.test(JSON.stringify(t))), `${jr2.entries.length} entries`);
+  } catch (e) { ok('setBoost true → false', false, `${e.code} ${e.message}`); }
+  if (boostWas === true) { try { await c.call('setBoost', { enabled: true }); note('game boost switched back on (it was on before the test)'); } catch (e) { ok('restore original game boost setting', false, `${e.code} ${e.message}`); } }
+  // Scorecard baseline capture.
+  try {
+    const r = await c.call('captureBaseline', undefined, { timeout: 15000 });
+    ok('captureBaseline answers', r && typeof r === 'object', JSON.stringify(r).slice(0, 200));
+    const sc = await c.call('scorecard');
+    ok('scorecard.baseline non-null after captureBaseline', !!sc.baseline && isTs(sc.baseline.capturedAt) && metricsShape(sc.baseline.metrics), JSON.stringify(sc.baseline).slice(0, 300));
+    ok('scorecard shape after captureBaseline', scorecardShape(sc));
+  } catch (e) { ok('captureBaseline → scorecard', false, `${e.code} ${e.message}`); }
   const s = await c.call('status');
   ok('ends in monitor mode', s.mode === 'monitor', s.mode);
 }

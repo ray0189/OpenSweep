@@ -523,6 +523,7 @@ RollbackSummary ControlEngine::recover(std::int64_t now) {
             continue;
         }
         if (t->kind != "policy") continue;  // recovery transactions belong to SweepHeal
+        if (t->trigger == "boost") continue;  // game boost transactions belong to boost::GameBoost::recover
         const auto kind = parse_policy_kind(t->action);
         if (!kind) {
             journal_.update(id, now, TxState::Failed, "crash_recovery", "unknown action; cannot restore");

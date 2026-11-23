@@ -61,6 +61,11 @@ const CORE_METHODS = Object.freeze({
   coreApprove: { cmd: 'approve', cap: 'admin', args: (a) => ({ id: id(a.id, 'approval id') }) },
   coreExportDiagnostics: { cmd: 'exportDiagnostics', cap: 'admin' },
   coreSetEtw: { cmd: 'setEtw', cap: 'admin', args: (a) => ({ enabled: bool(a.enabled, 'enabled') }) },
+  // Game boost + scorecard (docs/core/alpha4.md).
+  coreBoost: { cmd: 'boost', cap: 'read' },
+  coreScorecard: { cmd: 'scorecard', cap: 'read' },
+  coreSetBoost: { cmd: 'setBoost', cap: 'admin', args: (a) => ({ enabled: bool(a.enabled, 'enabled') }) },
+  coreCaptureBaseline: { cmd: 'captureBaseline', cap: 'admin' },
 });
 
 // Returns { cmd, cap, args } for a renderer method, or throws bad_args. Unknown keys are dropped;
@@ -110,6 +115,14 @@ function describeAdmin(method, args, ctx = {}) {
         ? { title: 'Turn kernel tracing on', message: 'Turn kernel tracing on?', detail: `Turn kernel tracing on/off: OpenSweep Core starts its own private Windows kernel trace session (ETW, no driver) to measure which drivers delay the system (DPC/ISR time), disk activity per app and hard page faults per app. Only driver and app names, byte counts and timings are kept — no file paths, contents or keystrokes. It normally costs well under 2 % of one CPU; if it costs more, Core reduces or stops it on its own.${cur}`, ok: 'Turn on' }
         : { title: 'Turn kernel tracing off', message: 'Turn kernel tracing off?', detail: `Turn kernel tracing on/off: OpenSweep Core stops its kernel trace session. The Latency tab and the driver-latency, disk and paging incidents stop updating; all other measurements continue. Nothing else is changed and you can turn it on again at any time.${cur}`, ok: 'Turn off' };
     }
+    case 'coreSetBoost': {
+      const cur = ctx.boost ? `\n\nNow: Core game boost is ${ctx.boost.enabled ? 'on' : 'off'}.` : '';
+      return args.enabled
+        ? { title: 'Turn Core game boost on', message: 'Turn OpenSweep Core game boost on?', detail: `While a game or other full-screen app is in front, OpenSweep Core puts background apps that use noticeable CPU (at least 1 % over the last 30 s) into efficiency mode (EcoQoS) and lowers their memory priority, at most 16 at a time. It never touches the game itself or its child processes, audio, anti-cheat, security or Windows system processes. Every change is journaled and rolled back when the game leaves full screen, when you turn this off, and when the service stops. It does not overclock, kill apps or change drivers.${cur}`, ok: 'Turn on' }
+        : { title: 'Turn Core game boost off', message: 'Turn OpenSweep Core game boost off?', detail: `OpenSweep Core stops throttling background apps while you play. Anything it throttled right now is restored immediately. Nothing else is changed.${cur}`, ok: 'Turn off' };
+    }
+    case 'coreCaptureBaseline':
+      return { title: 'Capture "Before" numbers', message: 'Save the current measurements as your "Before" baseline?', detail: `OpenSweep Core stores its measurements of the last 24 hours (boot time, idle CPU and memory, storage latency, hard page faults, stutter and crashes) as the "Before" column of the scorecard${ctx.hasBaseline ? ', replacing the baseline you captured earlier' : ''}. Later numbers are compared with it. Only numbers are saved on this PC; nothing is sent anywhere and no Windows setting changes.`, ok: 'Capture' };
     default:
       throw badArgs('Not an admin method');
   }

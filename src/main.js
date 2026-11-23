@@ -14,7 +14,7 @@ let win = null, widget = null, tray = null, quitting = false;
 // ------------------------------------------------------------------ settings
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
 const DEFAULTS = { theme: 'system', minimizeToTray: true, showWidget: false, launchAtLogin: false, confirmActions: true, scanRoot: '', shortcuts: [], history: [],
-  autoUpdate: true, stabilityMonitor: true, stabilityNotify: true, stabilitySeen: null, settingsGuard: true, guardTweaks: [], autoClean: 'off' };
+  autoUpdate: true, stabilityMonitor: true, stabilityNotify: true, stabilitySeen: null, settingsGuard: true, guardTweaks: [], autoClean: 'off', gameBoost: false };
 let settings = { ...DEFAULTS };
 function loadSettings() { try { settings = { ...DEFAULTS, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) }; } catch { settings = { ...DEFAULTS }; } }
 function saveSettings() { try { fs.mkdirSync(path.dirname(settingsFile()), { recursive: true }); fs.writeFileSync(settingsFile(), JSON.stringify(settings, null, 2)); } catch { /* non-fatal */ } }
@@ -136,7 +136,7 @@ function scheduleStability() {
   if (DEMO) return;
   let last = 0;
   const tick = () => {
-    if (!settings.stabilityMonitor) return;
+    if (!settings.stabilityMonitor || gb.boosting) return; // paused while a game boost runs
     const every = (powerMonitor.isOnBatteryPower && powerMonitor.isOnBatteryPower() ? 3 : 1) * 3600e3;
     if (Date.now() - last < every - 60e3) return;
     last = Date.now();
@@ -172,7 +172,7 @@ function hardenDataDir() {
 // ------------------------------------------------------------------ settings guard (keeps your tweaks applied)
 let guardRunning = false;
 async function runGuard({ manual = false } = {}) {
-  if (DEMO || guardRunning || (!settings.settingsGuard && !manual)) return { restored: [] };
+  if (DEMO || guardRunning || (!settings.settingsGuard && !manual) || (gb.boosting && !manual)) return { restored: [] };
   const ids = (settings.guardTweaks || []).filter(id => C.TWEAKS.some(t => t.id === id));
   if (!ids.length) return { restored: [], checked: 0 };
   guardRunning = true;
@@ -193,6 +193,8 @@ async function runGuard({ manual = false } = {}) {
 
 // ------------------------------------------------------------------ scheduled cleaning (--auto-clean)
 async function autoClean() {
+  // A scheduled clean that arrives during a game boost waits until the boost ends.
+  if (gb.boosting) { gb.pendingClean = true; return 0; }
   const ids = C.CLEANUP.filter(c => c.rec).map(c => c.id);
   const r = await backend.cleanupRun({ ids, elevate: true });
   const freed = (r || []).reduce((a, x) => a + (x.freed || 0), 0);
@@ -356,6 +358,8 @@ async function coreAdmin(method, input) {
   // Look up what is being acted on so the dialog can describe it (and unknown ids fail before anything is sent).
   const ctx = {};
   if (method === 'coreSetMode') ctx.current = await coreRead('status').then(s => s && s.mode).catch(() => null);
+  if (method === 'coreSetBoost') ctx.boost = await coreRead('boost').catch(() => null);
+  if (method === 'coreCaptureBaseline') ctx.hasBaseline = await coreRead('scorecard').then(s => !!(s && s.baseline)).catch(() => false);
   if (method === 'coreSetEtw') ctx.etw = await coreRead('status').then(s => (s && s.etw) || null).catch(() => null);
   if (method === 'coreRollbackAll' || method === 'coreDisablePolicy') {
     const active = (await coreRead('policies')).active || [];
@@ -376,10 +380,12 @@ async function coreAdmin(method, input) {
   return res;
 }
 
-// Foreground hint (phases-2-8 `reportForeground`): the service runs in session 0 and cannot see the
-// foreground window, so the logged-on app reports its process id every 2 s while Core is connected.
-// One persistent PowerShell process; P/Invoke is defined in memory (Reflection.Emit), so no compiled
-// DLL is written to disk. Not used in demo mode. Stops when Core does not support the command.
+// Foreground hint (phases-2-8 `reportForeground`, alpha4 `fullscreen`): the service runs in session 0 and
+// cannot see the foreground window, so the logged-on app reports its process id (and whether a full-screen
+// app / game is in front, from SHQueryUserNotificationState) every 2 s while Core is connected or game
+// boost is on. One persistent PowerShell process; P/Invoke is defined in memory (Reflection.Emit), so no
+// compiled DLL is written to disk. Not used in demo mode. Core reporting pauses when Core does not
+// support the command; an older Core that rejects `fullscreen` gets `{ pid }` only.
 const FG_SCRIPT = `$ErrorActionPreference = 'Stop'
 $asm = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object Reflection.AssemblyName 'OpenSweepFg'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
 $tb = $asm.DefineDynamicModule('OpenSweepFg').DefineType('OpenSweepFg.U', 'Public, Class')
@@ -388,26 +394,43 @@ $m1 = $tb.DefinePInvokeMethod('GetForegroundWindow', 'user32.dll', $attr, [Refle
 $m1.SetImplementationFlags('PreserveSig')
 $m2 = $tb.DefinePInvokeMethod('GetWindowThreadProcessId', 'user32.dll', $attr, [Reflection.CallingConventions]::Standard, [UInt32], [Type[]]@([IntPtr], [UInt32].MakeByRefType()), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
 $m2.SetImplementationFlags('PreserveSig')
+$m3 = $tb.DefinePInvokeMethod('SHQueryUserNotificationState', 'shell32.dll', $attr, [Reflection.CallingConventions]::Standard, [Int32], [Type[]]@([Int32].MakeByRefType()), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
+$m3.SetImplementationFlags('PreserveSig')
 $u = $tb.CreateType()
 while ($true) {
   $p = [UInt32]0; $h = $u::GetForegroundWindow()
   if ($h -ne [IntPtr]::Zero) { [void]$u::GetWindowThreadProcessId($h, [ref]$p) }
-  [Console]::Out.WriteLine('{"pid":' + $p + '}'); [Console]::Out.Flush()
+  # QUNS_BUSY = 2 (full-screen app), QUNS_RUNNING_D3D_FULL_SCREEN = 3, QUNS_PRESENTATION_MODE = 4
+  $q = [Int32]0; $f = 'false'
+  try { if ($u::SHQueryUserNotificationState([ref]$q) -eq 0 -and $q -ge 2 -and $q -le 4) { $f = 'true' } } catch { }
+  [Console]::Out.WriteLine('{"pid":' + $p + ',"fs":' + $f + '}'); [Console]::Out.Flush()
   Start-Sleep -Milliseconds 2000
 }`;
-const fg = { stop: null, unsupportedUntil: 0, lastErr: null };
+const fg = { stop: null, unsupportedUntil: 0, coreUnsupportedUntil: 0, noFullscreen: false, lastErr: null };
+function reportToCore(pid, fullscreen) {
+  if (!coreClient || !coreClient.connected || Date.now() < fg.coreUnsupportedUntil) return; // only while connected
+  const plain = () => coreClient.call('reportForeground', { pid }, { timeout: 1500 });
+  const first = fg.noFullscreen ? plain() : coreClient.call('reportForeground', { pid, fullscreen }, { timeout: 1500 })
+    .catch(e => {
+      if (e.code !== 'bad_args') throw e;
+      // An older Core rejects the unknown `fullscreen` field: if `{ pid }` alone is accepted, keep sending that.
+      return plain().then(r => { fg.noFullscreen = true; return r; });
+    });
+  first.then(() => { fg.lastErr = null; }).catch(e => {
+    fg.lastErr = e.code;
+    if (e.code === 'unknown_cmd') fg.coreUnsupportedUntil = Date.now() + 10 * 60e3;
+  });
+}
 function startForegroundHint() {
   if (DEMO || fg.stop || Date.now() < fg.unsupportedUntil) return;
   const startedAt = Date.now();
   let mine = null;
   try {
     mine = fg.stop = require('./backend/pscore').stream(FG_SCRIPT, undefined, (d) => {
-      const pid = d && d.pid;
-      if (!coreClient || !coreClient.connected || !Number.isSafeInteger(pid) || pid <= 4) return; // only while connected
-      coreClient.call('reportForeground', { pid }, { timeout: 1500 }).then(() => { fg.lastErr = null; }).catch(e => {
-        fg.lastErr = e.code;
-        if (e.code === 'unknown_cmd') { fg.unsupportedUntil = Date.now() + 10 * 60e3; stopForegroundHint(); }
-      });
+      const pid = d && d.pid, fullscreen = !!(d && d.fs === true);
+      if (!Number.isSafeInteger(pid)) return;
+      gameBoostTick(pid > 4 ? pid : 0, fullscreen);
+      if (pid > 4) reportToCore(pid, fullscreen);
     }, () => {
       if (fg.stop !== mine) return; // stopped on purpose, or already replaced by a newer helper
       fg.stop = null;
@@ -416,16 +439,100 @@ function startForegroundHint() {
   } catch { fg.stop = null; }
 }
 function stopForegroundHint() { const s = fg.stop; fg.stop = null; if (s) s(); }
-// Supervisor: (re)start the hint when Core answers, stop it when Core is gone. Cheap: one hello every 30 s.
+// Supervisor: run the hint while Core answers or game boost is on, stop it otherwise. Cheap: one hello every 30 s.
 function scheduleForegroundHint() {
   if (DEMO) return;
   let misses = 0;
   setInterval(async () => {
+    // No foreground report for a while (helper died) while boosting: restore rather than stay boosted.
+    if (gb.boosting && Date.now() - gb.lastReport > 30e3) stopGameBoost('foreground detection stopped').catch(() => {});
     const p = await core().probe({ timeout: 1500 });
-    if (p.available) { misses = 0; startForegroundHint(); }
-    else if (++misses >= 2) stopForegroundHint();
+    if (p.available) misses = 0; else misses++;
+    if (p.available || settings.gameBoost) startForegroundHint();
+    else if (misses >= 2) stopForegroundHint();
   }, 30e3);
-  setTimeout(() => core().probe({ timeout: 1500 }).then(p => { if (p.available) startForegroundHint(); }), 15e3);
+  setTimeout(() => core().probe({ timeout: 1500 }).then(p => { if (p.available || settings.gameBoost) startForegroundHint(); }), 15e3);
+}
+
+// ------------------------------------------------------------------ game boost (app side, docs/core/alpha4.md §2)
+// Opt-in (`gameBoost`, default off). While a full-screen app / game has been in front for ≥ 5 s, OpenSweep
+// switches to the built-in Ultimate or High performance power plan (remembering the previous one) and pauses
+// its own scheduled background work (stability check, settings guard, scheduled clean). When full screen has
+// ended for ≥ 10 s, game boost is turned off, or the app quits, the previous plan is restored. Works without
+// OpenSweep Core; Core's own boost (throttling background apps) is a separate switch the user controls.
+const GB_PLANS = [['e9a42b02-d5df-448d-aa00-03f14749eb61', 'Ultimate Performance'], ['8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c', 'High performance']];
+const GB_START_MS = 5000, GB_END_MS = 10000;
+const gb = { boosting: false, busy: false, since: null, fsSince: 0, notFsSince: 0, fullscreen: false, fgPid: 0, lastReport: 0, prevPlan: null, plan: null, planNote: null, pendingClean: false, lastSession: null };
+const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const powercfgExe = () => path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'powercfg.exe');
+function powercfg(args) {
+  return new Promise((resolve, reject) => require('child_process').execFile(powercfgExe(), args, { windowsHide: true, timeout: 15000 }, (err, out) => (err ? reject(err) : resolve(String(out || '')))));
+}
+async function activePlan() {
+  const m = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*\((.*)\)/i.exec(await powercfg(['/getactivescheme']));
+  return m ? { guid: m[1].toLowerCase(), name: m[2].trim() } : null;
+}
+function gameBoostStatus() {
+  return { enabled: !!settings.gameBoost, boosting: gb.boosting, since: gb.since, fullscreen: gb.fullscreen, plan: gb.plan, prevPlan: gb.prevPlan, planNote: gb.planNote,
+    paused: gb.boosting ? ['Stability check', 'Settings guard', 'Scheduled clean'] : [], lastSession: gb.lastSession,
+    detection: DEMO ? 'demo' : fg.stop ? 'running' : 'stopped', startAfterSec: GB_START_MS / 1000, endAfterSec: GB_END_MS / 1000 };
+}
+function gameBoostTick(pid, fullscreen) {
+  const now = Date.now();
+  gb.lastReport = now; gb.fgPid = pid;
+  if (fullscreen) { gb.notFsSince = 0; if (!gb.fsSince) gb.fsSince = now; } else { gb.fsSince = 0; if (!gb.notFsSince) gb.notFsSince = now; }
+  gb.fullscreen = fullscreen;
+  if (!settings.gameBoost) { if (gb.boosting) stopGameBoost('turned off').catch(() => {}); return; }
+  if (!gb.boosting && fullscreen && now - gb.fsSince >= GB_START_MS) startGameBoost().catch(() => {});
+  else if (gb.boosting && !fullscreen && now - gb.notFsSince >= GB_END_MS) stopGameBoost('full screen ended').catch(() => {});
+}
+async function startGameBoost() {
+  if (gb.boosting || gb.busy) return;
+  gb.busy = true;
+  try {
+    gb.boosting = true; gb.since = new Date().toISOString(); gb.prevPlan = null; gb.plan = null; gb.planNote = null;
+    if (!DEMO) {
+      try {
+        const [cur, list] = await Promise.all([activePlan(), powercfg(['/list'])]);
+        const have = new Set((list.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || []).map(g => g.toLowerCase()));
+        const target = GB_PLANS.find(([g]) => have.has(g));
+        if (!target) gb.planNote = 'No built-in Ultimate or High performance plan on this PC: power plan left as it is.';
+        else if (cur && cur.guid === target[0]) { gb.plan = { guid: target[0], name: target[1] }; gb.planNote = `${target[1]} was already active.`; }
+        else {
+          await powercfg(['/setactive', target[0]]);
+          gb.prevPlan = cur; gb.plan = { guid: target[0], name: target[1] };
+        }
+      } catch (e) { gb.planNote = `Power plan not changed: ${String(e.message || e).split('\n')[0]}`; }
+    }
+    logHistory({ kind: 'boost', summary: `Game boost on${gb.prevPlan ? ` — power plan ${gb.prevPlan.name} → ${gb.plan.name}` : ''}; background scans paused` });
+    send('gameBoost', { ...gameBoostStatus(), event: 'on' });
+  } finally { gb.busy = false; }
+}
+// Restores the plan only if it is still the one game boost set (the user may have changed it meanwhile).
+async function stopGameBoost(reason) {
+  if (!gb.boosting || gb.busy) return;
+  gb.busy = true;
+  try {
+    let restored = null;
+    if (!DEMO && gb.prevPlan && gb.plan) {
+      try { const cur = await activePlan(); if (cur && cur.guid === gb.plan.guid && GUID_RE.test(gb.prevPlan.guid)) { await powercfg(['/setactive', gb.prevPlan.guid]); restored = gb.prevPlan.name; } }
+      catch { /* leave as is; reported below */ }
+    }
+    gb.lastSession = { start: gb.since, end: new Date().toISOString(), reason, restoredPlan: restored };
+    gb.boosting = false; gb.since = null; gb.prevPlan = null; gb.plan = null; gb.planNote = null;
+    logHistory({ kind: 'boost', summary: `Game boost off (${reason})${restored ? ` — power plan restored to ${restored}` : ''}` });
+    send('gameBoost', { ...gameBoostStatus(), event: 'off' });
+    if (gb.pendingClean) { gb.pendingClean = false; setTimeout(() => autoClean().catch(() => {}), 60e3); }
+  } finally { gb.busy = false; }
+}
+// On quit there is no time for async work: restore the plan synchronously.
+function stopGameBoostSync() {
+  if (!gb.boosting) return;
+  try {
+    if (!DEMO && gb.prevPlan && GUID_RE.test(gb.prevPlan.guid)) require('child_process').execFileSync(powercfgExe(), ['/setactive', gb.prevPlan.guid], { windowsHide: true, timeout: 5000 });
+    logHistory({ kind: 'boost', summary: `Game boost off (OpenSweep closed)${gb.prevPlan ? ` — power plan restored to ${gb.prevPlan.name}` : ''}` });
+  } catch { /* ignore */ }
+  gb.boosting = false;
 }
 async function coreAction(action) {
   if (DEMO) { await backend.coreAction(action); logHistory({ kind: 'core', summary: `OpenSweep Core: ${action} (simulated)` }); return backend.coreStatus(); }
@@ -651,13 +758,19 @@ const api = {
 
   getSettings: () => ({ ...settings, history: undefined, stabilitySeen: undefined, guardTweaks: undefined, guardCount: (settings.guardTweaks || []).length }),
   setSettings: ({ patch }) => {
-    const allowed = ['theme', 'minimizeToTray', 'showWidget', 'launchAtLogin', 'confirmActions', 'scanRoot', 'autoUpdate', 'stabilityMonitor', 'stabilityNotify', 'settingsGuard', 'autoClean', 'compactNav'];
+    const allowed = ['theme', 'minimizeToTray', 'showWidget', 'launchAtLogin', 'confirmActions', 'scanRoot', 'autoUpdate', 'stabilityMonitor', 'stabilityNotify', 'settingsGuard', 'autoClean', 'compactNav', 'gameBoost'];
     if ('autoClean' in (patch || {}) && !['off', 'weekly', 'monthly'].includes(patch.autoClean)) throw new Error('Invalid schedule');
+    if ('gameBoost' in (patch || {}) && typeof patch.gameBoost !== 'boolean') throw new Error('Invalid game boost setting');
+    const boostChanged = 'gameBoost' in (patch || {}) && patch.gameBoost !== !!settings.gameBoost;
     const cleanChanged = 'autoClean' in (patch || {}) && patch.autoClean !== settings.autoClean;
     for (const k of allowed) if (k in (patch || {})) settings[k] = patch[k];
     if (Array.isArray(settings.shortcuts)) settings.shortcuts = settings.shortcuts.slice(0, 50).map(s => ({ name: String(s.name).slice(0, 60), target: String(s.target).slice(0, 1024) }));
     saveSettings();
     applySettings();
+    if (boostChanged) {
+      logHistory({ kind: 'boost', summary: `Game boost ${settings.gameBoost ? 'turned on' : 'turned off'}` });
+      if (settings.gameBoost) startForegroundHint(); else stopGameBoost('turned off').catch(() => {});
+    }
     if (cleanChanged && !DEMO) backend.setCleanSchedule({ freq: settings.autoClean, exe: process.execPath }).catch(e => logHistory({ kind: 'cleanup', summary: `Could not set the cleaning schedule: ${e.message}` }));
     return api.getSettings();
   },
@@ -689,6 +802,7 @@ const api = {
   // OpenSweep Core: Phase 1 methods use no renderer input; the Phase 2–8 methods are added below
   // from core-validate's fixed table (strict argument checks, admin methods confirmed natively).
   coreStatus: () => coreStatus(),
+  gameBoostStatus: () => gameBoostStatus(),
   coreMetrics: () => (DEMO ? backend.coreMetrics() : core().call('metrics')),
   coreTopology: () => (DEMO ? backend.coreTopology() : core().call('topology')),
   coreInstall: () => coreAction('install'),
@@ -702,6 +816,20 @@ Object.assign(api, extra, {
   guardStatus: () => ({ enabled: !!settings.settingsGuard, count: (settings.guardTweaks || []).length }),
   guardRun: () => runGuard({ manual: true }),
 });
+// Hardware check (docs/core/alpha4.md §1). Optional module: OpenSweep starts without it.
+const HW_FIX_IDS = ['refresh_rate', 'refresh_revert', 'ssd_retrim', 'power_plan'];
+try {
+  const hw = require('./api-hardware')({ DEMO, logHistory, dialog, getWin: () => win });
+  if (hw && typeof hw.hwCheck === 'function') api.hwCheck = () => hw.hwCheck();
+  if (hw && typeof hw.hwFix === 'function') {
+    api.hwFix = (a) => {
+      const { id, target } = a || {};
+      if (typeof id !== 'string' || !HW_FIX_IDS.includes(id)) throw new Error('Unknown hardware fix');
+      if (target !== undefined && target !== null && (typeof target !== 'string' || target.length > 200)) throw new Error('Invalid hardware fix target');
+      return hw.hwFix(typeof target === 'string' ? { id, target } : { id });
+    };
+  }
+} catch (e) { console.warn(`Hardware check not available: ${e && e.message}`); }
 for (const [method, spec] of Object.entries(coreValidate.CORE_METHODS)) {
   api[method] = spec.cap === 'admin' ? (args) => coreAdmin(method, args) : (args) => { const p = coreValidate.prepare(method, args); return coreRead(p.cmd, p.args); };
 }
@@ -786,7 +914,7 @@ else {
     scheduleForegroundHint();
     if (!DEMO) setTimeout(() => runGuard().catch(() => {}), 120e3);
   });
-  app.on('before-quit', () => { quitting = true; try { extra._stopAll(); } catch { /* ignore */ } try { stopForegroundHint(); } catch { /* ignore */ } try { if (coreClient) coreClient.close(); } catch { /* ignore */ } });
+  app.on('before-quit', () => { quitting = true; try { stopGameBoostSync(); } catch { /* ignore */ } try { extra._stopAll(); } catch { /* ignore */ } try { stopForegroundHint(); } catch { /* ignore */ } try { if (coreClient) coreClient.close(); } catch { /* ignore */ } });
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
   app.on('activate', showMain);
 }

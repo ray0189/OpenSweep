@@ -14,11 +14,17 @@
 //   events.jsonl    whenever new events arrived (append) and at shutdown
 //   incidents.jsonl when an incident is created / re-opened / resolved, otherwise at most every 5 min
 //   journal.jsonl   write-ahead, always (journal::Journal appends before every action)
-//   config.json     mode, simulation, opt-ins; written on every successful setMode; validated on load
-//                   (anything invalid -> fail-safe defaults: monitor, no simulation, no opt-ins)
+//   config.json     mode, simulation, opt-ins, etw, boost; written on every successful setMode / setEtw /
+//                   setBoost; validated on load (anything invalid -> fail-safe defaults: monitor, no
+//                   simulation, no opt-ins, boost off)
+//   scorecard.json  first start, scorecard baseline, stutter / fullscreen minutes (scorecard.hpp);
+//                   every 15 min, on captureBaseline and at shutdown
+// Game boost (boost.hpp) runs every tick before the control engine; recommendations for processes
+// boost holds are dropped and boost never touches a process the control engine holds.
 // start() loads everything and then rolls back whatever the journal says may still be applied
-// (crash recovery: ControlEngine::recover) and expires interrupted recoveries (SweepHeal::recover).
-// shutdown() rolls back every active policy (ControlEngine::shutdown) and persists everything.
+// (crash recovery: GameBoost::recover, then ControlEngine::recover) and expires interrupted recoveries
+// (SweepHeal::recover). shutdown() ends a boost session, rolls back every active policy
+// (ControlEngine::shutdown) and persists everything.
 //
 // Thread safety: every public method takes the engine mutex. tick() holds it for the duration of
 // one tick (the expensive collection happens before, outside the lock); read methods copy the data
@@ -42,6 +48,7 @@
 #include <vector>
 
 #include "baseline.hpp"
+#include "boost.hpp"
 #include "control.hpp"
 #include "guard.hpp"
 #include "heal.hpp"
@@ -51,6 +58,7 @@
 #include "kernel_guard.hpp"
 #include "memory_policy.hpp"
 #include "scheduler_policy.hpp"
+#include "scorecard.hpp"
 #include "telemetry.hpp"
 #include "trace.hpp"
 
@@ -68,10 +76,12 @@ struct Settings {
     bool simulation = false;
     std::vector<PolicyKind> opted_in;
     bool etw = true;  // kernel tracing (docs/core/etw.md); absent in older files -> true
+    bool boost = false;  // game boost opt-in (docs/core/alpha4.md); absent in older files -> false
 };
 inline constexpr std::int64_t kSettingsVersion = 1;
 json::Value settings_to_json(const Settings& s);
-// Strict: { version:1, mode:"monitor"|"balanced"|"advanced", simulation:bool, optIn:[kind...], etw?:bool }.
+// Strict: { version:1, mode:"monitor"|"balanced"|"advanced", simulation:bool, optIn:[kind...], etw?:bool,
+//          boost?:bool }.
 // Unknown keys, wrong types, unknown / duplicate kinds -> nullopt with `error` set.
 std::optional<Settings> settings_from_json(const json::Value& v, std::string& error);
 
@@ -107,6 +117,8 @@ struct EngineOptions {
     memory::MemoryConfig memory;
     sched::SchedulerConfig scheduler;
     journal::JournalOptions journal;
+    boost::BoostConfig boost;          // `lists` is overridden from `scheduler.lists`
+    std::int64_t scorecard_persist_ms = 15 * 60'000;
 };
 
 inline constexpr const char* kTraceFile = "trace.bin";
@@ -116,6 +128,7 @@ inline constexpr const char* kIncidentsFile = "incidents.jsonl";
 inline constexpr const char* kJournalFile = "journal.jsonl";
 inline constexpr const char* kConfigFile = "config.json";
 inline constexpr const char* kDiagnosticsFile = "diagnostics.json";
+inline constexpr const char* kScorecardFile = "scorecard.json";
 
 struct IncidentCapture {
     std::string incident_id;
@@ -130,6 +143,8 @@ struct StartReport {
     bool config_valid = true;   // false: invalid file, defaults used
     std::string config_error;
     control::RollbackSummary recovered;  // policies rolled back by crash recovery
+    control::RollbackSummary boost_recovered;  // boost targets restored by crash recovery
+    trace::LoadReport scorecard;
     int heal_expired = 0;                // interrupted recoveries marked expired
 };
 
@@ -155,6 +170,26 @@ struct Status {
     std::string memory_level = "low";
     double memory_score = 0.0;
     bool cpu_contention = false;
+    bool boost_enabled = false;
+    bool boost_active = false;
+};
+
+struct BoostResult {
+    bool enabled = false;
+    bool active = false;
+    bool persisted = false;  // config.json written
+    control::RollbackSummary restored;  // targets restored because boost was turned off
+};
+
+struct ScorecardView {
+    std::optional<scorecard::Baseline> baseline;
+    scorecard::Metrics current;
+    double hours_measured = 0.0;
+};
+
+struct CaptureResult {
+    scorecard::Baseline baseline;
+    bool persisted = false;  // scorecard.json written
 };
 
 struct HealView {
@@ -215,6 +250,12 @@ public:
     std::vector<IncidentCapture> captures() const;
     std::size_t tracked_processes() const;  // guard + scheduler + kernel guard bounded tracking (tests)
     std::vector<std::string> kernel_notes() const;  // why kernel-trace hogs were not candidates (last tick)
+    boost::View boost_view() const;
+    bool boost_enabled() const;
+    ScorecardView scorecard() const;
+
+    // Foreground hint (already validated by the platform). Feeds game boost's fullscreen detection.
+    void report_foreground(std::uint32_t pid, bool fullscreen);
 
     // ---- admin side (the IPC layer has already checked the admin capability) ----------------
     // `simulation` / `opt_in` are optional additive arguments of setMode (see ipc-protocol.md).
@@ -227,6 +268,10 @@ public:
     // Returns true when config.json was written.
     bool set_etw(bool enabled);
     bool etw_enabled() const;
+    // Persists the game-boost opt-in (config.json `boost`); off ends an active session.
+    BoostResult set_boost(bool enabled);
+    // Stores the current scorecard metrics as the baseline ("before") in scorecard.json.
+    CaptureResult capture_baseline();
 
     // Writes `data` atomically to data_dir/name; returns the full path or nullopt.
     std::optional<std::string> write_data_file(std::string_view name, std::string_view data);
@@ -244,6 +289,7 @@ private:
     std::vector<std::uint32_t> suspected_leak_pids_locked() const;
     void persist_locked(std::int64_t now, bool force, bool incidents_changed, bool events_changed);
     void clear_caches_locked();
+    void save_scorecard_locked();
 
     trace::FileIO& io_;
     EngineOptions options_;
@@ -269,6 +315,8 @@ private:
     sched::SweepScheduler scheduler_;
     journal::Journal journal_;
     control::ControlEngine control_;
+    boost::GameBoost boost_;
+    scorecard::Scorecard scorecard_;
     std::unique_ptr<OwnedExecutor> owned_exec_;
     std::unique_ptr<heal::SweepHeal> heal_;
 
@@ -294,6 +342,7 @@ private:
     std::int64_t last_trace_save_ = 0;
     std::int64_t last_baseline_save_ = 0;
     std::int64_t last_incident_save_ = 0;
+    std::int64_t last_scorecard_save_ = 0;
     std::size_t last_incident_size_ = 0;
     std::size_t last_incident_open_ = 0;
     bool events_dirty_ = false;
